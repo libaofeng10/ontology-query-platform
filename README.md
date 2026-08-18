@@ -9,6 +9,7 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)
 ![MySQL](https://img.shields.io/badge/MySQL-read--only-4479A1?logo=mysql&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
+![License](https://img.shields.io/badge/License-Apache--2.0-D22128)
 
 OntoQuery 是一个面向企业数据分析场景的本体驱动智能问数平台。它从只读 MySQL 自动探查结构和受限值域，构建可人工审核的业务对象、属性与关系模型，再通过语义查询计划、SQL 安全护栏和结果等价评测生成可追溯的问数结果。
 
@@ -198,4 +199,4 @@ examples/            示例评测清单
 
 ## 许可证
 
-本仓库当前未声明开源许可证。未经版权所有者明确许可，不应将代码视为可自由复制、修改或分发的开源软件。
+本项目采用 [Apache License 2.0](./LICENSE)。你可以使用、修改和分发本项目，包括商业用途；重新分发时需遵守许可证中的署名、修改声明和其他条件。

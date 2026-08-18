@@ -9,6 +9,7 @@ English | [简体中文](./README.md)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)
 ![MySQL](https://img.shields.io/badge/MySQL-read--only-4479A1?logo=mysql&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
+![License](https://img.shields.io/badge/License-Apache--2.0-D22128)
 
 OntoQuery is an ontology-driven conversational analytics platform for enterprise data. It discovers metadata and bounded value evidence from read-only MySQL sources, builds human-reviewed business objects, properties, and links, and produces traceable answers through semantic query plans, SQL safety guards, and result-equivalence evaluations.
 
@@ -200,4 +201,4 @@ This repository is a runnable, single-instance baseline. Enterprise acceptance s
 
 ## License
 
-No open-source license is currently declared. Unless the copyright holder grants explicit permission, do not assume the code may be freely copied, modified, or redistributed.
+This project is licensed under the [Apache License 2.0](./LICENSE). You may use, modify, and distribute it, including for commercial purposes, subject to the attribution, change-notice, and other conditions in the license.
