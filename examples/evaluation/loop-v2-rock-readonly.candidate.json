@@ -1,0 +1,45 @@
+{
+  "version": "loop-v2-rock-readonly-candidate-1",
+  "setName": "loop-v2-production-v1",
+  "status": "candidate",
+  "minimumCases": 30,
+  "source": {
+    "id": 2,
+    "name": "rock_readonly"
+  },
+  "cases": [
+    {
+      "id": "beijing-dacheng-account-systems-count",
+      "category": "跨产品账号全集",
+      "question": "分别统计北京大成律所 Alpha 主账号数与 AlphaGPT 产品账号体系账号数（不限定 product_key）",
+      "goldSql": "SELECT COUNT(*) AS account_count FROM alpha_user WHERE alp_office_name LIKE '%北京大成%' AND is_deleted = 0 UNION ALL SELECT COUNT(*) AS account_count FROM alpha_account_user WHERE user_office_name LIKE '%北京大成%' AND is_deleted = 0",
+      "expectedTables": [
+        "alpha_user",
+        "alpha_account_user"
+      ],
+      "requiredSqlFragments": [
+        "%北京大成%"
+      ],
+      "forbiddenSqlFragments": [
+        "%北京%",
+        "%大成%"
+      ]
+    },
+    {
+      "id": "beijing-dacheng-current-month-clue-count",
+      "category": "实体与时间",
+      "question": "统计北京大成本月进线线索数量",
+      "goldSql": "SELECT COUNT(*) AS clue_count FROM alpha_crm_clue WHERE office_name LIKE '%北京大成%' AND clue_create_time >= DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01') AND clue_create_time < DATE_FORMAT(DATE_ADD(CURRENT_DATE(), INTERVAL 1 MONTH), '%Y-%m-01') AND is_deleted = 0",
+      "expectedTables": [
+        "alpha_crm_clue"
+      ],
+      "requiredSqlFragments": [
+        "%北京大成%",
+        "clue_create_time"
+      ],
+      "forbiddenSqlFragments": [
+        " city "
+      ]
+    }
+  ]
+}

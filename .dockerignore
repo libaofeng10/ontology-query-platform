@@ -1,0 +1,11 @@
+.git
+.idea
+.data
+.ontology-wiki
+.env*
+node_modules
+.vinext
+.wrangler
+dist
+runtime
+npm-debug.log*
