@@ -260,6 +260,28 @@ test("domain-modeling API automatically builds every domain and its Links with t
     const task=await waitForTask(app,started.body.id);assert.equal(task.status,"succeeded",task.error);assert.equal(task.result.domainCount,2);assert.equal(task.result.succeededDomainCount,2);assert.equal(task.result.objectCount,4);assert.equal(task.result.linkCount,2);assert.equal(task.result.reviewRequiredCount,0);
     const runs=app.store.listOntologyGenerationRuns(source.id);assert.equal(runs.length,2);assert.ok(runs.every((run)=>run.taskId===task.id&&run.scope.orchestrationId===task.id&&run.status==="succeeded"));
     const candidates=app.store.listOntologyCandidates({sourceId:source.id});assert.equal(candidates.length,6);assert.ok(candidates.every((item)=>item.status==="auto_confirmed"));
+    const page=await api(app,`/api/ontology/generation-runs?sourceId=${source.id}&page=1&pageSize=1`,"viewer-token",null,"GET");assert.equal(page.status,200);assert.equal(page.body.items.length,1);assert.equal(page.body.total,2);assert.equal(page.body.totalPages,2);
+    assert.equal((await api(app,`/api/ontology/candidates/${candidates[0].id}/decision`,"editor-token",{decision:"withdraw"})).status,200);
+    const pendingWorkflow=await api(app,`/api/ontology/domain-modeling/${task.id}/summary`,"viewer-token",null,"GET");assert.equal(pendingWorkflow.body.reviewRequiredCount,1);assert.equal(pendingWorkflow.body.readyForDraft,false);
+    assert.equal((await api(app,`/api/ontology/domain-modeling/${task.id}/apply`,"editor-token",{})).status,409);
+    assert.equal((await api(app,`/api/ontology/candidates/${candidates[0].id}/decision`,"editor-token",{decision:"confirm"})).status,200);
+    const workflow=await api(app,`/api/ontology/domain-modeling/${task.id}/summary`,"viewer-token",null,"GET");assert.equal(workflow.status,200);assert.equal(workflow.body.domainCount,2);assert.equal(workflow.body.failedDomainCount,0);assert.equal(workflow.body.acceptedCount,6);assert.equal(workflow.body.readyForDraft,true);
+    app.store.createTask({id:"retry-in-progress",sourceId:source.id,taskType:"ontology_domain_modeling",total:100,currentStep:"等待重试",payloadJson:JSON.stringify({orchestrationId:task.id})});app.store.startTask("retry-in-progress");app.store.updateTaskProgress("retry-in-progress",{progress:52,currentStep:"重试失败域"});
+    const retrying=await api(app,`/api/ontology/domain-modeling/${task.id}/summary`,"viewer-token",null,"GET");assert.equal(retrying.body.readyForDraft,false);assert.equal(retrying.body.activeTask.id,"retry-in-progress");assert.equal(retrying.body.activeTask.progress,52);assert.equal((await api(app,`/api/ontology/domain-modeling/${task.id}/apply`,"editor-token",{})).status,409);
+    app.store.failTask("retry-in-progress","测试结束");
+    assert.equal((await api(app,`/api/ontology/domain-modeling/${task.id}/summary`,"viewer-token",null,"GET")).body.readyForDraft,true);
+    app.store.completeTask(task.id,{...task.result,domainCount:3,failedDomainCount:1,domains:[...task.result.domains,{domainId:"missing-domain",domainName:"缺失域",status:"failed",error:"LLM timeout"}]});
+    const partialWorkflow=await api(app,`/api/ontology/domain-modeling/${task.id}/summary`,"viewer-token",null,"GET");assert.equal(partialWorkflow.body.failedDomainCount,1);assert.equal(partialWorkflow.body.reviewRequiredCount,0);assert.equal((await api(app,`/api/ontology/domain-modeling/${task.id}/preview`,"editor-token",{})).status,409);assert.equal((await api(app,`/api/ontology/domain-modeling/${task.id}/preview`,"editor-token",{allowFailedDomains:true,conflictResolutions:{}})).status,200);
+    app.store.completeTask(task.id,task.result);
+    const preview=await api(app,`/api/ontology/domain-modeling/${task.id}/preview`,"editor-token",{});assert.equal(preview.status,200);assert.equal(preview.body.summary.candidateCount,6);assert.equal(preview.body.schema.objectTypes.length,4);assert.equal(preview.body.schema.linkTypes.length,2);
+    assert.equal((await api(app,`/api/ontology/domain-modeling/${task.id}/apply`,"viewer-token",{})).status,403);
+    const applied=await api(app,`/api/ontology/domain-modeling/${task.id}/apply`,"editor-token",{});assert.equal(applied.status,201);assert.equal(applied.body.draft.status,"draft");assert.equal(applied.body.draft.schema.objectTypes.length,4);assert.equal(applied.body.draft.schema.linkTypes.length,2);
+    assert.ok(app.store.listOntologyCandidates({sourceId:source.id}).every((item)=>item.status==="applied"));
+    const legacyValidation={ok:false,errors:[{code:"ONTOLOGY_LIMIT_EXCEEDED",path:"objectTypes",message:"Object Type 最多允许 100 个"}],warnings:[],summary:{objectTypes:4,properties:4,linkTypes:2,errorCount:1,warningCount:0}};
+    app.store.db.prepare("UPDATE ds_ontology_schema_version SET validation_json=? WHERE id=?").run(JSON.stringify(legacyValidation),applied.body.draft.id);
+    const repairable=await api(app,`/api/ontology/domain-modeling/${task.id}/summary`,"viewer-token",null,"GET");assert.equal(repairable.body.repairable,true);assert.equal(repairable.body.draftValidationOk,false);
+    assert.equal((await api(app,`/api/ontology/domain-modeling/${task.id}/repair`,"viewer-token",{})).status,403);
+    const repaired=await api(app,`/api/ontology/domain-modeling/${task.id}/repair`,"editor-token",{});assert.equal(repaired.status,201);assert.equal(repaired.body.repairedFromVersionId,applied.body.draft.id);assert.equal(repaired.body.validation.ok,true);assert.equal(repaired.body.draft.schema.objectTypes.length,4);assert.equal(repaired.body.draft.schema.linkTypes.length,2);assert.equal(repaired.body.draft.version,applied.body.draft.version+1);
   } finally { await app.close(); }
 });
 

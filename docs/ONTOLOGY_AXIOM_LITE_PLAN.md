@@ -141,7 +141,7 @@ Object Type 新增可选字段：
 | 兄弟子类判别值集合两两交集为空时自动登记互斥（进 E2）；有交集时告警 `ONTOLOGY_SIBLING_OVERLAP`（允许，如"重点客户"与"企业客户"可交叉） | — |
 | 同一 Schema 中父类与其子类不得同时被同一个 Link 的 source/target 引用产生歧义路径（见 3.4 限制） | `ONTOLOGY_LINK_HIERARCHY_AMBIGUOUS` |
 
-上限：含子类在内仍受 `MAX_OBJECT_TYPES=100` 约束，不单设新限。
+上限：含子类在内仍受 `MAX_OBJECT_TYPES=1000` 约束，不单设新限；全域草稿采用分页和按需渲染，避免大 Schema 阻塞页面。
 
 ### 3.4 编译器变更（semantic-query-plan.mjs）
 

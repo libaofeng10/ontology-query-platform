@@ -7,6 +7,7 @@ import {
 } from "./ontology-candidate-score.mjs";
 import { buildObjectGenerationScope, ONTOLOGY_OBJECT_PROMPT_VERSION } from "./ontology-candidate-generator.mjs";
 import { assembleOntologyDraft } from "./ontology-draft-assembler.mjs";
+import { assertLosslessOntologyDraft } from "./ontology-draft-integrity.mjs";
 import { diffSemanticSchemas } from "./semantic-schema-diff.mjs";
 import { callLlmEmbedding } from "./embedding-client.mjs";
 
@@ -78,7 +79,7 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     const effectiveAutoConfirmScore=boundedInteger(sourceAutoConfirmScore,0,100,boundedInteger(aiConfig.autoConfirmScore,0,100,80));
     const run=store.createOntologyGenerationRun({
       id,sourceId:source.id,taskId,mode,
-      scope:{tableNames,domainName:String(input?.domainName||"").trim(),domainDescription:String(input?.domainDescription||"").trim(),namespace,nonSensitiveFieldCount,batches:generationScope.batches,limits:{maxTables,maxFields},modelingMode:aiConfig.mode,autoConfirmScore:effectiveAutoConfirmScore,embeddingModel,publishedSchemaVersionIdAtStart:publishedAtStart?.id||null,...domainOrchestrationScope(input)},
+      scope:{tableNames,domainName:String(input?.domainName||"").trim(),domainDescription:String(input?.domainDescription||"").trim(),namespace,nonSensitiveFieldCount,batches:generationScope.batches,limits:{maxTables,maxFields},modelingMode:aiConfig.mode,autoConfirmScore:effectiveAutoConfirmScore,llmTimeoutMs:boundedInteger(aiConfig.timeoutMs,1_000,600_000,300_000),embeddingModel,publishedSchemaVersionIdAtStart:publishedAtStart?.id||null,...domainOrchestrationScope(input)},
       catalogChecksum:ontologyCatalogChecksum(selectedCatalog),baseSchemaVersionId,
       modelName:String(config?.llm?.model||"").trim()||null,promptVersion:ONTOLOGY_OBJECT_PROMPT_VERSION,
       scoringVersion:`${ONTOLOGY_CANDIDATE_SCORING_VERSION}:embedding=${embeddingModel}`,createdBy:String(createdBy||"system"),summary:{tableCount:tableNames.length,nonSensitiveFieldCount,includedFieldCount:generationScope.includedFieldCount,truncatedFieldCount:generationScope.truncatedFieldCount,batchCount:generationScope.batchCount,confirmedRelationCount:generationScope.confirmedRelationCount,includedRelationCount:generationScope.includedRelationCount,crossBatchRelationCount:generationScope.crossBatchRelationCount,excludedSensitiveRelationCount:generationScope.excludedSensitiveRelationCount,excludedInvalidRelationCount:generationScope.excludedInvalidRelationCount,candidateCount:0,autoConfirmedCount:0,reviewRequiredCount:0,blockedCount:0},
@@ -218,15 +219,19 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     if(current.status!=="review_required")throw httpError(409,"只有待人工确认候选可以执行确认");
     const run=requiredRun(current.runId);const currentCatalog=validatedRunCatalog(run);
     const edited=input?.candidate!=null;
-    const payload=normalizeCandidatePayload(edited?input.candidate:current.payload,{candidateType:current.candidateType,namespace:run.scope.namespace,catalog:currentCatalog});
-    const acceptedObjects=store.listOntologyCandidates({runId:run.id,candidateType:"object"}).filter((item)=>ACCEPTED_STATUSES.has(item.status));
-    const baseSchema=run.baseSchemaVersionId?store.getOntologySchemaVersion(run.baseSchemaVersionId)?.schema:null;
-    const rescored=await candidateScorer.score({...current,payload,namespace:run.scope.namespace},{sourceId:run.sourceId,catalog:currentCatalog,acceptedObjects,baseSchema,mode:"review",autoConfirmScore:run.scope.autoConfirmScore??aiConfig.autoConfirmScore,embeddingModel:run.scope.embeddingModel,scoringVersion:run.scoringVersion});
-    if(!rescored.validation.ok)throw httpError(422,"人工修订后的候选未通过确定性校验");
-    if(rescored.stableKey!==current.stableKey)throw httpError(409,"人工修订改变了 stableKey 所依赖的物理映射，请重新生成候选");
+    let payload=current.payload;let score=current.score;let scoreBreakdown=current.scoreBreakdown;let validation=current.validation;let forcedReviewReasons=current.forcedReviewReasons;
+    if(edited){
+      payload=normalizeCandidatePayload(input.candidate,{candidateType:current.candidateType,namespace:run.scope.namespace,catalog:currentCatalog});
+      const acceptedObjects=store.listOntologyCandidates({runId:run.id,candidateType:"object"}).filter((item)=>ACCEPTED_STATUSES.has(item.status));
+      const baseSchema=run.baseSchemaVersionId?store.getOntologySchemaVersion(run.baseSchemaVersionId)?.schema:null;
+      const rescored=await candidateScorer.score({...current,payload,namespace:run.scope.namespace},{sourceId:run.sourceId,catalog:currentCatalog,acceptedObjects,baseSchema,mode:"review",autoConfirmScore:run.scope.autoConfirmScore??aiConfig.autoConfirmScore,embeddingModel:run.scope.embeddingModel,scoringVersion:run.scoringVersion});
+      if(!rescored.validation.ok)throw httpError(422,"人工修订后的候选未通过确定性校验");
+      if(rescored.stableKey!==current.stableKey)throw httpError(409,"人工修订改变了 stableKey 所依赖的物理映射，请重新生成候选");
+      score=rescored.score;scoreBreakdown=rescored.scoreBreakdown;validation=rescored.validation;forcedReviewReasons=rescored.forcedReviewReasons;
+    }else if(!validation?.ok)throw httpError(422,"候选生成时未通过确定性校验，请编辑后再确认");
     return requireTransition(store.transitionOntologyCandidate({
-      id:current.id,expectedStatus:"review_required",status:"confirmed",payload,score:rescored.score,scoreBreakdown:rescored.scoreBreakdown,
-      validation:rescored.validation,forcedReviewReasons:rescored.forcedReviewReasons,reviewedBy:actor,decisionNote:input?.note||null,actor,eventType:edited?"edited_and_confirmed":"confirmed",note:input?.note||null,
+      id:current.id,expectedStatus:"review_required",status:"confirmed",payload,score,scoreBreakdown,
+      validation,forcedReviewReasons,reviewedBy:actor,decisionNote:input?.note||null,actor,eventType:edited?"edited_and_confirmed":"confirmed",note:input?.note||null,
     }));
   }
 
@@ -258,6 +263,7 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     const {run,expectedPublishedId,assembled,validation,diff}=prepareDraft(runId,input);
     if(assembled.summary.unresolvedConflictCount)throw httpError(409,"仍有未处理的 Schema 冲突，请明确选择保留现有定义或采用候选并重新预览");
     if(!assembled.includedCandidates.length)throw httpError(409,"没有可应用的已确认候选；请完成审核或调整排除列表");
+    assertLosslessOntologyDraft(assembled.schema,validation);
     const compactValidation=withoutSchema(validation);
     const schema=validation.schema;
     const draft=store.createOntologyDraftWithCandidates({
@@ -310,7 +316,9 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
 
   return {
     catalog,planScope,createRun,evaluateAndStore,runGeneration,runSupplementalLinks,assertSupplementalReady,decide,bulkDecide,merge,preview,apply,
-    getRun:(id)=>runView(requiredRun(id),new Map()),listRuns:(sourceId)=>{const cache=new Map();return store.listOntologyGenerationRuns(sourceId).map((run)=>runView(run,cache));},
+    getRun:(id)=>runView(requiredRun(id),new Map()),
+    listRuns:(sourceId,limit=50,offset=0)=>{const cache=new Map();return store.listOntologyGenerationRuns(sourceId,limit,offset).map((run)=>runView(run,cache));},
+    listRunsPage:(sourceId,{page=1,pageSize=20}={})=>{const normalizedPage=boundedInteger(page,1,100000,1);const normalizedSize=boundedInteger(pageSize,1,50,20);const total=store.countOntologyGenerationRuns(sourceId);const cache=new Map();const items=store.listOntologyGenerationRuns(sourceId,normalizedSize,(normalizedPage-1)*normalizedSize).map((run)=>runView(run,cache));return {items,total,page:normalizedPage,pageSize:normalizedSize,totalPages:Math.max(1,Math.ceil(total/normalizedSize))};},
     getCandidate,listCandidates,
     listEvents:(candidateId)=>store.listOntologyCandidateEvents(candidateId),
   };

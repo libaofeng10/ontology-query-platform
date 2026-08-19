@@ -59,12 +59,14 @@ test("bulk decisions validate one source and report per-candidate concurrency co
   const fixture=await createFixture();
   try {
     const config={ontologyAi:{mode:"review",autoConfirmScore:80,maxTables:20,maxFields:600},llm:{},embedding:{model:"embed-v1"}};
-    const scorer={score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9})};
+    let scoreCalls=0;const scorer={score:async(candidate,options)=>{scoreCalls+=1;return scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9});}};
     const service=createOntologyCandidateService({store:fixture.store,config,scorer});
     const run=service.createRun({sourceId:fixture.source.id,tableNames:["crm_customer","sales_order"],domainName:"sales"},"editor-a");
     const customer=await service.evaluateAndStore(run.id,objectCandidate());const order=await service.evaluateAndStore(run.id,orderCandidate());
+    const generationScoreCalls=scoreCalls;
     const result=await service.bulkDecide({sourceId:fixture.source.id,candidateIds:[customer.id,order.id,customer.id],decision:"confirm",note:"批量双检"},"editor-a");
     assert.equal(result.total,2);assert.equal(result.succeeded,2);assert.equal(result.failed,0);assert.ok(result.results.every((item)=>item.candidate.status==="confirmed"));
+    assert.equal(scoreCalls,generationScoreCalls,"未编辑候选批量确认不应重复请求 Embedding 评分");
     const repeated=await service.bulkDecide({sourceId:fixture.source.id,candidateIds:[customer.id,order.id],decision:"confirm"},"editor-b");
     assert.equal(repeated.succeeded,0);assert.equal(repeated.failed,2);assert.ok(repeated.results.every((item)=>/只有待人工确认/.test(item.error)));
     await assert.rejects(service.bulkDecide({sourceId:fixture.source.id+1,candidateIds:[customer.id],decision:"confirm"},"editor-b"),/不属于当前数据源/);

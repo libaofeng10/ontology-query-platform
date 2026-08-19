@@ -17,7 +17,18 @@ test("draft assembler merges accepted objects and links without overwriting base
   assert.deepEqual(result.schema.linkTypes.map((item)=>item.apiName),["customer_orders"]);
   assert.deepEqual(result.includedCandidates.map((item)=>item.id),["order","customer-orders"]);
   assert.equal(result.conflicts.length,1);assert.equal(result.conflicts[0].reason,"object_api_name_exists");
-  assert.deepEqual(result.summary,{objectsAdded:1,propertiesAdded:1,linksAdded:1,candidateCount:2,conflictCount:1,resolvedConflictCount:0,unresolvedConflictCount:1,excludedCount:1});
+  assert.deepEqual(result.summary,{objectsAdded:1,propertiesAdded:1,linksAdded:1,renamedLinkCount:0,candidateCount:2,conflictCount:1,resolvedConflictCount:0,unresolvedConflictCount:1,excludedCount:1});
+});
+
+test("draft assembler deterministically disambiguates Link and inverse names across domains",()=>{
+  const run={id:"run-1",sourceId:1,scope:{namespace:"sales",domainName:"销售域"}};
+  const baseSchema={name:"sales",displayName:"销售模型",objectTypes:[object("customer","crm_customer","id","客户"),object("order","sales_order","id","订单"),object("invoice","sales_invoice","id","发票")],linkTypes:[{apiName:"customer_orders",inverseApiName:"orders",displayName:"客户订单",source:"customer",target:"order",cardinality:"one_to_many",relationMappings:[]}]};
+  const candidates=[candidate("invoice-link","link","confirmed","link:sales:order:8:invoice",{apiName:"orders",inverseApiName:"customer_orders",displayName:"订单发票",source:"order",target:"invoice",cardinality:"one_to_many",relationMappings:[{relationId:8}]})];
+  const result=assembleOntologyDraft({run,candidates,baseSchema});
+  assert.equal(result.schema.linkTypes[1].apiName,"orders_order_to_invoice");
+  assert.equal(result.schema.linkTypes[1].inverseApiName,"customer_orders_invoice_to_order");
+  assert.equal(result.summary.renamedLinkCount,2);
+  assert.deepEqual(result.renamedLinks.map((item)=>item.field),["apiName","inverseApiName"]);
 });
 
 test("draft assembler reports a Link conflict when an endpoint is excluded",()=>{

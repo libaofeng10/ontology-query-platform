@@ -21,7 +21,7 @@ export function SettingsWorkspace({sourceId,role,onRefresh}:{sourceId?:number;ro
   const [retrieval,setRetrieval]=useState<RetrievalForm>({vectorEnabled:true,topK:"8",vectorWeight:"0.4",minSimilarity:"0.35",semanticThreshold:"0.55"});
   const [profiling,setProfiling]=useState<ProfilingForm>({enabled:false,sampleLimit:"1000",maxTablesPerRefresh:"20",timeoutMs:"10000"});
   const [query,setQuery]=useState<QueryForm>({semanticQueryPlanMode:"off",queryAgentMode:"off",queryAgentTrafficPercent:"100",queryAgentMaxIterations:"8",queryAgentMaxSqlCalls:"5",queryAgentMaxScannedRows:"5000000",queryAgentPendingTtlMs:"600000",queryMaxRows:"500",explainMaxRows:"1000000",queryTimeoutMs:"30000",queryLlmTimeoutMs:"90000"});
-  const [ontologyAi,setOntologyAi]=useState<OntologyAiForm>({mode:"off",autoConfirmScore:"80",maxTables:"20",maxFields:"600",timeoutMs:"90000",criticEnabled:false,calibrationMinSamples:"40",calibrationMinPrecision:"0.95",maxManualObjectRate:"0.2",maxFailureRate:"0.05",maxP95LatencyMs:"90000",maxAverageTokens:"50000"});
+  const [ontologyAi,setOntologyAi]=useState<OntologyAiForm>({mode:"off",autoConfirmScore:"80",maxTables:"20",maxFields:"600",timeoutMs:"300000",criticEnabled:false,calibrationMinSamples:"40",calibrationMinPrecision:"0.95",maxManualObjectRate:"0.2",maxFailureRate:"0.05",maxP95LatencyMs:"90000",maxAverageTokens:"50000"});
   const [activeTab,setActiveTab]=useState<"runtime"|"prompts">("runtime");
   const [prompts,setPrompts]=useState<QueryPromptMap>(EMPTY_PROMPTS);
   const [promptChanges,setPromptChanges]=useState<Set<QueryPromptKey>>(()=>new Set());

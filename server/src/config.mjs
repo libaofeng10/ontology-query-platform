@@ -73,7 +73,7 @@ export const config = {
     autoConfirmScore:integerRangeFromEnv("ONTOLOGY_AI_AUTO_CONFIRM_SCORE",0,100,80),
     maxTables:integerRangeFromEnv("ONTOLOGY_AI_MAX_TABLES",1,20,20),
     maxFields:integerRangeFromEnv("ONTOLOGY_AI_MAX_FIELDS",1,600,600),
-    timeoutMs:integerRangeFromEnv("ONTOLOGY_AI_LLM_TIMEOUT_MS",1_000,600_000,90_000),
+    timeoutMs:integerRangeFromEnv("ONTOLOGY_AI_LLM_TIMEOUT_MS",1_000,600_000,300_000),
     criticEnabled:String(process.env.ONTOLOGY_AI_CRITIC_ENABLED??"false").toLowerCase()==="true",
     calibrationMinSamples:integerRangeFromEnv("ONTOLOGY_AI_CALIBRATION_MIN_SAMPLES",1,10_000,40),
     calibrationMinPrecision:numberRatioFromEnv("ONTOLOGY_AI_CALIBRATION_MIN_PRECISION",0.95),

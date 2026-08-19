@@ -37,3 +37,17 @@ test("存在其他活动批次时拒绝启动全域自动建模",()=>{
   const service=createOntologyDomainModelingService({domainPlanner:{plan:async()=>({domains:[]})},candidates:{listRuns:()=>[{id:"active",status:"running",scope:{domainName:"客户域"}}],createRun(){},runGeneration(){}}});
   assert.throws(()=>service.assertReady(1),(error)=>error.status===409&&/客户域/.test(error.message));
 });
+
+test("失败域重试沿用原编排并创建新批次，已成功域不会重复生成",async()=>{
+  const domains=[domain("bad","异常域","bad_table"),domain("ok","正常域","ok_table")];
+  const runs=[{id:"run-bad-old",status:"failed",scope:{orchestrationId:"task-original",domainPlanId:"bad"}},{id:"run-ok",status:"succeeded",scope:{orchestrationId:"task-original",domainPlanId:"ok"},summary:{objectCount:1}}];
+  const created=[];const calls=[];
+  const candidates={
+    listRuns:()=>runs,
+    createRun(input,actor,{taskId}){const run={id:`run-${input.domainPlanId}-retry`,status:"queued",scope:{...input},taskId,actor};created.push(run);runs.push(run);return run;},
+    async runGeneration({payload}){calls.push(payload.runId);const run=runs.find((item)=>item.id===payload.runId);if(run.status==="succeeded")return {objectCount:1,linkCount:0,autoConfirmedCount:1,reviewRequiredCount:0,blockedCount:0};run.status="succeeded";return {objectCount:2,linkCount:0,autoConfirmedCount:2,reviewRequiredCount:0,blockedCount:0};},
+  };
+  const service=createOntologyDomainModelingService({domainPlanner:{plan:async()=>({domains})},candidates});
+  const result=await service.run({task:{id:"task-retry"},source:{id:1},payload:{orchestrationId:"task-original",domainIds:["bad"]}});
+  assert.deepEqual(calls,["run-bad-retry"]);assert.equal(created.length,1);assert.equal(created[0].scope.orchestrationId,"task-original");assert.equal(created[0].taskId,"task-retry");assert.equal(result.orchestrationId,"task-original");assert.equal(result.succeededDomainCount,1);
+});

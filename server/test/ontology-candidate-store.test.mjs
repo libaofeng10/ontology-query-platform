@@ -68,6 +68,10 @@ test("draft creation applies candidates and cross-run replacement atomically",as
     assert.equal(fixture.store.listOntologySchemaVersions(fixture.source.id).length,0);
     assert.equal(fixture.store.getOntologyCandidate(selected.id).status,"confirmed");
 
+    assert.throws(()=>fixture.store.createOntologyDraftWithCandidates({...draftInput,validation:{ok:false,errors:[{code:"ONTOLOGY_LIMIT_EXCEEDED",path:"objectTypes",message:"对象超限"}],warnings:[]},candidateIds:[selected.id]}),/已阻止保存会丢失定义的草稿/);
+    assert.equal(fixture.store.listOntologySchemaVersions(fixture.source.id).length,0);
+    assert.equal(fixture.store.getOntologyCandidate(selected.id).status,"confirmed");
+
     const draft=fixture.store.createOntologyDraftWithCandidates({...draftInput,candidateIds:[selected.id]});
     assert.equal(draft.status,"draft");assert.equal(fixture.store.getOntologyCandidate(selected.id).appliedSchemaVersionId,draft.id);
     assert.equal(fixture.store.getOntologyCandidate(older.id).status,"superseded");assert.equal(fixture.store.getOntologyCandidate(older.id).supersededById,selected.id);

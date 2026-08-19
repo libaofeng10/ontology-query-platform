@@ -8,9 +8,9 @@ const FRESHNESS_VALUES=new Set(["realtime","hourly","daily","batch"]);
 const RELATION_KINDS=new Set(["contains","references","temporal"]);
 const TERM_MATCHES=new Set(["exact","close","broader"]);
 const DISCRIMINATOR_TYPES=new Set(["enum","string","integer"]);
-const MAX_OBJECT_TYPES=100;
-const MAX_PROPERTIES=2_000;
-const MAX_LINK_TYPES=500;
+const MAX_OBJECT_TYPES=1_000;
+const MAX_PROPERTIES=20_000;
+const MAX_LINK_TYPES=5_000;
 const MAX_DISJOINT_GROUPS=50;
 const MAX_HIERARCHY_DEPTH=3;
 

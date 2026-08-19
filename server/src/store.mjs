@@ -491,17 +491,24 @@ export function createStore(dbPath) {
     createOntologyDraftWithCandidates(item) {
       const id=db.transaction((input)=>{
         const candidateIds=[...new Set((input.candidateIds||[]).map(String))];
+        const repairFromSchemaVersionId=Number(input.repairFromSchemaVersionId)||null;
         if(!candidateIds.length)throw storeConflict("没有可应用的已确认候选");
+        if((input.validation?.errors||[]).some((issue)=>issue?.code==="ONTOLOGY_LIMIT_EXCEEDED"))throw storeConflict("Schema 超出容量上限，已阻止保存会丢失定义的草稿");
         const currentPublished=db.prepare(`SELECT id FROM ds_ontology_schema_version WHERE source_id=? AND status='published' ORDER BY version DESC LIMIT 1`).get(input.sourceId);
         if((currentPublished?.id||null)!==(input.expectedPublishedSchemaVersionId||null))throw storeConflict("当前发布 Schema 已变化，请基于最新版本重新生成批次");
         if(input.baseSchemaVersionId!=null) {
           const base=db.prepare(`SELECT source_id AS sourceId FROM ds_ontology_schema_version WHERE id=?`).get(input.baseSchemaVersionId);
           if(!base||Number(base.sourceId)!==Number(input.sourceId))throw storeConflict("基础 Schema 版本不存在或不属于当前数据源");
         }
+        if(repairFromSchemaVersionId) {
+          const previous=db.prepare(`SELECT source_id AS sourceId,status FROM ds_ontology_schema_version WHERE id=?`).get(repairFromSchemaVersionId);
+          if(!previous||Number(previous.sourceId)!==Number(input.sourceId)||previous.status!=="draft")throw storeConflict("待修复草稿不存在、已发布或不属于当前数据源");
+        }
+        const allowedRunIds=new Set((input.runIds||[input.runId]).map(String));
         const candidates=candidateIds.map((candidateId)=>this.getOntologyCandidate(candidateId));
         if(candidates.some((candidate)=>!candidate))throw storeConflict("待应用候选不存在，请刷新后重试");
-        if(candidates.some((candidate)=>candidate.runId!==input.runId||Number(candidate.sourceId)!==Number(input.sourceId)))throw storeConflict("待应用候选不属于当前生成批次");
-        if(candidates.some((candidate)=>!["auto_confirmed","confirmed"].includes(candidate.status)))throw storeConflict("候选状态已变化，请刷新后重试");
+        if(candidates.some((candidate)=>!allowedRunIds.has(candidate.runId)||Number(candidate.sourceId)!==Number(input.sourceId)))throw storeConflict("待应用候选不属于当前生成批次");
+        if(candidates.some((candidate)=>!["auto_confirmed","confirmed"].includes(candidate.status)&&!(repairFromSchemaVersionId&&candidate.status==="applied"&&Number(candidate.appliedSchemaVersionId)===repairFromSchemaVersionId)))throw storeConflict("候选状态已变化，请刷新后重试");
 
         const current=db.prepare(`SELECT COALESCE(MAX(version),0) AS version FROM ds_ontology_schema_version WHERE source_id=?`).get(input.sourceId);
         const version=Number(current.version)+1;
@@ -511,13 +518,18 @@ export function createStore(dbPath) {
         const olderCandidates=db.prepare(`SELECT id FROM ds_ontology_candidate WHERE source_id=? AND candidate_type=? AND stable_key=? AND run_id<>? AND rowid<? AND status IN ('auto_confirmed','confirmed') ORDER BY rowid`);
         for(const candidate of candidates) {
           const before=this.getOntologyCandidate(candidate.id);
-          const applied=db.prepare(`UPDATE ds_ontology_candidate SET status='applied',applied_schema_version_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`).run(schemaVersionId,before.id,before.status);
+          const reapplied=before.status==="applied";
+          const applied=reapplied
+            ?db.prepare(`UPDATE ds_ontology_candidate SET applied_schema_version_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='applied' AND applied_schema_version_id=?`).run(schemaVersionId,before.id,repairFromSchemaVersionId)
+            :db.prepare(`UPDATE ds_ontology_candidate SET status='applied',applied_schema_version_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`).run(schemaVersionId,before.id,before.status);
           if(applied.changes!==1)throw storeConflict("候选状态已变化，请刷新后重试");
           const after=this.getOntologyCandidate(before.id);
-          db.prepare(`INSERT INTO ds_ontology_candidate_event(candidate_id,run_id,source_id,event_type,actor,from_status,to_status,note,before_json,after_json) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(before.id,before.runId,before.sourceId,"applied",input.createdBy||null,before.status,"applied",`应用到 Schema 草稿 v${version}`,JSON.stringify(before),JSON.stringify(after));
+          db.prepare(`INSERT INTO ds_ontology_candidate_event(candidate_id,run_id,source_id,event_type,actor,from_status,to_status,note,before_json,after_json) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(before.id,before.runId,before.sourceId,reapplied?"reapplied":"applied",input.createdBy||null,before.status,"applied",reapplied?`从异常草稿重建到 Schema 草稿 v${version}`:`应用到 Schema 草稿 v${version}`,JSON.stringify(before),JSON.stringify(after));
 
+          if(reapplied)continue;
           const rowNumber=candidateRowNumber.get(before.id)?.rowNumber;
           for(const older of olderCandidates.all(before.sourceId,before.candidateType,before.stableKey,before.runId,rowNumber)) {
+            if(candidateIds.includes(older.id))continue;
             const supersededBefore=this.getOntologyCandidate(older.id);
             const superseded=db.prepare(`UPDATE ds_ontology_candidate SET status='superseded',superseded_by_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`).run(before.id,supersededBefore.id,supersededBefore.status);
             if(superseded.changes!==1)throw storeConflict("跨批次同键候选状态已变化，请刷新后重试");
@@ -556,9 +568,10 @@ export function createStore(dbPath) {
       const row=db.prepare(`SELECT id,source_id AS sourceId,task_id AS taskId,mode,scope_json AS scopeJson,catalog_checksum AS catalogChecksum,base_schema_version_id AS baseSchemaVersionId,model_name AS modelName,prompt_version AS promptVersion,scoring_version AS scoringVersion,status,progress,summary_json AS summaryJson,token_usage_json AS tokenUsageJson,error,created_by AS createdBy,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,updated_at AS updatedAt FROM ds_ontology_generation_run WHERE id=?`).get(id);
       return row?parseOntologyGenerationRun(row):null;
     },
-    listOntologyGenerationRuns(sourceId,limit=50) {
-      return db.prepare(`SELECT id,source_id AS sourceId,task_id AS taskId,mode,scope_json AS scopeJson,catalog_checksum AS catalogChecksum,base_schema_version_id AS baseSchemaVersionId,model_name AS modelName,prompt_version AS promptVersion,scoring_version AS scoringVersion,status,progress,summary_json AS summaryJson,token_usage_json AS tokenUsageJson,error,created_by AS createdBy,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,updated_at AS updatedAt FROM ds_ontology_generation_run WHERE source_id=? ORDER BY created_at DESC,id DESC LIMIT ?`).all(sourceId,Math.max(1,Math.min(500,Number(limit)||50))).map(parseOntologyGenerationRun);
+    listOntologyGenerationRuns(sourceId,limit=50,offset=0) {
+      return db.prepare(`SELECT id,source_id AS sourceId,task_id AS taskId,mode,scope_json AS scopeJson,catalog_checksum AS catalogChecksum,base_schema_version_id AS baseSchemaVersionId,model_name AS modelName,prompt_version AS promptVersion,scoring_version AS scoringVersion,status,progress,summary_json AS summaryJson,token_usage_json AS tokenUsageJson,error,created_by AS createdBy,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,updated_at AS updatedAt FROM ds_ontology_generation_run WHERE source_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`).all(sourceId,Math.max(1,Math.min(500,Number(limit)||50)),Math.max(0,Number(offset)||0)).map(parseOntologyGenerationRun);
     },
+    countOntologyGenerationRuns(sourceId) { return Number(db.prepare(`SELECT COUNT(*) AS count FROM ds_ontology_generation_run WHERE source_id=?`).get(sourceId)?.count||0); },
     transitionOntologyGenerationRun(item) {
       return db.transaction((input)=>{
         const before=this.getOntologyGenerationRun(input.id);

@@ -183,19 +183,20 @@ export type OntologyDomainPlanTable = { tableName:string; comment:string|null; g
 export type OntologyDomainPlanDomain = { id:string; domainKey:string; name:string; description:string; namingSource:"llm"|"fallback"; tableCount:number; batchIndex:number; batchCount:number; tables:OntologyDomainPlanTable[]; relationCount:number; signal:"relations"|"prefix"|"mixed" };
 export type OntologyDomainPlan = { sourceId:number; generatedAt?:string; namingSource?:"llm"|"fallback"; llmError?:string|null; eligibleTableCount?:number; confirmedRelationCount?:number; maxTables?:number; domains:OntologyDomainPlanDomain[]|null; stored:boolean; storedAt?:string; stale?:boolean };
 export type OntologyDomainModelingDomainResult={domainId:string;domainName:string;runId:string|null;status:"succeeded"|"failed";error?:string;objectCount:number;linkCount:number;autoConfirmedCount:number;reviewRequiredCount:number;blockedCount:number};
-export type OntologyDomainModelingResult={sourceId:number;domainCount:number;succeededDomainCount:number;failedDomainCount:number;objectCount:number;linkCount:number;autoConfirmedCount:number;reviewRequiredCount:number;blockedCount:number;runIds:string[];domains:OntologyDomainModelingDomainResult[]};
+export type OntologyDomainModelingResult={sourceId:number;orchestrationId?:string;domainCount:number;succeededDomainCount:number;failedDomainCount:number;objectCount:number;linkCount:number;autoConfirmedCount:number;reviewRequiredCount:number;blockedCount:number;runIds:string[];domains:OntologyDomainModelingDomainResult[]};
 export type SemanticSchemaDiffChange = { type:string;kind:"schema"|"object"|"property"|"link"|"disjoint_group"; change:"added"|"removed"|"changed"; path:string; label:string; impact:"compatible"|"review"|"breaking"; detail:string };export type SemanticSchemaEvaluationImpact = { summary:{breakingChanges:number;reviewChanges:number;affectedCases:number;affectedSets:number;uncoveredChanges:number;requiresEvaluation:boolean;hierarchyChanged?:boolean;subtypeRootCoverageMissing?:boolean;readyToPublish?:boolean}; affectedCases:Array<{id:number;setName:string;question:string;category:string;reasons:string[];changePaths:string[]}>; affectedSets:string[]; uncoveredChanges:Array<{path:string;label:string;impact:"review"|"breaking";detail:string}>; gateEvidence?:Array<{setName:string;passed:boolean;gateId:string|null;createdAt:string|null;subtypeRootObjects?:string[]}>; subtypeRootCoverage?:string[] };
 export type SemanticSchemaDiff = { ok:boolean; sourceId:number; currentVersion:number; baseVersion:number; summary:{added:number;removed:number;changed:number;breaking:number;review:number;compatible:number;total:number}; changes:SemanticSchemaDiffChange[]; evaluationImpact?:SemanticSchemaEvaluationImpact };
 
 export type OntologyGenerationRun = {
   id:string; sourceId:number; taskId:string|null; mode:"selected_tables"|"business_domain";
-  scope:{tableNames:string[];domainName?:string;domainDescription?:string;namespace?:string;nonSensitiveFieldCount?:number;batches?:Array<{id:string;tableNames:string[];fieldCount:number}>;limits?:{maxTables:number;maxFields:number};modelingMode?:"off"|"review"|"auto_draft";autoConfirmScore?:number;publishedSchemaVersionIdAtStart?:number|null;orchestrationId?:string|null;domainPlanId?:string|null;domainKey?:string|null;domainBatchIndex?:number|null;domainBatchCount?:number|null};
+  scope:{tableNames:string[];domainName?:string;domainDescription?:string;namespace?:string;nonSensitiveFieldCount?:number;batches?:Array<{id:string;tableNames:string[];fieldCount:number}>;limits?:{maxTables:number;maxFields:number};modelingMode?:"off"|"review"|"auto_draft";autoConfirmScore?:number;llmTimeoutMs?:number;publishedSchemaVersionIdAtStart?:number|null;orchestrationId?:string|null;domainPlanId?:string|null;domainKey?:string|null;domainBatchIndex?:number|null;domainBatchCount?:number|null};
   catalogChecksum:string;baseSchemaVersionId:number|null;modelName:string|null;promptVersion:string;scoringVersion:string;
   catalogCurrent?:boolean;
   status:"queued"|"running"|"succeeded"|"failed"|"cancelled";progress:number;
   summary:{tableCount?:number;nonSensitiveFieldCount?:number;includedFieldCount?:number;truncatedFieldCount?:number;batchCount?:number;confirmedRelationCount?:number;includedRelationCount?:number;crossBatchRelationCount?:number;excludedSensitiveRelationCount?:number;excludedInvalidRelationCount?:number;candidateCount?:number;objectCount?:number;linkCount?:number;autoConfirmedCount?:number;reviewRequiredCount?:number;blockedCount?:number;normalizationIssueCount?:number;objectCoveredTableCount?:number;objectMissingTableCount?:number;objectMissingTables?:string[];lastSupplementalLinkError?:string|null};
   tokenUsage:{promptTokens?:number;completionTokens?:number;totalTokens?:number};error:string|null;createdBy:string;createdAt:string;startedAt:string|null;finishedAt:string|null;updatedAt:string;
 };
+export type OntologyGenerationRunPage={items:OntologyGenerationRun[];total:number;page:number;pageSize:number;totalPages:number};
 export type OntologyGenerationTraceSummary={fileName:string;runId:string;batchId:string;modelName:string|null;promptVersion:string|null;durationMs:number;usage:{promptTokens?:number;completionTokens?:number;totalTokens?:number}|null;error:string|null;hasOutput:boolean;sizeBytes:number;updatedAt:string};
 export type OntologyGenerationTraceDetail=OntologyGenerationTraceSummary&{messages:Array<{role:string;content:string}>;rawOutput:unknown};
 export type OntologyCandidateStatus="generated"|"blocked"|"auto_confirmed"|"review_required"|"confirmed"|"rejected"|"superseded"|"applied";
@@ -212,8 +213,20 @@ export type OntologyBulkDecisionResult={sourceId:number;decision:"confirm"|"reje
 export type OntologyConflictResolution="keep_existing"|"use_candidate";
 export type OntologyDraftConflict={candidateId:string;candidateType:"object"|"link";stableKey:string;reason:string;existingApiName?:string;source?:string;target?:string;allowedResolutions:OntologyConflictResolution[];resolution:OntologyConflictResolution|"unresolved"};
 export type OntologyDraftDiff=Pick<SemanticSchemaDiff,"ok"|"summary"|"changes">;
-export type OntologyDraftPreview = {schema:SemanticSchema;validation:SemanticSchemaValidation;diff:OntologyDraftDiff;conflicts:OntologyDraftConflict[];excludedCandidateIds:string[];summary:{objectsAdded:number;propertiesAdded:number;linksAdded:number;candidateCount:number;conflictCount:number;resolvedConflictCount:number;unresolvedConflictCount:number;excludedCount:number}};
+export type OntologyDraftPreview = {schema:SemanticSchema;validation:SemanticSchemaValidation;diff:OntologyDraftDiff;conflicts:OntologyDraftConflict[];excludedCandidateIds:string[];summary:{objectsAdded:number;propertiesAdded:number;linksAdded:number;renamedLinkCount?:number;candidateCount:number;conflictCount:number;resolvedConflictCount:number;unresolvedConflictCount:number;excludedCount:number}};
 export type OntologyDraftApplyResult = Omit<OntologyDraftPreview,"schema"> & {draft:SemanticSchemaVersion};
+export type OntologyDomainWorkflowSummary={
+  orchestrationId:string;sourceId:number;taskStatus:BackgroundTask["status"];
+  domainCount:number;succeededDomainCount:number;failedDomainCount:number;activeDomainCount:number;
+  candidateCount:number;objectCount:number;linkCount:number;reviewRequiredCount:number;acceptedCount:number;appliedCount:number;blockedCount:number;rejectedCount:number;
+  catalogCurrent:boolean;readyForDraft:boolean;baseSchemaVersionId:number|null;draftSchemaVersionId:number|null;draftValidationOk:boolean|null;repairable:boolean;
+  activeTask:{id:string;status:BackgroundTask["status"];progress:number;total:number;currentStep:string|null;updatedAt:string}|null;
+  nextReviewRun:{id:string;domainName:string;pendingCount:number}|null;
+  failedDomains:Array<{domainId:string;domainName:string;error:string}>;
+};
+export type OntologyDomainDraftPreview=OntologyDraftPreview&{workflow:OntologyDomainWorkflowSummary};
+export type OntologyDomainDraftApplyResult=OntologyDraftApplyResult&{workflow:OntologyDomainWorkflowSummary;partial:boolean};
+export type OntologyDomainDraftRepairResult={draft:SemanticSchemaVersion;validation:SemanticSchemaValidation;summary?:OntologyDraftPreview["summary"];repairedFromVersionId:number;reused:boolean};
 export type OntologyCalibrationCondition={id:string;label:string;passed:boolean;actual:number|boolean|null;target:string};
 export type OntologyCalibrationReport={
   sourceId:number;runIds:string[];scoringVersion:string|null;promptVersion:string|null;mode:"off"|"review"|"auto_draft";autoConfirmScore:number;autoConfirmScoreSource:"source"|"global";

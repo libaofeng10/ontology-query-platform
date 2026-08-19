@@ -18,7 +18,7 @@ export function createOntologyCandidateGenerator({llm,fetchImpl=globalThis.fetch
       const started=Date.now();let traced;
       try {
         const extraBody=/dashscope|\.maas\.aliyuncs\.com/i.test(String(llm?.baseUrl||""))?{enable_thinking:false}:{};
-        const requestTimeout=typeof timeoutMs==="function"?timeoutMs():timeoutMs;
+        const requestTimeout=runTimeout(run,timeoutMs);
         const runLlm={baseUrl:llm?.baseUrl,apiKey:llm?.apiKey,model:run.modelName||llm?.model};
         traced=await callJson(runLlm,messages,{timeoutMs:requestTimeout,fetchImpl,extraBody});
       } catch(error) {
@@ -45,7 +45,7 @@ export function createOntologyCandidateGenerator({llm,fetchImpl=globalThis.fetch
     onProgress({progress:82,total:100,currentStep:phase==="supplemental"?"补充识别 Link 候选":"识别 Link 候选"});
     const messages=linkGenerationMessages({run,scope,catalog,knowledgePages});const started=Date.now();let traced;
     try {
-      const requestTimeout=typeof timeoutMs==="function"?timeoutMs():timeoutMs;
+      const requestTimeout=runTimeout(run,timeoutMs);
       const runLlm={baseUrl:llm?.baseUrl,apiKey:llm?.apiKey,model:run.modelName||llm?.model};
       const extraBody=/dashscope|\.maas\.aliyuncs\.com/i.test(String(llm?.baseUrl||""))?{enable_thinking:false}:{};
       traced=await callJson(runLlm,messages,{timeoutMs:requestTimeout,fetchImpl,extraBody});
@@ -59,6 +59,13 @@ export function createOntologyCandidateGenerator({llm,fetchImpl=globalThis.fetch
     return {candidates:stored,calls:[callSummary],tokenUsage:usageObject(traced.usage),normalizationIssues:normalized.issues,eligibleRelationCount:scope.relations.length};
   }
   return {generateObjects,generateLinks};
+}
+
+function runTimeout(run,configuredTimeout) {
+  const snapshotted=Number(run?.scope?.llmTimeoutMs);
+  if(Number.isInteger(snapshotted)&&snapshotted>=1_000&&snapshotted<=600_000)return snapshotted;
+  const configured=Number(typeof configuredTimeout==="function"?configuredTimeout():configuredTimeout);
+  return Number.isInteger(configured)&&configured>=1_000&&configured<=600_000?configured:300_000;
 }
 
 export function buildObjectGenerationScope({catalog,tableNames,maxFields=600}={}) {

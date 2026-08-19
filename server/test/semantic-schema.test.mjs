@@ -7,9 +7,19 @@ import test from "node:test";
 import { createApp } from "../src/server.mjs";
 import { evalSetChecksum } from "../src/evaluation-evidence.mjs";
 import { createSemanticSchemaService } from "../src/semantic-schema-service.mjs";
+import { validateSemanticSchema } from "../src/semantic-schema.mjs";
 import { diffSemanticSchemas } from "../src/semantic-schema-diff.mjs";
 import { analyzeSemanticSchemaImpact } from "../src/semantic-schema-impact.mjs";
 import { createStore } from "../src/store.mjs";
+
+test("full-domain schemas retain hundreds of objects and thousands of properties without truncation",()=>{
+  const properties=Array.from({length:12},(_,index)=>({apiName:`field_${index}`,displayName:`字段 ${index}`,type:"string",required:index===0,mapping:{table:"wide_table",column:"id"}}));
+  const schema={name:"enterprise",displayName:"企业全域本体",objectTypes:Array.from({length:344},(_,index)=>({apiName:`object_${index}`,displayName:`对象 ${index}`,primaryKey:"field_0",properties})),linkTypes:[]};
+  const validation=validateSemanticSchema(schema,{tables:[{tableName:"wide_table",active:1,grade:"A"}],columnsByTable:{wide_table:[{columnName:"id",dataType:"varchar",nullable:0,isSensitive:0}]},relations:[]});
+  assert.equal(validation.errors.some((issue)=>issue.code==="ONTOLOGY_LIMIT_EXCEEDED"),false,JSON.stringify(validation.errors.slice(0,3)));
+  assert.equal(validation.schema.objectTypes.length,344);
+  assert.equal(validation.summary.properties,4_128);
+});
 
 test("semantic schema validates typed object mappings and confirmed links",async()=>{
   const fixture=await createFixture();

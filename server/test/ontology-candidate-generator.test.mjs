@@ -91,13 +91,13 @@ test("normalizer derives types and mappings locally while flagging allowlist vio
 
 test("generator records restricted prompt/output traces and token usage",async()=>{
   const auditDir=await mkdtemp(join(tmpdir(),"ontoquery-generation-audit-"));
-  const catalog=wideCatalog();const scope=buildObjectGenerationScope({catalog,tableNames:["wide_account"],maxFields:4});const run=runFor(scope);
+  const catalog=wideCatalog();const scope=buildObjectGenerationScope({catalog,tableNames:["wide_account"],maxFields:4});const run=runFor(scope);run.scope.llmTimeoutMs=300_000;
   const raw={candidates:[{tableName:"wide_account",apiName:"account",displayName:"账号",primaryKeyColumn:"account_id",properties:[{column:"account_id"}]}]};
-  let calledModel=null;
-  const generator=createOntologyCandidateGenerator({llm:{baseUrl:"https://llm.test/v1",apiKey:"key",model:"changed-after-run-start"},auditDir,callJson:async(llm)=>{calledModel=llm.model;return {value:raw,rawContent:JSON.stringify(raw),usage:{promptTokens:10,completionTokens:5,totalTokens:15}};}});
+  let calledModel=null;let calledTimeout=null;
+  const generator=createOntologyCandidateGenerator({llm:{baseUrl:"https://llm.test/v1",apiKey:"key",model:"changed-after-run-start"},timeoutMs:90_000,auditDir,callJson:async(llm,_messages,options)=>{calledModel=llm.model;calledTimeout=options.timeoutMs;return {value:raw,rawContent:JSON.stringify(raw),usage:{promptTokens:10,completionTokens:5,totalTokens:15}};}});
   const seen=[];const result=await generator.generateObjects({run,catalog,onCandidate:async(candidate)=>{seen.push(candidate);return {id:"stored"};}});
   assert.equal(seen.length,1);assert.equal(result.candidates[0].id,"stored");assert.equal(result.tokenUsage.totalTokens,15);assert.equal(result.calls[0].traceStored,true);
-  assert.equal(calledModel,run.modelName);
+  assert.equal(calledModel,run.modelName);assert.equal(calledTimeout,300_000);
   const traceFile=join(auditDir,run.id,"object-001.json");
   assert.equal((await stat(traceFile)).mode&0o777,0o600);
   const trace=JSON.parse(await readFile(traceFile,"utf8"));

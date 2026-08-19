@@ -2,11 +2,12 @@ import { normalizeOntologyNamespace } from "./ontology-candidate-score.mjs";
 
 const APPLICABLE_STATUSES=new Set(["auto_confirmed","confirmed"]);
 
-export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCandidateIds=[],conflictResolutions={}}={}) {
+export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCandidateIds=[],conflictResolutions={},applicableStatuses=APPLICABLE_STATUSES}={}) {
   const excluded=new Set(excludeCandidateIds||[]);const conflicts=[];const includedCandidates=[];
   const schema=baseSchema?structuredClone(baseSchema):{name:normalizeOntologyNamespace(run?.scope?.namespace||run?.scope?.domainName),displayName:String(run?.scope?.domainName||"AI 生成业务本体").trim()||"AI 生成业务本体",description:String(run?.scope?.domainDescription||"").trim(),objectTypes:[],linkTypes:[]};
   schema.objectTypes=Array.isArray(schema.objectTypes)?schema.objectTypes:[];schema.linkTypes=Array.isArray(schema.linkTypes)?schema.linkTypes:[];
-  const eligible=(candidates||[]).filter((candidate)=>candidate.runId===run.id&&Number(candidate.sourceId)===Number(run.sourceId)&&APPLICABLE_STATUSES.has(candidate.status)&&!excluded.has(candidate.id));
+  const allowedStatuses=applicableStatuses instanceof Set?applicableStatuses:new Set(applicableStatuses||[]);
+  const eligible=(candidates||[]).filter((candidate)=>candidate.runId===run.id&&Number(candidate.sourceId)===Number(run.sourceId)&&allowedStatuses.has(candidate.status)&&!excluded.has(candidate.id));
   const objects=eligible.filter((candidate)=>candidate.candidateType==="object").sort(byStableKey);const links=eligible.filter((candidate)=>candidate.candidateType==="link").sort(byStableKey);
   const objectByApi=new Map(schema.objectTypes.map((object)=>[object.apiName,object]));const objectByTable=new Map();
   for(const object of schema.objectTypes)for(const table of mappedTables(object))if(!objectByTable.has(table))objectByTable.set(table,object);
@@ -37,8 +38,22 @@ export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCan
     }
     schema.linkTypes.push(payload);linkByApi.set(payload.apiName,payload);if(relationId)linkByRelation.set(relationId,payload);includedCandidates.push(candidate);
   }
+  const renamedLinks=ensureUniqueLinkNames(schema.linkTypes);
   const baseObjectCount=baseSchema?.objectTypes?.length||0;const baseLinkCount=baseSchema?.linkTypes?.length||0;const basePropertyCount=propertyCount(baseSchema?.objectTypes);
-  return {schema,includedCandidates,conflicts,excludedCandidateIds:[...excluded],summary:{objectsAdded:Math.max(0,schema.objectTypes.length-baseObjectCount),propertiesAdded:Math.max(0,propertyCount(schema.objectTypes)-basePropertyCount),linksAdded:Math.max(0,schema.linkTypes.length-baseLinkCount),candidateCount:includedCandidates.length,conflictCount:conflicts.length,resolvedConflictCount:conflicts.filter((item)=>item.resolution!=="unresolved").length,unresolvedConflictCount:conflicts.filter((item)=>item.resolution==="unresolved").length,excludedCount:excluded.size}};
+  return {schema,includedCandidates,conflicts,renamedLinks,excludedCandidateIds:[...excluded],summary:{objectsAdded:Math.max(0,schema.objectTypes.length-baseObjectCount),propertiesAdded:Math.max(0,propertyCount(schema.objectTypes)-basePropertyCount),linksAdded:Math.max(0,schema.linkTypes.length-baseLinkCount),renamedLinkCount:renamedLinks.length,candidateCount:includedCandidates.length,conflictCount:conflicts.length,resolvedConflictCount:conflicts.filter((item)=>item.resolution!=="unresolved").length,unresolvedConflictCount:conflicts.filter((item)=>item.resolution==="unresolved").length,excludedCount:excluded.size}};
+}
+
+function ensureUniqueLinkNames(links) {
+  const used=new Map();const renamed=[];
+  for(const [index,link] of (links||[]).entries())for(const field of ["apiName","inverseApiName"]) {
+    const original=String(link?.[field]||"").trim();if(!original)continue;
+    if(!used.has(original)){used.set(original,{index,field});continue;}
+    const direction=field==="inverseApiName"?`${link.target}_to_${link.source}`:`${link.source}_to_${link.target}`;
+    const base=`${original}_${direction}`.replace(/[^a-z0-9_]/g,"_").replace(/_+/g,"_").replace(/^_+|_+$/g,"")||`${original}_link`;
+    let value=base,suffix=2;while(used.has(value))value=`${base}_${suffix++}`;
+    link[field]=value;used.set(value,{index,field});renamed.push({index,field,from:original,to:value,conflictsWith:used.get(original)});
+  }
+  return renamed;
 }
 
 function resolvedConflict({candidate,candidateType,reason,existingApiName,source,target,allowedResolutions,conflictResolutions}) {
@@ -58,4 +73,4 @@ function relationIds(link) { return [...new Set((link?.relationMappings||[]).map
 function byStableKey(left,right) { return String(left.stableKey).localeCompare(String(right.stableKey)); }
 function equalJson(left,right) { return JSON.stringify(left)===JSON.stringify(right); }
 
-export const ontologyDraftAssemblerInternal={objectCore,linkCore,mappedTables,relationIds};
+export const ontologyDraftAssemblerInternal={objectCore,linkCore,mappedTables,relationIds,ensureUniqueLinkNames};
