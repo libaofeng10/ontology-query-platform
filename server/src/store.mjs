@@ -46,7 +46,7 @@ const SCHEMA = [
     id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL, kind TEXT NOT NULL,
     scope TEXT NOT NULL, table_name TEXT, column_name TEXT, question TEXT NOT NULL,
     evidence TEXT NOT NULL, options TEXT NOT NULL, answer TEXT, answered_at TEXT,
-    outruled_by TEXT, status TEXT NOT NULL DEFAULT 'pending', relation_id INTEGER
+    outruled_by TEXT, status TEXT NOT NULL DEFAULT 'pending', relation_id INTEGER, enum_value TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS ds_relation_analysis (
     source_id INTEGER PRIMARY KEY, model_status TEXT NOT NULL, model_name TEXT,
@@ -274,6 +274,7 @@ const MIGRATIONS = [
   `ALTER TABLE ds_relation ADD COLUMN structural_reason TEXT`,
   `ALTER TABLE ds_relation ADD COLUMN evaluated_at TEXT`,
   `ALTER TABLE ds_question ADD COLUMN relation_id INTEGER`,
+  `ALTER TABLE ds_question ADD COLUMN enum_value TEXT`,
   `ALTER TABLE ds_audit ADD COLUMN planning_mode TEXT`,
   `ALTER TABLE ds_audit ADD COLUMN query_plan_json TEXT`,
   `ALTER TABLE ds_audit ADD COLUMN ontology_schema_version INTEGER`,
@@ -315,6 +316,26 @@ export function createStore(dbPath) {
   db.prepare(`CREATE INDEX IF NOT EXISTS idx_ds_relation_source_inference ON ds_relation(source_id, present, inference_source, status)`).run();
   db.prepare(`CREATE INDEX IF NOT EXISTS idx_ds_eval_gate_source_schema_set ON ds_eval_gate(source_id, ontology_schema_version, set_name, passed)`).run();
   db.pragma("optimize");
+
+  const answerEnumQuestionTransaction=db.transaction(({id,answer,outruledBy=null})=>{
+    const question=db.prepare(`SELECT id,source_id AS sourceId,kind,table_name AS tableName,column_name AS columnName,enum_value AS enumValue,options,status FROM ds_question WHERE id=?`).get(id);
+    if(!question)return {ok:false,reason:"not_found"};
+    if(question.status!=="pending")return {ok:false,reason:"not_pending"};
+    if(question.kind!=="枚举含义")return {ok:false,reason:"invalid_kind"};
+    const options=parseQuestionOptions(question.options);
+    if(!options.length)return {ok:false,reason:"invalid_options"};
+    const normalizedAnswer=typeof answer==="string"?answer.trim():"";
+    if(!options.includes(normalizedAnswer))return {ok:false,reason:"answer_not_allowed",options};
+    if(!question.tableName||!question.columnName||question.enumValue==null)return {ok:false,reason:"invalid_binding"};
+    if(normalizedAnswer!=="补充说明"){
+      const existing=db.prepare(`SELECT meaning,meaning_source AS meaningSource FROM ds_enum WHERE source_id=? AND table_name=? AND column_name=? AND value=?`).get(question.sourceId,question.tableName,question.columnName,String(question.enumValue));
+      if(existing?.meaning!=null&&existing.meaningSource==="human"&&String(existing.meaning)!==normalizedAnswer)return {ok:false,reason:"meaning_conflict"};
+    }
+    const claimed=db.prepare(`UPDATE ds_question SET answer=?,answered_at=CURRENT_TIMESTAMP,outruled_by=?,status='answered' WHERE id=? AND status='pending'`).run(normalizedAnswer,outruledBy,id).changes;
+    if(claimed!==1)return {ok:false,reason:"not_pending"};
+    if(normalizedAnswer!=="补充说明")db.prepare(`INSERT INTO ds_enum(source_id,table_name,column_name,value,count,ratio,meaning,meaning_source) VALUES(?,?,?,?,NULL,NULL,?,'human') ON CONFLICT(source_id,table_name,column_name,value) DO UPDATE SET meaning=excluded.meaning,meaning_source=excluded.meaning_source`).run(question.sourceId,question.tableName,question.columnName,String(question.enumValue),normalizedAnswer);
+    return {ok:true,changes:1,wroteMeaning:normalizedAnswer!=="补充说明"};
+  });
 
   return {
     db,
@@ -375,7 +396,7 @@ export function createStore(dbPath) {
       const profiles=new Map(this.listColumnProfiles(sourceId,tableName).map((profile)=>[profile.columnName,profile]));
       return db.prepare(`SELECT source_id AS sourceId,table_name AS tableName,column_name AS columnName,data_type AS dataType,nullable,null_rate AS nullRate,cardinality,is_sensitive AS isSensitive,comment,is_primary AS isPrimary,is_unique AS isUnique,is_indexed AS isIndexed FROM ds_column WHERE source_id=? AND table_name=? AND present=1 ORDER BY rowid`).all(sourceId,tableName).map((column)=>({...column,profile:profiles.get(column.columnName)||null}));
     },
-    listEnums: (sourceId, tableName) => db.prepare(`SELECT column_name AS columnName,value,count,ratio,meaning FROM ds_enum WHERE source_id=? AND table_name=? ORDER BY column_name,count DESC`).all(sourceId, tableName),
+    listEnums: (sourceId, tableName) => db.prepare(`SELECT column_name AS columnName,value,count,ratio,meaning,meaning_source AS meaningSource FROM ds_enum WHERE source_id=? AND table_name=? ORDER BY column_name,count DESC`).all(sourceId, tableName),
     upsertTermAnchor(input) {
       const item={vocabulary:String(input.vocabulary||"").trim(),canonicalId:String(input.canonicalId||"").trim(),prefLabelZh:input.prefLabelZh==null?null:String(input.prefLabelZh).trim()||null,prefLabelEn:input.prefLabelEn==null?null:String(input.prefLabelEn).trim()||null,altLabels:[...new Set((Array.isArray(input.altLabels)?input.altLabels:[]).map((value)=>String(value).trim()).filter(Boolean))],kind:String(input.kind||"object").trim().toLowerCase(),broaderCanonicalId:input.broaderCanonicalId==null?null:String(input.broaderCanonicalId).trim()||null,note:input.note==null?null:String(input.note).trim()||null};
       if(!item.vocabulary||!item.canonicalId)throw new Error("术语锚点 vocabulary 与 canonicalId 必填");
@@ -396,14 +417,18 @@ export function createStore(dbPath) {
     listRelations: (sourceId, acceptedOnly=false, includeRejected=false) => db.prepare(`SELECT id,from_table AS fromTable,from_col AS fromCol,to_table AS toTable,to_col AS toCol,cardinality,confidence,overlap_ratio AS overlapRatio,status,inference_source AS inferenceSource,model_decision AS modelDecision,model_confidence AS modelConfidence,model_reason AS modelReason,model_name AS modelName,structural_score AS structuralScore,structural_reason AS structuralReason,evaluated_at AS evaluatedAt FROM ds_relation WHERE source_id=? AND present=1 ${acceptedOnly ? "AND status IN ('accepted','confirmed')" : includeRejected ? "" : "AND status NOT IN ('rejected','denied')"} ORDER BY confidence DESC`).all(sourceId),
     getRelationByKey: (sourceId,fromTable,fromCol,toTable,toCol) => db.prepare(`SELECT id,source_id AS sourceId,from_table AS fromTable,from_col AS fromCol,to_table AS toTable,to_col AS toCol,cardinality,confidence,overlap_ratio AS overlapRatio,status,inference_source AS inferenceSource,model_decision AS modelDecision,model_confidence AS modelConfidence,model_reason AS modelReason,model_name AS modelName,structural_score AS structuralScore,structural_reason AS structuralReason,evaluated_at AS evaluatedAt FROM ds_relation WHERE source_id=? AND from_table=? AND from_col=? AND to_table=? AND to_col=?`).get(sourceId,fromTable,fromCol,toTable,toCol),
     addQuestion(question) {
-      const existing=db.prepare(`SELECT id FROM ds_question WHERE source_id=@sourceId AND kind=@kind AND ((@relationId IS NOT NULL AND relation_id=@relationId) OR (@relationId IS NULL AND COALESCE(table_name,'')=COALESCE(@tableName,'') AND COALESCE(column_name,'')=COALESCE(@columnName,'') AND question=@question)) AND status='pending'`).get({tableName:null,columnName:null,relationId:null,...question});
+      const existing=db.prepare(`SELECT id FROM ds_question WHERE source_id=@sourceId AND kind=@kind AND ((@relationId IS NOT NULL AND relation_id=@relationId) OR (@relationId IS NULL AND COALESCE(table_name,'')=COALESCE(@tableName,'') AND COALESCE(column_name,'')=COALESCE(@columnName,'') AND COALESCE(enum_value,'')=COALESCE(@enumValue,'') AND question=@question)) AND status='pending'`).get({tableName:null,columnName:null,relationId:null,enumValue:null,...question});
       if(existing) return existing.id;
-      const result = db.prepare(`INSERT INTO ds_question (source_id,kind,scope,table_name,column_name,question,evidence,options,relation_id) VALUES (@sourceId,@kind,@scope,@tableName,@columnName,@question,@evidence,@options,@relationId)`).run({ tableName:null,columnName:null,relationId:null,...question, options:JSON.stringify(question.options || []) });
+      const result = db.prepare(`INSERT INTO ds_question (source_id,kind,scope,table_name,column_name,question,evidence,options,relation_id,enum_value) VALUES (@sourceId,@kind,@scope,@tableName,@columnName,@question,@evidence,@options,@relationId,@enumValue)`).run({ tableName:null,columnName:null,relationId:null,enumValue:null,...question, options:JSON.stringify(question.options || []) });
       return Number(result.lastInsertRowid);
     },
-    listQuestions: (sourceId) => db.prepare(`SELECT id,kind,scope,table_name AS tableName,column_name AS columnName,question,evidence,options,status,relation_id AS relationId FROM ds_question WHERE source_id=? AND status='pending' ORDER BY id`).all(sourceId).map((item)=>({...item, options:JSON.parse(item.options)})),
-    getQuestion: (id) => db.prepare(`SELECT id,source_id AS sourceId,kind,scope,table_name AS tableName,column_name AS columnName,question,evidence,options,status,relation_id AS relationId FROM ds_question WHERE id=?`).get(id),
+    listQuestions: (sourceId) => db.prepare(`SELECT id,kind,scope,table_name AS tableName,column_name AS columnName,enum_value AS enumValue,question,evidence,options,status,relation_id AS relationId FROM ds_question WHERE source_id=? AND status='pending' ORDER BY id`).all(sourceId).map(parseQuestionRow),
+    getQuestion: (id) => parseQuestionRow(db.prepare(`SELECT id,source_id AS sourceId,kind,scope,table_name AS tableName,column_name AS columnName,enum_value AS enumValue,question,evidence,options,status,relation_id AS relationId FROM ds_question WHERE id=?`).get(id)),
     answerQuestion(id, answer, outruledBy=null) { return db.prepare(`UPDATE ds_question SET answer=?, answered_at=CURRENT_TIMESTAMP, outruled_by=?, status='answered' WHERE id=? AND status='pending'`).run(answer, outruledBy, id).changes; },
+    answerEnumQuestion(id,answer,outruledBy=null) { return answerEnumQuestionTransaction({id,answer,outruledBy}); },
+    setEnumMeaning(sourceId,tableName,columnName,value,meaning,meaningSource="human") {
+      db.prepare(`INSERT INTO ds_enum(source_id,table_name,column_name,value,count,ratio,meaning,meaning_source) VALUES(?,?,?,?,NULL,NULL,?,?) ON CONFLICT(source_id,table_name,column_name,value) DO UPDATE SET meaning=excluded.meaning,meaning_source=excluded.meaning_source`).run(sourceId,tableName,columnName,String(value),String(meaning),String(meaningSource));
+    },
     confirmRelationByColumn(sourceId, tableName, columnName) { return db.prepare(`UPDATE ds_relation SET status='confirmed' WHERE source_id=? AND from_table=? AND from_col=?`).run(sourceId,tableName,columnName).changes; },
     setRelationStatus(id,status) { if(!["review","confirmed","rejected","denied"].includes(status)) throw new Error("不支持的关系状态");return db.prepare(`UPDATE ds_relation SET status=? WHERE id=?`).run(status,id).changes; },
     closeStaleRelationQuestions(sourceId) { return db.prepare(`UPDATE ds_question SET status='obsolete',answered_at=CURRENT_TIMESTAMP WHERE source_id=? AND kind='JOIN 路径' AND status='pending' AND (relation_id IS NULL OR NOT EXISTS (SELECT 1 FROM ds_relation r WHERE r.id=ds_question.relation_id AND r.present=1 AND r.status='review'))`).run(sourceId).changes; },
@@ -762,6 +787,24 @@ function parseOntologyCalibrationGate(row) {
 function parseTermAnchor(row) {
   const {altLabelsJson,...anchor}=row;
   return {...anchor,altLabels:safeJson(altLabelsJson,[])};
+}
+
+function parseQuestionRow(row) {
+  if(!row)return null;
+  return {...row,options:parseQuestionOptions(row.options)};
+}
+
+function parseQuestionOptions(value) {
+  const parsed=typeof value==="string"?safeJson(value,null):value;
+  if(!Array.isArray(parsed)||!parsed.length||parsed.length>100)return [];
+  const options=[];
+  for(const item of parsed) {
+    if(typeof item!=="string")return [];
+    const option=item.trim();
+    if(!option||option.length>200)return [];
+    if(!options.includes(option))options.push(option);
+  }
+  return options;
 }
 
 function candidateTransitionAllowed(from,to) {

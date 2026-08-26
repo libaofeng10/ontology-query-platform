@@ -12,6 +12,8 @@ services:
     env_file:
       - .env.production
     environment:
+      TZ: ${BUSINESS_TIME_ZONE:-Asia/Shanghai}
+      BUSINESS_TIME_ZONE: ${BUSINESS_TIME_ZONE:-Asia/Shanghai}
       API_HOST: 0.0.0.0
       API_PORT: 8787
       WEB_PORT: 3000

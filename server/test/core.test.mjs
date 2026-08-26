@@ -53,10 +53,52 @@ test("relation inference combines overlap, names, types and cardinality", () => 
 });
 
 test("SQL guard permits confirmed aliased joins and adds a limit", () => {
-  const verdict = guardSql("SELECT c.customer_id, COUNT(*) n FROM crm_customer c JOIN sales_order o ON c.customer_id = o.customer_id GROUP BY c.customer_id", {allowedTables:["crm_customer","sales_order"],allowedRelations:[{fromTable:"sales_order",fromCol:"customer_id",toTable:"crm_customer",toCol:"customer_id"}],maxRows:100});
+  const verdict = guardSql("SELECT c.customer_id, COUNT(*) n FROM crm_customer c JOIN sales_order o ON c.customer_id = o.customer_id GROUP BY c.customer_id", {allowedTables:["crm_customer","sales_order"],allowedRelations:[{id:41,fromTable:"sales_order",fromCol:"customer_id",toTable:"crm_customer",toCol:"customer_id"}],maxRows:100});
   assert.equal(verdict.ok, true, verdict.reason);
   assert.match(verdict.sql, /LIMIT 100/i);
   assert.deepEqual(verdict.joins,["sales_order.customer_id = crm_customer.customer_id"]);
+  assert.deepEqual(verdict.joinRelationIds,[41]);
+  assert.equal(verdict.requestedAst.limit,null);
+  assert.deepEqual(verdict.ast.limit.value.map((item)=>Number(item.value)),[100]);
+  assert.equal(verdict.limitedAst,verdict.ast);
+  assert.deepEqual(verdict.limit,{maxRows:100,requested:null,offset:0,effective:100,added:true,capped:false});
+});
+
+test("SQL guard parses every MySQL LIMIT form and caps the count rather than the offset",()=>{
+  const policy={allowedTables:["crm_customer"],allowedColumns:{crm_customer:["customer_id"]},maxRows:100};
+
+  const countOnly=guardSql("SELECT customer_id FROM crm_customer LIMIT 25",policy);
+  assert.equal(countOnly.ok,true,countOnly.reason);
+  assert.deepEqual(countOnly.requestedAst.limit.value.map((item)=>Number(item.value)),[25]);
+  assert.deepEqual(countOnly.ast.limit.value.map((item)=>Number(item.value)),[25]);
+  assert.deepEqual(countOnly.limit,{maxRows:100,requested:25,offset:0,effective:25,added:false,capped:false});
+
+  const comma=guardSql("SELECT customer_id FROM crm_customer LIMIT 20, 250",policy);
+  assert.equal(comma.ok,true,comma.reason);
+  assert.equal(comma.requestedAst.limit.seperator,",");
+  assert.deepEqual(comma.requestedAst.limit.value.map((item)=>Number(item.value)),[20,250]);
+  assert.deepEqual(comma.ast.limit.value.map((item)=>Number(item.value)),[20,100]);
+  assert.deepEqual(comma.limit,{maxRows:100,requested:250,offset:20,effective:100,added:false,capped:true});
+  assert.match(comma.sql,/LIMIT 20, 100/i);
+
+  const offset=guardSql("SELECT customer_id FROM crm_customer LIMIT 250 OFFSET 20",policy);
+  assert.equal(offset.ok,true,offset.reason);
+  assert.equal(offset.requestedAst.limit.seperator,"offset");
+  assert.deepEqual(offset.requestedAst.limit.value.map((item)=>Number(item.value)),[250,20]);
+  assert.deepEqual(offset.ast.limit.value.map((item)=>Number(item.value)),[100,20]);
+  assert.deepEqual(offset.limit,{maxRows:100,requested:250,offset:20,effective:100,added:false,capped:true});
+  assert.match(offset.sql,/LIMIT 100 OFFSET 20/i);
+});
+
+test("SQL guard fails closed on set operations at the root and inside CTEs",()=>{
+  const policy={allowedTables:["crm_customer","sales_order"],allowedColumns:{crm_customer:["customer_id"],sales_order:["customer_id"]},maxRows:100};
+  const root=guardSql("SELECT customer_id FROM crm_customer UNION ALL SELECT customer_id FROM sales_order",policy);
+  assert.equal(root.ok,false);
+  assert.equal(root.code,"UNSUPPORTED_SET_OPERATION");
+
+  const cte=guardSql("WITH combined AS (SELECT customer_id FROM crm_customer UNION SELECT customer_id FROM sales_order) SELECT customer_id FROM combined",policy);
+  assert.equal(cte.ok,false);
+  assert.equal(cte.code,"UNSUPPORTED_SET_OPERATION");
 });
 
 test("SQL guard blocks mutations, multiple statements, invented joins, bad enums and dangerous functions", () => {
@@ -140,6 +182,18 @@ test("SQL guard resolves CTE column lineage for allowlists, joins and sensitive 
   assert.match(guardSql("WITH t AS (SELECT COUNT(*) AS n, customer_id AS cid FROM sales_order GROUP BY customer_id) SELECT c.name FROM crm_customer c JOIN t ON t.n = c.customer_id",policy).reason,/计算列/);
   assert.match(guardSql("WITH t AS (SELECT mobile AS m FROM crm_customer) SELECT m FROM t",policy).reason,/敏感字段/);
   assert.match(guardSql("WITH t AS (SELECT order_id FROM sales_order) SELECT c.name FROM crm_customer c JOIN t ON t.order_id = c.customer_id",policy).reason,/未确认的 JOIN/);
+});
+
+test("SQL guard fails closed on derived tables whose output and join lineage are not supported",()=>{
+  const policy={
+    allowedTables:["lead_entity","lead_owner_rel"],
+    allowedColumns:{lead_entity:["id"],lead_owner_rel:["lead_id","owner_name"]},
+    allowedRelations:[],
+  };
+  const sql="SELECT d.owner_name FROM (SELECT lead_id, owner_name FROM lead_owner_rel) d JOIN lead_entity l ON d.lead_id = l.id";
+  const result=guardSql(sql,policy);
+  assert.equal(result.ok,false);
+  assert.equal(result.code,"UNSUPPORTED_DERIVED_TABLE");
 });
 
 test("verified ontology pages are never overwritten", async () => {

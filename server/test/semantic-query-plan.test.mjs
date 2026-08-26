@@ -71,7 +71,7 @@ test("filter literals escape backslashes and quotes so values cannot break out o
   const compiled=compileSemanticQueryPlan(plan,{schema,catalog,maxRows:100});
   assert.match(compiled.sql,/= 'abc\\\\'/);
   const quoted=compileSemanticQueryPlan({...plan,filters:[{property:"customer.nickname",operator:"contains",value:"o'brien"}]},{schema,catalog,maxRows:100});
-  assert.match(quoted.sql,/'o''brien'/);
+  assert.match(quoted.sql,/LIKE '%o''brien%'/);
 });
 
 test("subtypes inherit properties and links while mandatory discriminators are compiled and guarded",()=>{
@@ -82,9 +82,18 @@ test("subtypes inherit properties and links while mandatory discriminators are c
   const plan={rootObject:"vip_customer",dimensions:[{property:"vip_customer.segment",alias:"segment"}],metrics:[{aggregation:"sum",property:"order.amount",alias:"revenue"}],filters:[],orderBy:[]};
   const validation=validateSemanticQueryPlan(plan,subtypeSchema);
   assert.equal(validation.ok,true,JSON.stringify(validation.errors));
-  const compiled=compileSemanticQueryPlan(plan,{schema:subtypeSchema,catalog,maxRows:100});
-  assert.match(compiled.sql,/WHERE t0\.`segment_code` IN \('vip'\)/);
+  const compiled=compileSemanticQueryPlan(plan,{schema:subtypeSchema,catalog,maxRows:100,ontologySchemaVersion:7});
+  assert.match(compiled.sql,/WHERE t0\.`segment_code` = 'vip'/);
   assert.deepEqual(compiled.policy.mandatoryFilters.map((item)=>item.object),["vip_customer"]);
+  assert.deepEqual(compiled.semanticContract,{
+    version:"semantic-row-domain-v1",ontologySchemaVersion:7,rootObject:"vip_customer",immutable:true,
+    rowDomainSlots:[{
+      id:"ontology:7:vip_customer:discriminator:vip_customer:warehouse_customer.segment_code",
+      kind:"semantic_row_domain",role:"ontology_subtype_discriminator",required:true,immutable:true,source:"published_ontology",
+      ontologySchemaVersion:7,rootObject:"vip_customer",object:"vip_customer",owner:"vip_customer",table:"warehouse_customer",column:"segment_code",
+      columns:["warehouse_customer.segment_code"],operator:"eq",values:[{value:"vip",valueType:"string"}],
+    }],
+  });
   assert.equal(guardSql(compiled.sql,compiled.policy).ok,true);
   const unsafe=compiled.sql.replace(/WHERE[^\n]+\n/,"");
   assert.match(guardSql(unsafe,compiled.policy).reason,/缺少子类型 vip_customer/);
@@ -93,6 +102,8 @@ test("subtypes inherit properties and links while mandatory discriminators are c
   assert.equal(child.parent,"customer");
   assert.ok(child.properties.some((item)=>item.apiName==="id"&&item.inherited));
   assert.equal(view.linkTypes[0].inverseApiName,"order_belongs_to_customer");
+  const restated=compileSemanticQueryPlan({...plan,filters:[{property:"vip_customer.segment",operator:"eq",value:"vip"}]},{schema:subtypeSchema,catalog,maxRows:100,ontologySchemaVersion:7});
+  assert.equal((restated.sql.match(/segment_code` = 'vip'/g)||[]).length,1);
 });
 
 test("subtype query plans reject contradictory filters and mixed parent-child references",()=>{

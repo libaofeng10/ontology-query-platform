@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractKnowledgeColumnRefs, findKnowledgeOntologyConflicts, schemaMappedColumns } from "../src/knowledge-column-refs.mjs";
+import { extractKnowledgeColumnRefs, findKnowledgeOntologyConflicts, findKnowledgeOntologyMappingConflicts, schemaMappedColumns } from "../src/knowledge-column-refs.mjs";
 import { probeTargets, probeZeroResult, siblingColumns } from "../src/query-result-probe.mjs";
 
 const columnsByTable={
@@ -35,6 +35,42 @@ test("知识-本体冲突：模型已映射表中缺失被引用字段时报冲�
   assert.equal(findKnowledgeOntologyConflicts([page],columnsByTable,schemaMappedColumns(schema)).length,0);
   // 未验证页不参与
   assert.equal(findKnowledgeOntologyConflicts([{...page,verified:false}],columnsByTable,schemaMappedColumns({objectTypes:[]})).length,0);
+});
+
+test("查询期硬冲突要求同一属性概念的正向映射证据，anti 与 join 引用不升级",()=>{
+  const schema={objectTypes:[{apiName:"alpha_product_account",properties:[
+    {apiName:"office_name",displayName:"律所名称",mapping:{table:"alpha_account_user",column:"office_name"}},
+  ]}]};
+  const positive={verified:true,title:"律所名称",aliases:["所属律所"],pageType:"term",slug:"office",tables:["alpha_account_user"],sqlContent:"user_office_name LIKE ...",content:""};
+  const conflicts=findKnowledgeOntologyMappingConflicts([positive],columnsByTable,schema);
+  assert.deepEqual(conflicts.map((item)=>[item.column,item.mappedProperty,item.mappedColumn]),[["user_office_name","alpha_product_account.office_name","office_name"]]);
+  const antiOnly={...positive,sqlContent:"office_name LIKE ...",antiExamples:"不要使用 user_office_name"};
+  assert.deepEqual(findKnowledgeOntologyMappingConflicts([antiOnly],columnsByTable,schema),[],"antiExamples 不能成为正向字段绑定");
+  assert.deepEqual(findKnowledgeOntologyMappingConflicts([{...positive,pageType:"join"}],columnsByTable,schema),[],"join 页 FK/字段不是属性映射冲突");
+  assert.deepEqual(findKnowledgeOntologyMappingConflicts([{...positive,title:"到期时间",aliases:[]}],columnsByTable,schema),[],"未映射字段本身只构成 coverage gap，不能在概念不一致时硬阻断");
+});
+
+test("metric/rule 多列表达式的辅助谓词列不能借用页面标题升级为硬冲突",()=>{
+  const formulaColumns={fact_order:[
+    {columnName:"gross_amount",comment:"原始订单金额",isSensitive:0},
+    {columnName:"net_amount",comment:"本体订单金额",isSensitive:0},
+    {columnName:"order_status",comment:"订单状态",isSensitive:0},
+    {columnName:"order_time",comment:"下单时间",isSensitive:0},
+    {columnName:"is_deleted",comment:"删除标记",isSensitive:0},
+  ]};
+  const schema={objectTypes:[{apiName:"order",properties:[
+    {apiName:"amount",displayName:"订单金额",mapping:{table:"fact_order",column:"net_amount"}},
+    {apiName:"status",displayName:"订单状态",mapping:{table:"fact_order",column:"order_status"}},
+    {apiName:"created_at",displayName:"下单时间",mapping:{table:"fact_order",column:"order_time"}},
+  ]}]};
+  const metric={verified:true,pageType:"metric",slug:"order-amount",title:"订单金额",aliases:["成交金额"],tables:["fact_order"],sqlContent:"SUM(gross_amount) WHERE order_status = 'paid' AND order_time >= ? AND is_deleted = 0",content:""};
+  assert.deepEqual(findKnowledgeOntologyMappingConflicts([metric],formulaColumns,schema),[],"多列 metric 没有 ref→property 结构化绑定时只能形成 coverage gap");
+  assert.deepEqual(findKnowledgeOntologyMappingConflicts([{...metric,propertyRef:"order.amount"}],formulaColumns,schema),[],"多列表达式仅有页级 propertyRef 仍不能确定它绑定哪个物理 ref");
+  const rule={...metric,pageType:"rule",slug:"paid-order",title:"订单金额规则"};
+  assert.deepEqual(findKnowledgeOntologyMappingConflicts([rule],formulaColumns,schema),[],"多列 rule 的状态、时间、删除列不能被页面标题连带升级");
+  const bound={...metric,propertyBindings:{"fact_order.gross_amount":"order.amount"}};
+  const conflicts=findKnowledgeOntologyMappingConflicts([bound],formulaColumns,schema);
+  assert.deepEqual(conflicts.map((item)=>[item.column,item.mappedProperty,item.mappedColumn,item.evidence]),[["gross_amount","order.amount","net_amount","structured_property_ref"]]);
 });
 
 test("兄弟字段：按词干重叠找同表字符串字段，排除敏感与非字符串", () => {

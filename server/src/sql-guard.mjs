@@ -13,6 +13,19 @@ export function guardSql(sql, policy = {}) {
   if (statements.length !== 1) return denied("只允许单条 SQL",{code:"MULTIPLE_STATEMENTS"});
   const statement = statements[0];
   if (statement?.type !== "select") return denied("只允许 SELECT 查询",{code:"NON_SELECT"});
+  // node-sql-parser represents UNION/INTERSECT/EXCEPT as a linked SELECT
+  // chain (`set_op` + `_next`).  The result-contract lineage analyser does not
+  // yet validate every branch independently, so permitting a set operation
+  // would let one branch provide valid evidence for another invalid branch.
+  // collectSelects walks CTE and subquery ASTs too, keeping this fail-closed at
+  // every nesting level.
+  if(collectSelects(statement).some((select)=>select.set_op||select._next))return denied("暂不支持 UNION、INTERSECT、EXCEPT 等集合运算；请改写为单一 SELECT 或普通 CTE",{code:"UNSUPPORTED_SET_OPERATION"});
+  // Derived-table output lineage is not represented by the legacy guard's
+  // alias map. Failing closed here prevents an unknown derived alias/column or
+  // an unconfirmed JOIN from bypassing both column and relation allowlists.
+  // CTEs remain supported because their direct-column lineage is validated by
+  // buildCteInfo below.
+  if(collectSelects(statement).some((select)=>(select.from||[]).some((source)=>source.expr?.ast?.type==="select")))return denied("暂不支持 FROM/JOIN 派生表；请改写为 CTE 或已确认关系的直接 JOIN",{code:"UNSUPPORTED_DERIVED_TABLE"});
   const hasIntoTarget = statement.into && Object.values(statement.into).some((value)=>value != null);
   if (hasIntoTarget || statement.lock || statement.for_update || /\b(?:INTO\s+(?:OUTFILE|DUMPFILE)|FOR\s+UPDATE|LOCK\s+IN\s+SHARE\s+MODE)\b/i.test(sql)) return denied("禁止写文件或加锁查询");
 
@@ -49,17 +62,36 @@ export function guardSql(sql, policy = {}) {
   if(!semanticVerdict.ok)return {...semanticVerdict,tables:tableNames};
 
   const maxRows = Math.max(1, Number(policy.maxRows || 500));
-  const limitedAst = structuredClone(statement);
-  const requestedLimit=limitCount(statement.limit);
+  const requestedAst=statement;
+  const requestedLimit=parseLimitSpec(requestedAst.limit);
+  if(requestedLimit.explicit&&!requestedLimit.valid)return denied("LIMIT 必须使用非负整数常量",{code:"INVALID_LIMIT",tables:tableNames});
+  const limitedAst = structuredClone(requestedAst);
   if (!limitedAst.limit) limitedAst.limit = { seperator:"", value:[{ type:"number", value:maxRows }] };
   else {
-    const values = limitedAst.limit.value || [];
-    const countNode = values.at(-1);
-    if (countNode?.type === "number" && Number(countNode.value) > maxRows) countNode.value=maxRows;
+    const limited=parseLimitSpec(limitedAst.limit);
+    if(limited.count>maxRows)limited.countNode.value=maxRows;
   }
   const safeSql = parser.sqlify(limitedAst, { database:"MySQL" });
-  const effectiveLimit=requestedLimit==null?maxRows:Math.min(requestedLimit,maxRows);
-  return { ok:true, sql:safeSql, tables:tableNames, joins:joinVerdict.joins, functions:functionNames, ast:statement,limit:{maxRows,effective:effectiveLimit,added:requestedLimit==null,capped:requestedLimit!=null&&requestedLimit>maxRows} };
+  const effectiveLimit=requestedLimit.explicit?Math.min(requestedLimit.count,maxRows):maxRows;
+  return {
+    ok:true,
+    sql:safeSql,
+    tables:tableNames,
+    joins:joinVerdict.joins,
+    joinRelationIds:joinVerdict.joinRelationIds,
+    functions:functionNames,
+    requestedAst,
+    ast:limitedAst,
+    limitedAst,
+    limit:{
+      maxRows,
+      requested:requestedLimit.explicit?requestedLimit.count:null,
+      offset:requestedLimit.offset,
+      effective:effectiveLimit,
+      added:!requestedLimit.explicit,
+      capped:requestedLimit.explicit&&requestedLimit.count>maxRows,
+    },
+  };
 }
 
 // CTE outputs are tracked as column lineage back to physical columns; computed
@@ -188,7 +220,11 @@ function validateJoins(statement, allowedRelations, aliasContext, cte) {
   });
   if(failure) return denied(failure);
 
-  return { ok:true,joins:usedRelations.map((relation)=>`${relation.fromTable}.${relation.fromCol} = ${relation.toTable}.${relation.toCol}`) };
+  return {
+    ok:true,
+    joins:usedRelations.map((relation)=>`${relation.fromTable}.${relation.fromCol} = ${relation.toTable}.${relation.toCol}`),
+    joinRelationIds:[...new Set(usedRelations.map((relation)=>relation.id).filter((id)=>id!==null&&id!==undefined))],
+  };
 
   function checkColumnPair(left,right) {
     const a=resolvePhysical(left,aliasContext,cte);
@@ -386,7 +422,31 @@ function subqueryOf(node) {
 
 function literalValue(node) { return ["string","single_quote_string","double_quote_string","number","bool","null"].includes(node?.type) ? node.value : null; }
 function splitColumnKey(value){const parts=String(value||"").split(".");return [normalizeName(parts.at(-2)||""),normalizeName(parts.at(-1)||"")];}
-function limitCount(limit){const node=limit?.value?.at(-1);return node?.type==="number"&&Number.isFinite(Number(node.value))?Number(node.value):null;}
+function parseLimitSpec(limit) {
+  if(!limit)return {explicit:false,valid:true,count:null,offset:0,countNode:null,offsetNode:null};
+  const values=Array.isArray(limit.value)?limit.value:[];
+  const separator=String(limit.seperator||"").toLowerCase();
+  let countNode=null;let offsetNode=null;
+  if(separator==="offset") {
+    countNode=values[0]||null;offsetNode=values[1]||null;
+  } else if(separator===",") {
+    offsetNode=values[0]||null;countNode=values[1]||null;
+  } else {
+    countNode=values[0]||null;
+  }
+  const count=limitInteger(countNode);const offset=offsetNode?limitInteger(offsetNode):0;
+  const expectedValues=separator===","||separator==="offset"?2:1;
+  return {
+    explicit:true,
+    valid:values.length===expectedValues&&count!==null&&offset!==null,
+    count,
+    offset,
+    countNode,
+    offsetNode,
+  };
+}
+
+function limitInteger(node){const value=node?.type==="number"?Number(node.value):NaN;return Number.isSafeInteger(value)&&value>=0?value:null;}
 function edgeKey(a,ac,b,bc){return `${normalizeName(a)}.${normalizeName(ac)}>${normalizeName(b)}.${normalizeName(bc)}`;}
 function normalizeName(name=""){return String(name).replaceAll("`","").replaceAll("'","").replaceAll('"',"").replaceAll("[","").replaceAll("]","").split(".").at(-1).toLowerCase();}
 function denied(reason, extra={}) { return { ok:false, code:extra.code||guardCode(reason),reason, ...extra }; }
@@ -433,4 +493,4 @@ function walkWithAncestors(value,visitor,ancestors=[],seen=new Set()) {
   for(const child of Object.values(value))if(child&&typeof child==="object")walkWithAncestors(child,visitor,[...ancestors,value],seen);
 }
 
-export const _internal = { validateJoins, validateColumns, validateValueSemantics, collectJoinComparisons, collectFunctionNames, buildCteInfo, buildAliasContext };
+export const _internal = { validateJoins, validateColumns, validateValueSemantics, collectJoinComparisons, collectFunctionNames, buildCteInfo, buildAliasContext, parseLimitSpec };

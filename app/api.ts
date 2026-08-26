@@ -26,7 +26,7 @@ export function answerQuestion(id:number,answer:string){return request<{ok:boole
 export function saveKnowledge(input:KnowledgeInput){return request<KnowledgePage>("/knowledge",{method:"POST",headers:writeHeaders,body:JSON.stringify(input)},20_000);}
 export function syncKnowledge(sourceId:number){return request<{scanned:number;imported:number;unchanged:number;skipped:number;errors:Array<{file:string;error:string}>}>("/knowledge/sync",{method:"POST",headers:writeHeaders,body:JSON.stringify({sourceId})},30_000);}
 export function listRelationDocuments(sourceId:number){return request<RelationDocument[]>(`/sources/${sourceId}/relation-docs`);}
-export function uploadRelationDocument(sourceId:number,filename:string,content:string){return request<RelationDocument>(`/sources/${sourceId}/relation-docs`,{method:"POST",headers:writeHeaders,body:JSON.stringify({filename,content})},120_000);}
+export function uploadRelationDocument(sourceId:number,filename:string,content:string){return request<RelationDocument>(`/sources/${sourceId}/relation-docs`,{method:"POST",headers:writeHeaders,body:JSON.stringify({filename,content})},300_000);}
 export function listOntologySchemas(sourceId:number){return request<SemanticSchemaVersion[]>(`/ontology/schemas?sourceId=${sourceId}`);}
 export function getOntologyCatalog(sourceId:number){return request<OntologyCatalog>(`/ontology/catalog?sourceId=${sourceId}`);}
 export function listTermAnchors(vocabulary?:string){return request<TermAnchor[]>(`/ontology/term-anchors${vocabulary?`?vocabulary=${encodeURIComponent(vocabulary)}`:""}`);}

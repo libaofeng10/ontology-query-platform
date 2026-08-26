@@ -113,7 +113,7 @@ export function validateSemanticQueryPlan(input,schema) {
   return {ok:errors.length===0,plan,errors,summary:{dimensions:plan.dimensions.length,metrics:plan.metrics.length,filters:plan.filters.length}};
 }
 
-export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500}) {
+export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500,ontologySchemaVersion=null}) {
   const validation=validateSemanticQueryPlan(input,schema);
   if(!validation.ok) throw new SemanticQueryPlanError("QUERY_PLAN_VALIDATION_FAILED",validation.errors.map((item)=>item.message).join("；"),validation.errors);
   const plan=validation.plan;
@@ -146,7 +146,7 @@ export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500}) {
   const primaryProperty=rootObject.properties.get(rootObject.primaryKey);
   if(!primaryProperty?.mapping?.table) throw new SemanticQueryPlanError("QUERY_PLAN_ROOT_MAPPING_MISSING",`根对象 ${rootObject.apiName} 缺少主键映射`);
   const rootTable=primaryProperty.mapping.table;
-  const discriminatorSpecs=semanticPath.objects.flatMap((objectName)=>model.objects.get(objectName).discriminators.map((item)=>({objectName,...item}))).sort((left,right)=>left.objectName.localeCompare(right.objectName)||left.owner.localeCompare(right.owner));
+  const discriminatorSpecs=uniqueDiscriminatorSpecs(semanticPath.objects.flatMap((objectName)=>model.objects.get(objectName).discriminators.map((item)=>({objectName,...item}))));
   const requiredTables=new Set([rootTable,...referencedProperties.map((item)=>item.property.mapping.table),...discriminatorSpecs.map((item)=>item.property.mapping.table)]);
   const physicalPath=resolvePhysicalPath(rootTable,requiredTables,[...candidateRelations.values()]);
   const aliases=new Map([[rootTable,"t0"]]);
@@ -198,9 +198,15 @@ export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500}) {
   const mandatoryFilters=discriminatorSpecs.map((item)=>{
     const {table,column}=item.property.mapping;
     if(!aliases.has(table)) throw new SemanticQueryPlanError("QUERY_PLAN_TABLE_UNREACHABLE",`子类型 ${item.objectName} 的判别字段无法连接`);
-    return {object:item.objectName,owner:item.owner,table,column,values:item.values,expression:`${aliases.get(table)}.${quoteId(column)} IN (${item.values.map(literal).join(", ")})`};
+    const values=[...item.values];
+    const columnSql=`${aliases.get(table)}.${quoteId(column)}`;
+    return {object:item.objectName,owner:item.owner,table,column,values,expression:values.length===1?`${columnSql} = ${literal(values[0])}`:`${columnSql} IN (${values.map(literal).join(", ")})`};
   });
-  const where=[...mandatoryFilters.map((item)=>item.expression),...plan.filters.map((filter)=>filterExpression(filter,columnInfo))];
+  // A planner may restate the subtype discriminator as an ordinary filter.  It
+  // is the same immutable ontology requirement, so compile one canonical atom
+  // and let the result contract validate that physical row-domain binding.
+  const explicitFilters=plan.filters.filter((filter)=>!mandatoryFilters.some((mandatory)=>filterRestatesMandatoryDiscriminator(filter,mandatory,model)));
+  const where=[...mandatoryFilters.map((item)=>item.expression),...explicitFilters.map((filter)=>filterExpression(filter,columnInfo))];
   if(where.length) sqlParts.push(`WHERE ${where.join(" AND ")}`);
   if(groupBy.length&&plan.metrics.length) sqlParts.push(`GROUP BY ${groupBy.join(", ")}`);
   else if(groupBy.length&&!plan.metrics.length) sqlParts[0]=`SELECT DISTINCT ${selects.join(", ")}`;
@@ -221,6 +227,7 @@ export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500}) {
     sql:sqlParts.join("\n"),
     plan,
     semanticPath:{...semanticPath,mandatoryFilters:mandatoryFilters.map(publicMandatoryFilter),relations:usedRelations.map((item)=>({id:item.id,fromTable:item.fromTable,fromCol:item.fromCol,toTable:item.toTable,toCol:item.toCol}))},
+    semanticContract:semanticRowDomainContract({ontologySchemaVersion,rootObject:plan.rootObject,mandatoryFilters}),
     policy:{allowedTables:usedTables,allowedColumns,columnKinds,allowedRelations:usedRelations,enums,mandatoryFilters:mandatoryFilters.map(publicMandatoryFilter),maxRows:limit},
   };
 }
@@ -338,6 +345,35 @@ function discriminatorDomains(object) {
   return domains;
 }
 function publicMandatoryFilter(item){return {object:item.object,owner:item.owner,table:item.table,column:item.column,values:item.values};}
+function uniqueDiscriminatorSpecs(values) {
+  const result=new Map();
+  for(const item of values) {
+    const mapping=item.property?.mapping||{};
+    const key=`${item.owner}|${mapping.table}|${mapping.column}|${(item.values||[]).map(typedLiteralKey).sort().join("\u0000")}`;
+    if(!result.has(key))result.set(key,item);
+  }
+  return [...result.values()].sort((left,right)=>left.objectName.localeCompare(right.objectName)||left.owner.localeCompare(right.owner));
+}
+function filterRestatesMandatoryDiscriminator(filter,mandatory,model) {
+  const property=model.properties.get(filter.property)?.property;
+  if(!property||property.mapping?.table!==mandatory.table||property.mapping?.column!==mandatory.column)return false;
+  const expected=(mandatory.values||[]).map(typedLiteralKey).sort();
+  const actual=filter.operator==="eq"?[typedLiteralKey(filter.value)]:filter.operator==="in"&&Array.isArray(filter.value)?filter.value.map(typedLiteralKey).sort():[];
+  return expected.length===actual.length&&expected.every((value,index)=>value===actual[index]);
+}
+function semanticRowDomainContract({ontologySchemaVersion,rootObject,mandatoryFilters}) {
+  const slots=mandatoryFilters.map((filter)=>({
+    id:`ontology:${ontologySchemaVersion??"unbound"}:${rootObject}:discriminator:${filter.owner}:${filter.table}.${filter.column}`,
+    kind:"semantic_row_domain",role:"ontology_subtype_discriminator",required:true,immutable:true,
+    source:"published_ontology",ontologySchemaVersion:ontologySchemaVersion??null,rootObject,
+    object:filter.object,owner:filter.owner,table:filter.table,column:filter.column,
+    columns:[`${filter.table}.${filter.column}`],operator:filter.values.length===1?"eq":"in",
+    values:filter.values.map((value)=>({value,valueType:literalValueType(value)})),
+  }));
+  return {version:"semantic-row-domain-v1",ontologySchemaVersion:ontologySchemaVersion??null,rootObject,immutable:true,rowDomainSlots:slots};
+}
+function typedLiteralKey(value){return `${literalValueType(value)}:${String(value)}`;}
+function literalValueType(value){if(value===null)return "null";if(typeof value==="number")return "number";if(typeof value==="boolean")return "boolean";return "string";}
 
 function resolveSemanticPath(model,rootObject,targets) {
   const adjacency=new Map([...model.objects.keys()].map((name)=>[name,[]]));
@@ -409,7 +445,7 @@ function filterExpression(filter,columnInfo) {
   if(filter.operator==="lte") return `${column} <= ${literal(value)}`;
   if(filter.operator==="in"||filter.operator==="not_in") return `${column} ${filter.operator==="in"?"IN":"NOT IN"} (${value.map(literal).join(", ")})`;
   if(filter.operator==="between") return `${column} BETWEEN ${literal(value[0])} AND ${literal(value[1])}`;
-  if(filter.operator==="contains") return `LOCATE(${literal(value)}, ${column}) > 0`;
+  if(filter.operator==="contains") return `${column} LIKE ${literal(`%${value}%`)}`;
   return `${column} IS ${filter.operator==="not_null"?"NOT ":""}NULL`;
 }
 function literal(value) {

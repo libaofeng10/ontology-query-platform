@@ -56,7 +56,7 @@ export const config = {
   relationModel: {
     maxCandidates:numberFromEnv("RELATION_MODEL_MAX_CANDIDATES",600),
     batchSize:numberFromEnv("RELATION_MODEL_BATCH_SIZE",8),
-    timeoutMs:numberFromEnv("RELATION_MODEL_TIMEOUT_MS",90_000),
+    timeoutMs:numberFromEnv("RELATION_MODEL_TIMEOUT_MS",180_000),
     minConfidence:numberRatioFromEnv("RELATION_MODEL_MIN_CONFIDENCE",0.55),
     sampleLimit:numberFromEnv("RELATION_VALUE_SAMPLE_LIMIT",500),
     overlapConcurrency:integerRangeFromEnv("RELATION_OVERLAP_CONCURRENCY",1,16,4),

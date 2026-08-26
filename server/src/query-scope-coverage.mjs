@@ -1,4 +1,5 @@
 import { parseQueryIntent, queryIntentSqlErrors } from "./query-intent.mjs";
+import { buildQueryResultContract, validateQueryResultContract } from "./query-result-contract.mjs";
 
 export function missingExhaustiveAccountTables(question,context={},usedTables=[]) {
   const roots=exhaustiveAccountTables(question,context);
@@ -59,6 +60,8 @@ export function queryIntentFilterError(question,sql,intent=parseQueryIntent(ques
   const filterError=queryIntentSqlErrors(intent,sql)[0];
   if(filterError)return filterError;
   if(!Array.isArray(execution.usedTables)||!execution.retrieval)return null;
+  const contractValidation=queryResultContractValidation(intent,sql,execution);
+  if(!contractValidation.ok)return contractValidation.errors[0];
   const facets=subjectFacetDiagnostics(execution.retrieval);
   if(!facets.length)return null;
   const used=new Set(execution.usedTables.map(normalizeTable));
@@ -71,6 +74,12 @@ export function queryIntentFilterError(question,sql,intent=parseQueryIntent(ques
     message:`SQL 使用的表没有覆盖用户要求的业务对象（${(intent?.subjects||[]).join("、")}）；请从检索分面候选表中选择并先确认结构`,
     details:{subjects:intent?.subjects||[],usedTables:execution.usedTables,expectedTables:[...new Set(facets.flatMap(facetTableNames))]},
   };
+}
+
+export function queryResultContractValidation(intent,sql,execution={}) {
+  const contract=buildQueryResultContract(intent,execution.retrieval,execution.semanticContract);
+  const verdict=execution.verdict||{ast:execution.ast||null,tables:execution.usedTables||[]};
+  return validateQueryResultContract(contract,{sql,verdict,columnsByTable:execution.columnsByTable||{}});
 }
 
 export function missingIntentSubjectFacets(intent,retrieval,usedTables=[]) {

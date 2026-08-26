@@ -5,8 +5,9 @@ import { compileSemanticQueryPlan, semanticPlanningView } from "./semantic-query
 import { guardSql } from "./sql-guard.mjs";
 import { buildQueryColumnSemantics, columnSemanticKind, detectQuestionValueKinds, redactTypedLiterals } from "./query-column-semantics.mjs";
 import { normalizeQueryRow } from "./query-result-normalization.mjs";
-import { exhaustiveAccountTables, missingExhaustiveAccountProductColumns, missingExhaustiveAccountTables, missingIntentSubjectFacets, queryIntentFilterError } from "./query-scope-coverage.mjs";
-import { buildIntentRetrievalQuestion, parseQueryIntent } from "./query-intent.mjs";
+import { exhaustiveAccountTables, missingExhaustiveAccountProductColumns, missingExhaustiveAccountTables, missingIntentSubjectFacets, missingRequiredRetrievalFacets, queryIntentFilterError, queryResultContractValidation } from "./query-scope-coverage.mjs";
+import { applyIntentClarification, buildIntentRetrievalQuestion, parseQueryIntent } from "./query-intent.mjs";
+import { buildQueryResultContract, validateQueryRunSet } from "./query-result-contract.mjs";
 import { dominantFailureClass, toolFailure } from "./query-errors.mjs";
 import { QUERY_PROMPT_DEFAULTS, renderQueryPrompt } from "./query-prompts.mjs";
 
@@ -65,13 +66,14 @@ export async function runQueryAgent({store,connector,config,source,question,cont
   const timeoutMs=boundedInteger(config.queryLlmTimeoutMs,90_000,1,600_000);
   let deadline=started+timeoutMs;
   let activeSignal=signal;let activeOnEvent=onEvent;
-  const catalog=buildCatalog(store,source.id,config.queryMaxRows||500,question);
-  const queryIntent=context.queryIntent||parseQueryIntent(question);
+  const catalog=buildCatalog(store,source.id,config.queryMaxRows||500,question,context.ontologySchema);
+  let queryIntent=context.queryIntent||parseQueryIntent(question);
   if(Array.isArray(context.valueKinds)&&context.valueKinds.length)catalog.policy.valueKinds=context.valueKinds;
   const maxScannedRows=boundedInteger(config.queryAgentMaxScannedRows,Math.max(Number(config.explainMaxRows||1_000_000),1)*maxSqlCalls,1,Number.MAX_SAFE_INTEGER);
   const initialTables=new Set(context.tables.map((table)=>table.tableName).filter((table)=>catalog.tableByName.has(table)));
   const disclosedTables=new Set([...initialTables].map(normalizeIdentifier));
   const exploredPageSlugs=new Set(context.knowledge.map((page)=>page.slug));
+  const exploredRuleNames=new Set(context.rules.map((rule)=>rule.name));
   const successfulRuns=[];
   const retrievalEvidence=[context.retrieval].filter(Boolean);
   const validatedSemanticPlans=new Map();
@@ -95,7 +97,136 @@ export async function runQueryAgent({store,connector,config,source,question,cont
   const clarifications=[];
   const tokenUsage={promptTokens:0,completionTokens:0,totalTokens:0,available:false};
 
-  return continueLoop(0);
+  const intentClarification=blockingIntentClarification(queryIntent);
+  if(intentClarification)return pauseForIntentClarification(intentClarification);
+  const intentFailure=unresolvableBlockingIntent(queryIntent);
+  return intentFailure?intentFailureOutcome(intentFailure):continueLoop(0);
+
+  function pauseForIntentClarification(clarification) {
+    askUserCalls++;
+    const step=toolTrace.length+1;
+    const thought="已识别出会改变查询结果的业务口径歧义，需要先由用户确认。";
+    const action={tool:"ask_user",args:clarification};
+    const result={ok:true,pending:true,question:clarification.question,optionCount:clarification.options.length,allowFreeText:clarification.allowFreeText};
+    const phases=phasesForTool(action.tool);
+    for(const nextPhase of phases)if(nextPhase!==currentPhase){stateTransitions.push({from:currentPhase,to:nextPhase,step});currentPhase=nextPhase;}
+    const trace=makeTrace(action,thought,result,0,currentPhase);
+    toolTrace.push(trace);
+    emitEvent(activeOnEvent,{type:"step",step,status:"started"});
+    emitEvent(activeOnEvent,{type:"thought",step,text:thought});
+    emitEvent(activeOnEvent,toolCallEvent(step,action));
+    emitEvent(activeOnEvent,{type:"tool_result",step,tool:action.tool,ok:true,summary:trace.summary,durationMs:0});
+    emitEvent(activeOnEvent,{type:"step",step,status:"completed",durationMs:0});
+    const pausedAt=Date.now();let resumed=false;
+    return {
+      status:"clarification",clarification,queryIntent,retrievalEvidence:[...retrievalEvidence],exploredRuleNames:[...exploredRuleNames],iterations:1,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started,
+      resume:async(userAnswer,{signal,onEvent}={})=>{
+        try {
+        if(resumed)throw new Error("该澄清请求已恢复，不能重复使用");resumed=true;
+        const answer=requiredText(userAnswer,"澄清回复",500);deadline+=Date.now()-pausedAt;activeSignal=signal;activeOnEvent=onEvent;
+        clarifications.push({question:clarification.question,answer});
+        const resolution=resolveClarifiedIntent(answer);
+        messages.push({role:"assistant",content:JSON.stringify({thought,tool:action.tool,args:action.args})});
+        if(!resolution.changed)return unboundClarificationOutcome(clarification,answer);
+        const nextClarification=blockingIntentClarification(queryIntent);
+        if(nextClarification)return pauseForIntentClarification(nextClarification);
+        const intentFailure=unresolvableBlockingIntent(queryIntent);
+        if(intentFailure)return intentFailureOutcome(intentFailure);
+        const refreshed=await ensureClarifiedIntentEvidence(answer,resolution);
+        const evidenceGap=clarifiedEvidenceGapOutcome(refreshed);
+        if(evidenceGap)return evidenceGap;
+        resetMessagesForClarifiedIntent(answer,resolution,refreshed);
+        return await continueLoop(toolTrace.length);
+        } catch(error) { throw agentSnapshotError(error); }
+      },
+    };
+  }
+
+  function intentFailureOutcome(ambiguity) {
+    return {status:"refused",reason:`当前问题仍缺少可验证的业务口径：${ambiguity.message}。请先补充或发布对应的指标/字段定义后再查询。`,failureClass:"schema_gap",queryIntent,retrievalEvidence:[...retrievalEvidence],exploredRuleNames:[...exploredRuleNames],iterations:toolTrace.length,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started};
+  }
+
+  function unboundClarificationOutcome(clarification,answer) {
+    return {status:"refused",reason:`澄清答复“${clipText(answer,80)}”未能绑定到已发布的指标、枚举、术语或结构化查询口径，系统不会仅凭对话文本改变结果范围。请先发布该口径或改用可验证的筛选条件。`,failureClass:"schema_gap",errorCode:"CLARIFICATION_INTENT_BINDING_REQUIRED",queryIntent,retrievalEvidence:[...retrievalEvidence],exploredRuleNames:[...exploredRuleNames],iterations:toolTrace.length,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started};
+  }
+
+  function clarifiedEvidenceGapOutcome(refreshed) {
+    const gap=clarifiedEvidenceGap(queryIntent,refreshed);
+    if(!gap)return null;
+    return {status:"refused",...gap,failureClass:"schema_gap",queryIntent,retrievalEvidence:[...retrievalEvidence],exploredRuleNames:[...exploredRuleNames],iterations:toolTrace.length,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started};
+  }
+
+  function resolveClarifiedIntent(answer) {
+    const previousFingerprint=intentEvidenceFingerprint(queryIntent);
+    queryIntent=applyIntentClarification(queryIntent,answer);
+    const nextFingerprint=intentEvidenceFingerprint(queryIntent);
+    const changed=previousFingerprint!==nextFingerprint;
+    if(changed) {
+      // Retrieval evidence, semantic plans, and successful runs are valid only
+      // for the exact immutable intent contract that produced them.
+      retrievalEvidence.splice(0,retrievalEvidence.length);
+      successfulRuns.splice(0,successfulRuns.length);
+      validatedSemanticPlans.clear();
+      exploredPageSlugs.clear();
+      exploredRuleNames.clear();
+      searchContextSucceeded=false;
+    }
+    return {changed,previousFingerprint,nextFingerprint};
+  }
+
+  async function ensureClarifiedIntentEvidence(answer,resolution) {
+    if(!resolution.changed&&retrievalEvidence.length)return null;
+    const refreshQuery=clipText(`${question} ${answer}`.trim(),200);
+    const action={tool:"search_context",args:{query:refreshQuery}};
+    const thought=resolution.changed?"业务意图契约已改变，已废弃旧证据并按新口径刷新检索上下文。":"当前没有可复用的检索证据，按已确认口径补充检索上下文。";
+    const step=toolTrace.length+1;
+    if(currentPhase!=="RETRIEVE"){stateTransitions.push({from:currentPhase,to:"RETRIEVE",step});currentPhase="RETRIEVE";}
+    emitEvent(activeOnEvent,{type:"step",step,status:"started"});
+    emitEvent(activeOnEvent,{type:"thought",step,text:thought});
+    emitEvent(activeOnEvent,toolCallEvent(step,action));
+    const refreshStarted=Date.now();let result;
+    try {result=await searchContext(action.args);}
+    catch(error) {
+      throwIfAborted(activeSignal);
+      result=toolFailure({stage:"internal",code:"INTENT_EVIDENCE_REFRESH_FAILED",error:safeError(error),retryable:true});
+    }
+    result=normalizeToolFailure(result);
+    searchContextSucceeded=Boolean(result?.ok);
+    const trace=makeTrace(action,thought,result,Date.now()-refreshStarted,"RETRIEVE");
+    toolTrace.push(trace);
+    emitEvent(activeOnEvent,{type:"tool_result",step,tool:action.tool,ok:trace.ok,summary:trace.summary,durationMs:trace.durationMs,...traceDisplay(trace)});
+    emitEvent(activeOnEvent,{type:"step",step,status:trace.ok?"completed":"failed",durationMs:trace.durationMs});
+    return result;
+  }
+
+  function resetMessagesForClarifiedIntent(answer,resolution,refreshed) {
+    const retrieval=retrievalEvidence.at(-1)||null;
+    const tableNames=new Set(retrieval?.tableNames||[]);
+    const promptContext={
+      ...context,
+      queryIntent,
+      retrieval,
+      knowledge:retrieval?.pages||[],
+      tables:catalog.tables.filter((table)=>tableNames.has(table.tableName)),
+      columns:catalog.columnsByTable,
+      relations:catalog.relations.filter((relation)=>tableNames.has(relation.fromTable)&&tableNames.has(relation.toTable)),
+      rules:catalog.rules.filter((rule)=>exploredRuleNames.has(rule.name)),
+    };
+    const clarificationResult={ok:true,answer,resolvedIntent:queryIntent,priorEvidenceInvalidated:resolution.changed,evidenceDisposition:clarificationEvidenceDisposition(refreshed),...(refreshed?{refreshedContext:refreshed}:{})};
+    messages.splice(0,messages.length,
+      {role:"system",content:agentSystemPrompt({maxIterations,maxSqlCalls,maxScannedRows},config.prompts?.agentSystem)},
+      {role:"user",content:agentQuestionPrompt(question,promptContext,conversationHistory,semanticRuntime,config.prompts?.agentQuestion)},
+      {role:"user",content:`Harness 工具结果（用户已澄清）：${JSON.stringify(clarificationResult)}`},
+    );
+    disclosedTables.clear();for(const table of promptContext.tables)disclosedTables.add(normalizeIdentifier(table.tableName));
+    actionHistory.clear();consecutiveProtocolErrors=0;consecutiveRepeatedActions=0;
+  }
+
+  function agentSnapshotError(error) {
+    const failure=error instanceof Error?error:new Error(String(error));
+    failure.queryAgentSnapshot={queryIntent,retrievalEvidence:[...retrievalEvidence],exploredRuleNames:[...exploredRuleNames],iterations:toolTrace.length,toolTrace:[...toolTrace],stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started};
+    return failure;
+  }
 
   async function continueLoop(startIndex) {
     for(let index=startIndex;index<maxIterations;index++) {
@@ -165,29 +296,48 @@ export async function runQueryAgent({store,connector,config,source,question,cont
       emitEvent(activeOnEvent,{type:"step",step,status:trace.ok?"completed":"failed",durationMs:trace.durationMs});
       if(terminal?.status==="clarification") {
         const pausedAt=Date.now();let resumed=false;
-        return {...terminal,iterations:index+1,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started,resume:async(userAnswer,{signal,onEvent}={})=>{
+        return {...terminal,queryIntent,retrievalEvidence:[...retrievalEvidence],exploredRuleNames:[...exploredRuleNames],iterations:index+1,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started,resume:async(userAnswer,{signal,onEvent}={})=>{
+          try {
           if(resumed)throw new Error("该澄清请求已恢复，不能重复使用");resumed=true;
           const answer=requiredText(userAnswer,"澄清回复",500);deadline+=Date.now()-pausedAt;activeSignal=signal;activeOnEvent=onEvent;
           clarifications.push({question:terminal.clarification.question,answer});
+          const resolution=resolveClarifiedIntent(answer);
           messages.push({role:"assistant",content:JSON.stringify({thought,tool:action.tool,args:action.args})});
-          messages.push({role:"user",content:`Harness 工具结果（用户已澄清）：${JSON.stringify({ok:true,answer})}`});
-          return continueLoop(index+1);
+          if(!resolution.changed)return unboundClarificationOutcome(terminal.clarification,answer);
+          const nextClarification=blockingIntentClarification(queryIntent);
+          if(nextClarification)return pauseForIntentClarification(nextClarification);
+          const intentFailure=unresolvableBlockingIntent(queryIntent);
+          if(intentFailure)return intentFailureOutcome(intentFailure);
+          const refreshed=await ensureClarifiedIntentEvidence(answer,resolution);
+          const evidenceGap=clarifiedEvidenceGapOutcome(refreshed);
+          if(evidenceGap)return evidenceGap;
+          resetMessagesForClarifiedIntent(answer,resolution,refreshed);
+          return await continueLoop(toolTrace.length);
+          } catch(error) { throw agentSnapshotError(error); }
         }};
       }
-      if(terminal) return {...terminal,iterations:index+1,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started};
+      if(terminal) return {...terminal,queryIntent,retrievalEvidence:[...retrievalEvidence],exploredRuleNames:[...exploredRuleNames],iterations:index+1,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started};
       messages.push({role:"assistant",content:JSON.stringify({thought,tool:action.tool,args:action.args})});
       messages.push({role:"user",content:`Harness 工具结果（可信 JSON）：${JSON.stringify(result)}`});
       if(repeatedActionLimitReached)break;
     }
 
     const accountFallbackRuns=completeAccountFallbackRuns(successfulRuns,question,context);
-    if(accountFallbackRuns?.length) {
+    if(accountFallbackRuns?.length)for(const run of accountFallbackRuns)refreshRunContractValidation(run);
+    const fallbackContract=resultContractForRuns(accountFallbackRuns||[]);
+    const accountFallbackValidation=accountFallbackRuns?.length?validateQueryRunSet(fallbackContract,accountFallbackRuns):null;
+    if(accountFallbackRuns?.length&&accountFallbackValidation?.ok) {
       const rowCount=accountFallbackRuns.reduce((sum,run)=>sum+run.rows.length,0);
       return {
         status:"answered",
         conclusion:`查询已完成，共返回 ${rowCount} 行符合条件的结果。`,
         run:accountFallbackRuns.at(-1),runs:accountFallbackRuns,
         budgetFallback:true,
+        queryIntent,
+        retrievalEvidence:[...retrievalEvidence],
+        exploredRuleNames:[...exploredRuleNames],
+        resultContract:fallbackContract,
+        resultContractFingerprint:contractFingerprint(fallbackContract),
         iterations:toolTrace.length,
         toolTrace,
         clarifications:[...clarifications],
@@ -196,14 +346,22 @@ export async function runQueryAgent({store,connector,config,source,question,cont
         durationMs:Date.now()-started,stateTransitions:[...stateTransitions],
       };
     }
-    if(accountFallbackRuns) return {status:"exhausted",reason:"Agent Loop 已取得部分账号查询结果，但未能在预算内形成覆盖全部账号主表和产品维度的完整结果",failureClass:"result_incomplete",iterations:toolTrace.length,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started};
+    if(accountFallbackRuns) return {status:"exhausted",reason:"Agent Loop 已取得部分账号查询结果，但未能在预算内形成覆盖全部账号主表和产品维度的完整结果",failureClass:"result_incomplete",queryIntent,retrievalEvidence:[...retrievalEvidence],exploredRuleNames:[...exploredRuleNames],resultContract:fallbackContract,resultContractFingerprint:contractFingerprint(fallbackContract),iterations:toolTrace.length,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started};
     const lastRun=successfulRuns.at(-1);
+    if(lastRun)refreshRunContractValidation(lastRun);
+    const lastRunContract=resultContractForRuns(lastRun?[lastRun]:[]);
     const lastRunMissingSubjects=lastRun?missingIntentSubjectFacets(queryIntent,retrievalEvidence,lastRun.verdict?.tables||[]):[];
-    if(lastRun&&!lastRunMissingSubjects.length&&!(queryIntent.scope?.exhaustive&&lastRun.mayBeTruncated)) return {
+    const lastRunSetValidation=lastRun?validateQueryRunSet(lastRunContract,[lastRun]):null;
+    if(lastRun&&lastRun.contractValidation?.ok&&lastRunSetValidation?.ok&&!lastRunMissingSubjects.length&&!(queryIntent.scope?.exhaustive&&lastRun.mayBeTruncated)) return {
       status:"answered",
       conclusion:`查询已完成，共返回 ${lastRun.rows.length} 行符合条件的结果。`,
       run:lastRun,runs:[lastRun],
       budgetFallback:true,
+      queryIntent,
+      retrievalEvidence:[...retrievalEvidence],
+      exploredRuleNames:[...exploredRuleNames],
+      resultContract:lastRunContract,
+      resultContractFingerprint:contractFingerprint(lastRunContract),
       iterations:toolTrace.length,
       toolTrace,
       clarifications:[...clarifications],
@@ -212,7 +370,7 @@ export async function runQueryAgent({store,connector,config,source,question,cont
       durationMs:Date.now()-started,stateTransitions:[...stateTransitions],
     };
     const incomplete=Boolean(lastRun&&queryIntent.scope?.exhaustive&&lastRun.mayBeTruncated);
-    return {status:"exhausted",reason:incomplete?"查询结果达到安全 LIMIT，无法确认已覆盖用户要求的完整范围":"Agent Loop 在预算内没有得到可验证的查询结果",failureClass:incomplete?"result_incomplete":dominantFailureClass(toolTrace,"budget_exhausted"),iterations:toolTrace.length,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started};
+    return {status:"exhausted",reason:incomplete?"查询结果达到安全 LIMIT，无法确认已覆盖用户要求的完整范围":"Agent Loop 在预算内没有得到可验证的查询结果",failureClass:incomplete?"result_incomplete":dominantFailureClass(toolTrace,"budget_exhausted"),queryIntent,retrievalEvidence:[...retrievalEvidence],exploredRuleNames:[...exploredRuleNames],resultContract:lastRunContract,resultContractFingerprint:contractFingerprint(lastRunContract),iterations:toolTrace.length,toolTrace,stateTransitions:[...stateTransitions],clarifications:[...clarifications],tokenUsage:{...tokenUsage},exploredPageSlugs:[...exploredPageSlugs],durationMs:Date.now()-started};
   }
 
   async function searchContext(args) {
@@ -231,10 +389,13 @@ export async function runQueryAgent({store,connector,config,source,question,cont
       conceptAliases:config.retrieval?.conceptAliases||[],
       termAliases:context.termAliases||[],
       intent:queryIntent,
+      ontologySchema:catalog.ontologySchema,
+      enumItemsByColumn:catalog.enumItemsByColumn,
     });
     retrievalEvidence.push(retrieval);
     for(const page of retrieval.pages) exploredPageSlugs.add(page.slug);
     const rules=catalog.rules.filter((rule)=>!rule.appliesTo||retrieval.tableNames.some((table)=>String(rule.appliesTo).split(/[,，]/).map((item)=>item.trim()).includes(table)));
+    for(const rule of rules)exploredRuleNames.add(rule.name);
     return {
       ok:true,
       retrievalVersion:retrieval.version,
@@ -243,6 +404,20 @@ export async function runQueryAgent({store,connector,config,source,question,cont
       pages:retrieval.pages.map((page)=>({type:page.pageType,title:page.title,definition:clipText(page.content,2_000),sqlGuidance:clipText(page.sqlContent,1_500),antiExamples:clipText(page.antiExamples,1_000),tables:page.tables||[]})),
       relatedTables:retrieval.tableNames,
       coverageContract:retrieval.coverageContract,
+      capabilities:(retrieval.diagnostics?.facets||[]).filter((facet)=>facet.required).map((facet)=>({
+        key:facet.key,
+        executionTables:(facet.executionTables||[]).slice(0,4),
+        executionColumns:(facet.executionColumns||[]).slice(0,12),
+        filterBindings:(facet.filterBindings||[]).slice(0,12),
+        executionValidityPredicates:(facet.executionValidityPredicates||[]).slice(0,8),
+        labelColumns:(facet.labelColumns||[]).slice(0,8),
+        bindingTables:(facet.bindingTables||[]).slice(0,4),
+        bindingColumns:(facet.bindingColumns||[]).slice(0,8),
+        bindingRelationIds:(facet.bindingRelationIds||[]).slice(0,8),
+        bindingValidityPredicates:(facet.bindingValidityPredicates||[]).slice(0,8),
+        bindingProvenance:facet.bindingProvenance||null,
+        paths:(facet.paths||[]).slice(0,4),
+      })),
       rules:rules.slice(0,10).map((rule)=>({name:rule.name,content:clipText(rule.content,1_000)})),
     };
   }
@@ -329,8 +504,10 @@ export async function runQueryAgent({store,connector,config,source,question,cont
     if(!semanticRuntime?.ok) return {ok:false,stage:"semantic",error:semanticRuntime?.reason||"当前没有可用的发布语义模型"};
     if(!args?.plan||typeof args.plan!=="object"||Array.isArray(args.plan)) return {ok:false,stage:"semantic",error:"plan 必须是对象"};
     try {
-      const compiled=compileSemanticQueryPlan(args.plan,{schema:semanticRuntime.published.schema,catalog:semanticRuntime.catalog,maxRows:config.queryMaxRows});
-      const binding={...compiled,ontologySchemaVersion:semanticRuntime.published.version};
+      const compiled=compileSemanticQueryPlan(args.plan,{schema:semanticRuntime.published.schema,catalog:semanticRuntime.catalog,maxRows:config.queryMaxRows,ontologySchemaVersion:semanticRuntime.published.version});
+      const contractValidation=queryResultContractValidation(queryIntent,compiled.sql,{usedTables:compiled.policy.allowedTables||[],retrieval:retrievalEvidence,verdict:guardSql(compiled.sql,{...compiled.policy,valueKinds:catalog.policy.valueKinds}),columnsByTable:catalog.columnsByTable,semanticContract:compiled.semanticContract});
+      if(!contractValidation.ok)return toolFailure({stage:"intent",code:contractValidation.errors[0].code,error:contractValidation.errors[0].message,retryable:true,details:contractValidation.errors[0].details});
+      const binding={...compiled,ontologySchemaVersion:semanticRuntime.published.version,contractValidation};
       validatedSemanticPlans.set(sqlHash(compiled.sql),binding);
       for(const table of compiled.policy.allowedTables||[]) disclosedTables.add(normalizeIdentifier(table));
       return {ok:true,sql:compiled.sql,plan:compiled.plan,semanticPath:compiled.semanticPath,ontologySchemaVersion:semanticRuntime.published.version};
@@ -348,10 +525,19 @@ export async function runQueryAgent({store,connector,config,source,question,cont
     const verdict=guardSql(sql,{...(semanticPlan?.policy||catalog.policy),valueKinds:catalog.policy.valueKinds});
     if(!verdict.ok) {
       const suggestedTables=verdict.code==="UNKNOWN_TABLE"?suggestCatalogTables(verdict.details?.unknownTables||[],catalog.tables):[];
-      return toolFailure({stage:"guard",code:verdict.code||"GUARD_REJECTED",error:`${verdict.reason}${suggestedTables.length?`；可能相关的真实表：${suggestedTables.join("、")}，请先调用 get_schema 确认字段`:""}`,retryable:true,details:{...(verdict.details||{}),...(suggestedTables.length?{suggestedTables}:{})}});
+      const bindingTables=new Set(retrievalEvidence.flatMap((item)=>item?.diagnostics?.facets||[]).flatMap((facet)=>facet.bindingTables||[]));
+      const relationPath=verdict.code==="UNCONFIRMED_RELATION"?suggestConfirmedRelationPath(verdict.reason,catalog.relations,bindingTables):null;
+      const relationHint=relationPath?`；已确认的替代关联路径：${relationPath.joins.join(" → ")}。${relationPath.intermediateTables.length?`请先用 get_schema 查看中间表 ${relationPath.intermediateTables.join("、")}`:"请按此已确认字段关系改写"}`:"";
+      return toolFailure({stage:"guard",code:verdict.code||"GUARD_REJECTED",error:`${verdict.reason}${suggestedTables.length?`；可能相关的真实表：${suggestedTables.join("、")}，请先调用 get_schema 确认字段`:""}${relationHint}`,retryable:true,details:{...(verdict.details||{}),...(suggestedTables.length?{suggestedTables}:{}),...(relationPath?{suggestedRelationPath:relationPath}:{})}});
     }
-    const intentError=queryIntentFilterError(question,verdict.sql,queryIntent,{usedTables:verdict.tables,retrieval:retrievalEvidence});
+    const contractExecution={usedTables:verdict.tables,retrieval:retrievalEvidence,verdict,columnsByTable:catalog.columnsByTable,semanticContract:semanticPlan?.semanticContract||null};
+    const intentError=queryIntentFilterError(question,verdict.sql,queryIntent,contractExecution);
     if(intentError)return toolFailure({stage:"intent",code:intentError.code,error:intentError.message,retryable:intentError.retryable,details:intentError.details});
+    const contractValidation=queryResultContractValidation(queryIntent,verdict.sql,contractExecution);
+    if(!contractValidation.ok) {
+      const error=contractValidation.errors?.[0]||{};
+      return toolFailure({stage:"intent",code:error.code||"INTENT_RESULT_CONTRACT_MISMATCH",error:error.message||"SQL 未满足查询结果契约",retryable:true,details:error.details});
+    }
     const undisclosed=verdict.tables.filter((table)=>!disclosedTables.has(normalizeIdentifier(table)));
     if(undisclosed.length) return {ok:false,stage:"guard",error:`执行前必须先用 get_schema 查看表：${undisclosed.join(", ")}`};
     const executionStarted=Date.now();
@@ -363,7 +549,7 @@ export async function runQueryAgent({store,connector,config,source,question,cont
       const fields=normalizeFields(rawFields,rows);
       const resultDelivery=rows.length>100?"direct":"preview";
       const mayBeTruncated=Number.isFinite(Number(verdict.limit?.effective))&&rows.length>=Number(verdict.limit.effective);
-      const run={name,requestedSql:sql,sql:verdict.sql,sqlHashes:new Set([sqlHash(sql),sqlHash(verdict.sql)]),rows,fields,verdict,scannedRows:explanation.scannedRows,durationMs:Date.now()-executionStarted,resultDelivery,semanticPlan,mayBeTruncated};
+      const run={name,requestedSql:sql,sql:verdict.sql,sqlHashes:new Set([sqlHash(sql),sqlHash(verdict.sql)]),rows,fields,verdict,contractValidation,scannedRows:explanation.scannedRows,durationMs:Date.now()-executionStarted,resultDelivery,semanticPlan,mayBeTruncated};
       successfulRuns.push(run);
       const contextRows=resultDelivery==="direct"?{rows:[],truncated:true,modelRowsOmitted:true}:truncateRows(rows,{maxRows:40,maxBytes:64*1024,maxCellChars:200});
       return {ok:true,executedSql:verdict.sql,columns:fields,rowCount:rows.length,scannedRows:explanation.scannedRows,durationMs:run.durationMs,rows:contextRows.rows,truncated:contextRows.truncated,modelRowsOmitted:contextRows.modelRowsOmitted||undefined,resultDelivery,mayBeTruncated,limit:verdict.limit};
@@ -401,17 +587,46 @@ export async function runQueryAgent({store,connector,config,source,question,cont
       if(runs.includes(run))return {result:{ok:false,error:"submit_answer.sqls 不能重复引用同一次 SQL 执行"},terminal:null};
       runs.push(run);
     }
+    for(const run of runs) {
+      const validation=refreshRunContractValidation(run);
+      if(!validation.ok) {
+        const error=validation.errors?.[0]||{};
+        return {result:toolFailure({stage:"intent",code:error.code||"INTENT_RESULT_CONTRACT_MISMATCH",error:error.message||"提交结果与最终查询契约不一致",retryable:true,details:error.details}),terminal:null};
+      }
+    }
     const missingScopes=missingExhaustiveAccountTables(question,context,runs.flatMap((run)=>run.verdict.tables||[]));
     if(missingScopes.length)return {result:{ok:false,error:`问题要求查询所有账号，但提交结果遗漏账号主表：${missingScopes.join("、")}`},terminal:null};
     const missingSubjectFacets=missingIntentSubjectFacets(queryIntent,retrievalEvidence,runs.flatMap((run)=>run.verdict.tables||[]));
     if(missingSubjectFacets.length)return {result:toolFailure({stage:"intent",code:"INTENT_SUBJECT_INCOMPLETE",error:`提交结果遗漏业务对象分面：${missingSubjectFacets.join("、")}`,retryable:true,details:{missingFacets:missingSubjectFacets}}),terminal:null};
     const missingProductColumns=missingExhaustiveAccountProductColumns(question,context,runs.map((run)=>({sql:run.sql,tables:run.verdict.tables||[]})));
     if(missingProductColumns.length)return {result:{ok:false,error:`问题要求查询所有账号，但提交结果没有返回产品维度：${missingProductColumns.join("、")}`},terminal:null};
+    const resultContract=resultContractForRuns(runs);
+    const contractSetValidation=validateQueryRunSet(resultContract,runs);
+    if(!contractSetValidation.ok) {
+      const error=contractSetValidation.errors[0];
+      return {result:toolFailure({stage:"intent",code:error.code||"INTENT_RESULT_CONTRACT_MISMATCH",error:error.message||"提交结果未满足查询结果契约",retryable:true,details:error.details}),terminal:null};
+    }
     const incompleteRuns=runs.filter((run)=>run.mayBeTruncated);
     if(queryIntent.scope?.exhaustive&&incompleteRuns.length)return {result:toolFailure({stage:"result",code:"RESULT_INCOMPLETE",error:`问题要求完整结果，但以下结果集达到安全 LIMIT，无法确认已完整返回：${incompleteRuns.map((run)=>run.name).join("、")}`,retryable:true,details:{resultSets:incompleteRuns.map((run)=>run.name)}}),terminal:null};
     const delta=args.delta==null?undefined:clipText(String(args.delta),500);
-    return {result:{ok:true,queryCount:runs.length},terminal:{status:"answered",conclusion,delta,run:runs.at(-1),runs}};
+    return {result:{ok:true,queryCount:runs.length},terminal:{status:"answered",conclusion,delta,run:runs.at(-1),runs,resultContract,resultContractFingerprint:contractFingerprint(resultContract)}};
   }
+
+  function refreshRunContractValidation(run) {
+    const contractValidation=queryResultContractValidation(queryIntent,run.sql,{
+      usedTables:run.verdict?.tables||[],retrieval:retrievalEvidence,verdict:run.verdict,columnsByTable:catalog.columnsByTable,semanticContract:run.semanticPlan?.semanticContract||null,
+    });
+    run.contractValidation=contractValidation;
+    return contractValidation;
+  }
+
+  function resultContractForRuns(runs) {
+    const semanticContracts=(runs||[]).map((run)=>run.semanticPlan?.semanticContract||null);
+    const sharedSemanticContract=semanticContracts.length&&semanticContracts.every(Boolean)&&semanticContracts.every((contract)=>stableJson(contract)===stableJson(semanticContracts[0]))?semanticContracts[0]:null;
+    return buildQueryResultContract(queryIntent,retrievalEvidence,sharedSemanticContract);
+  }
+
+  function contractFingerprint(contract) { return hash(`query-result-contract:${stableJson(contract)}`); }
 
   function refuse(args) {
     const reason=requiredText(args.reason,"reason",1_000);
@@ -436,6 +651,7 @@ function completeAccountFallbackRuns(successfulRuns,question,context) {
   const selected=[];
   for(const root of roots) {
     const candidate=successfulRuns.findLast((run)=>{
+      if(!run.contractValidation?.ok)return false;
       if(!(run.verdict?.tables||[]).some((table)=>normalizeIdentifier(table)===normalizeIdentifier(root)))return false;
       if(run.mayBeTruncated)return false;
       return !missingExhaustiveAccountProductColumns(question,context,[{sql:run.sql,tables:run.verdict?.tables||[]}]).some((item)=>normalizeIdentifier(item.split(".")[0])===normalizeIdentifier(root));
@@ -446,20 +662,22 @@ function completeAccountFallbackRuns(successfulRuns,question,context) {
   return selected.sort((left,right)=>successfulRuns.indexOf(left)-successfulRuns.indexOf(right));
 }
 
-function buildCatalog(store,sourceId,maxRows,question="") {
+function buildCatalog(store,sourceId,maxRows,question="",ontologySchema=null) {
   const tables=store.listTables(sourceId).filter((table)=>table.grade!=="C"&&table.active);
   const rawColumnsByTable=Object.fromEntries(tables.map((table)=>[table.tableName,store.listColumns(sourceId,table.tableName)]));
   const columnSemantics=buildQueryColumnSemantics(rawColumnsByTable);
   const columnsByTable=rawColumnsByTable;
-  const enums={};
-  for(const table of tables) for(const item of store.listEnums(sourceId,table.tableName)) (enums[`${table.tableName}.${item.columnName}`]??=[]).push(item.value);
+  const enums={};const enumItemsByColumn={};
+  for(const table of tables) for(const item of store.listEnums(sourceId,table.tableName)) {const key=`${table.tableName}.${item.columnName}`;(enums[key]??=[]).push(item.value);(enumItemsByColumn[key]??=[]).push(item);}
   const relations=store.listRelations(sourceId,true);
   return {
     tables,
     tableByName:new Map(tables.map((table)=>[table.tableName,table])),
     columnsByTable,
     enums,
+    enumItemsByColumn,
     relations,
+    ontologySchema:ontologySchema||store.getPublishedOntologySchema(sourceId)?.schema||null,
     pages:store.listKnowledge(sourceId),
     rules:store.listRules(sourceId),
     policy:{allowedTables:tables.map((table)=>table.tableName),allowedColumns:columnSemantics.allowedColumns,columnKinds:columnSemantics.columnKinds,valueKinds:detectQuestionValueKinds(question),allowedRelations:relations,maxRows,enums:Object.fromEntries(Object.entries(enums).map(([key,values])=>[key,{mode:"observed",values:values.filter((value)=>value!=="null")}]))},
@@ -471,10 +689,24 @@ function agentSystemPrompt({maxIterations,maxSqlCalls,maxScannedRows},template=Q
 }
 
 function agentQuestionPrompt(question,context,history,semanticRuntime,template=QUERY_PROMPT_DEFAULTS.agentQuestion) {
+  const retrievalCapabilities=(context.retrieval?.diagnostics?.facets||[]).filter((facet)=>facet.required).map((facet)=>({
+    key:facet.key,
+    executionTables:(facet.executionTables||[]).slice(0,4),
+    executionColumns:(facet.executionColumns||[]).slice(0,12),
+    filterBindings:(facet.filterBindings||[]).slice(0,12),
+    executionValidityPredicates:(facet.executionValidityPredicates||[]).slice(0,8),
+    labelColumns:(facet.labelColumns||[]).slice(0,8),
+    bindingTables:(facet.bindingTables||[]).slice(0,4),
+    bindingColumns:(facet.bindingColumns||[]).slice(0,8),
+    bindingRelationIds:(facet.bindingRelationIds||[]).slice(0,8),
+    bindingValidityPredicates:(facet.bindingValidityPredicates||[]).slice(0,8),
+    paths:(facet.paths||[]).slice(0,4),
+  }));
   const initial={
     question,
     queryIntent:context.queryIntent||parseQueryIntent(question),
     retrievalContract:context.retrieval?.coverageContract,
+    retrievalCapabilities,
     lifecycle:["UNDERSTAND","RETRIEVE","RESOLVE","PLAN","VALIDATE","EXECUTE","REPAIR","SUBMIT"],
     recentConversation:history.slice(-10).map((item)=>({role:item.role,content:clipText(item.content,500)})),
     retrievedKnowledge:context.knowledge.map((page)=>({type:page.pageType,title:page.title,definition:clipText(page.content,1_500),sqlGuidance:clipText(page.sqlContent,1_000),antiExamples:clipText(page.antiExamples,800)})),
@@ -569,10 +801,73 @@ function phasesForTool(tool) { return {search_context:["RETRIEVE"],get_schema:["
 function availableAgentTools({searchContextSucceeded=false}={}) { return searchContextSucceeded?QUERY_AGENT_TOOLS.filter((tool)=>tool.name!=="search_context"):QUERY_AGENT_TOOLS; }
 function actionFingerprint(action){return `${action?.tool||"unknown"}:${hash(stableJson(action?.args||{}))}`;}
 function stableJson(value){if(Array.isArray(value))return `[${value.map(stableJson).join(",")}]`;if(value&&typeof value==="object")return `{${Object.keys(value).sort().map((key)=>`${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;return JSON.stringify(value);}
+function clarificationEvidenceDisposition(refreshed) {return !refreshed?"reused":refreshed.ok?"refreshed":"refresh_failed";}
+function clarifiedEvidenceGap(intent,retrieval) {
+  if(!retrieval?.ok)return null;
+  const missingFacets=missingRequiredRetrievalFacets(retrieval);
+  if(!missingFacets.length)return null;
+  const requirements=new Map((intent?.requirements||[]).map((item)=>[item.id,item]));
+  const attribution=missingFacets.map((id)=>requirements.get(id)).find((item)=>item?.kind==="dimension"&&item.attribution);
+  if(attribution) {
+    const attributionLabel=attribution.attribution==="event_time"?"事件发生时负责人":attribution.attribution==="current"?"当前负责人":String(attribution.attribution);
+    return {
+      errorCode:"INTENT_DIMENSION_ATTRIBUTION_BINDING_MISSING",
+      missingFacets,
+      reason:`澄清后的“${attributionLabel}”没有唯一、可验证的已发布归属角色和已确认关系路径；系统不会复用其他归属口径或猜测历史快照。`,
+    };
+  }
+  return {
+    errorCode:"INTENT_REQUIRED_RETRIEVAL_FACET_MISSING",
+    missingFacets,
+    reason:`澄清后的结构化查询口径仍缺少可执行的已发布分面：${missingFacets.join("、")}；系统不会在覆盖不完整时继续规划或执行 SQL。`,
+  };
+}
+function intentEvidenceFingerprint(intent) {
+  const excluded=new Set(["rawQuestion","normalizedQuestion","semanticQuestion","ambiguities"]);
+  const contract=Object.fromEntries(Object.entries(intent||{}).filter(([key])=>!excluded.has(key)));
+  return hash(`intent-evidence-v1:${stableJson(contract)}`);
+}
 function suggestCatalogTables(unknownTables,tables,limit=5) {
   const unknown=[...new Set((unknownTables||[]).map(normalizeIdentifier).filter(Boolean))];
   if(!unknown.length)return [];
   return tables.map((table)=>({name:table.tableName,score:Math.max(...unknown.map((value)=>tableNameSimilarity(value,table.tableName)))})).filter((item)=>item.score>0).sort((left,right)=>right.score-left.score||left.name.localeCompare(right.name)).slice(0,limit).map((item)=>item.name);
+}
+function suggestConfirmedRelationPath(reason,relations,preferredTables=new Set(),maxHops=4) {
+  const match=String(reason||"").match(/未确认的(?:\s*JOIN|关联)：([a-z0-9_$-]+)\.([a-z0-9_$-]+)\s*=\s*([a-z0-9_$-]+)\.([a-z0-9_$-]+)/i);
+  if(!match)return null;
+  const start=normalizeIdentifier(match[1]);const target=normalizeIdentifier(match[3]);
+  const graph=new Map();
+  for(const relation of relations||[]) {
+    if(!isUsableConfirmedRelation(relation))continue;
+    const from=normalizeIdentifier(relation.fromTable);const to=normalizeIdentifier(relation.toTable);
+    if(!graph.has(from))graph.set(from,[]);if(!graph.has(to))graph.set(to,[]);
+    graph.get(from).push({next:to,relation});graph.get(to).push({next:from,relation});
+  }
+  const preferred=new Set([...preferredTables].map(normalizeIdentifier));
+  const queue=[{table:start,tables:[start],edges:[]}];const bestDepth=new Map([[start,0]]);
+  while(queue.length) {
+    const current=queue.shift();
+    if(current.table===target&&current.edges.length) {
+      return {
+        tables:current.tables,
+        intermediateTables:current.tables.slice(1,-1),
+        joins:current.edges.map(({relation})=>`${relation.fromTable}.${relation.fromCol} = ${relation.toTable}.${relation.toCol}`),
+      };
+    }
+    if(current.edges.length>=maxHops)continue;
+    const edges=[...(graph.get(current.table)||[])].sort((left,right)=>Number(preferred.has(right.next))-Number(preferred.has(left.next))||left.next.localeCompare(right.next));
+    for(const edge of edges) {
+      const depth=current.edges.length+1;
+      if((bestDepth.get(edge.next)??Infinity)<=depth)continue;
+      bestDepth.set(edge.next,depth);
+      queue.push({table:edge.next,tables:[...current.tables,edge.next],edges:[...current.edges,edge]});
+    }
+  }
+  return null;
+}
+function isUsableConfirmedRelation(relation) {
+  const status=String(relation?.status||"").toLowerCase();
+  return !status||status==="confirmed"||status==="accepted";
 }
 function tableNameSimilarity(leftValue,rightValue) {
   const left=normalizeIdentifier(leftValue);const right=normalizeIdentifier(rightValue);
@@ -617,10 +912,24 @@ function clarificationContentError(value,catalog) {
   if(table)return `澄清问题不能暴露物理表名 ${table}`;
   return null;
 }
+function blockingIntentClarification(intent) {
+  const supported=RESOLVABLE_INTENT_AMBIGUITIES;
+  const ambiguity=(intent?.ambiguities||[]).find((item)=>item?.blocking&&supported.has(item.code));
+  if(!ambiguity)return null;
+  const options=[...new Set((ambiguity.options||[]).map((item)=>String(item||"").trim()).filter(Boolean))].slice(0,5);
+  return {question:`${String(ambiguity.message||"查询口径需要确认").replace(/[。；;]+$/g,"")}。请选择统计口径：`,options,allowFreeText:true};
+}
+function unresolvableBlockingIntent(intent) {return (intent?.ambiguities||[]).find((item)=>item?.blocking&&!RESOLVABLE_INTENT_AMBIGUITIES.has(item.code))||null;}
+const RESOLVABLE_INTENT_AMBIGUITIES=new Set([
+  "DIMENSION_ATTRIBUTION_AMBIGUOUS","TIME_RANGE_UNKNOWN","TIME_ROLE_AMBIGUOUS","TIME_ROLE_UNKNOWN","TIME_GRAIN_UNKNOWN","MEASURE_GRAIN_AMBIGUOUS",
+  "RANKING_DIMENSION_UNKNOWN","RANKING_MEASURE_UNKNOWN","RANKING_LIMIT_INVALID","COMPARISON_BASELINE_UNKNOWN",
+  "FILTER_BOOLEAN_UNSUPPORTED","FILTER_EXPRESSION_UNSUPPORTED","FILTER_VALUE_TYPE_UNSUPPORTED","FILTER_OPERATOR_UNSUPPORTED","FILTER_RESET_TARGET_UNKNOWN",
+  "DELETION_SCOPE_UNKNOWN",
+]);
 function emitEvent(onEvent,event) { try { onEvent?.(event); } catch { /* Streaming observers cannot control the harness. */ } }
 function throwIfAborted(signal) { if(signal?.aborted){const error=new Error("查询已取消");error.name="AbortError";error.code="ABORT_ERR";throw error;} }
 function hash(value) { return createHash("sha256").update(value).digest("hex"); }
 function boundedInteger(value,fallback,min,max) { const number=Number(value);return Number.isFinite(number)?Math.max(min,Math.min(max,Math.floor(number))):fallback; }
 function mergeTokenUsage(target,usage) { if(!usage||!Number.isFinite(Number(usage.totalTokens)))return;target.promptTokens+=Number(usage.promptTokens||0);target.completionTokens+=Number(usage.completionTokens||0);target.totalTokens+=Number(usage.totalTokens||0);target.available=true; }
 
-export const _internal={buildCatalog,truncateRows,sanitizeThought,sqlHash,agentSystemPrompt,agentQuestionPrompt,clarificationContentError,completeAccountFallbackRuns,availableAgentTools,suggestCatalogTables};
+export const _internal={buildCatalog,truncateRows,sanitizeThought,sqlHash,intentEvidenceFingerprint,clarifiedEvidenceGap,agentSystemPrompt,agentQuestionPrompt,clarificationContentError,blockingIntentClarification,unresolvableBlockingIntent,completeAccountFallbackRuns,availableAgentTools,suggestCatalogTables,suggestConfirmedRelationPath};

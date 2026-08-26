@@ -21,7 +21,7 @@ test("agent gate API runs an off-vs-required background comparison and persists 
   const originalFetch=globalThis.fetch;globalThis.fetch=async()=>new Response(JSON.stringify({choices:[{message:{content:JSON.stringify(replies.shift())}}],usage:{prompt_tokens:20,completion_tokens:5,total_tokens:25}}),{status:200});
   try {
     const response=await api(app,"/api/eval/gate","token-editor",{sourceId:source.id,setName:"agent-api",tolerance:1e-6,gateKind:"agent",maxRepeatedActionRate:0.05});assert.equal(response.status,202);assert.equal(response.body.taskType,"evaluation_agent_gate");assert.equal(response.body.payload.maxRepeatedActionRate,0.05);
-    const done=await waitForTask(app,response.body.id);assert.equal(done.status,"succeeded",done.error);assert.equal(done.result.gateKind,"agent");assert.equal(done.result.decision,"enable_agent_prefer");assert.equal(done.result.candidate.agentExecutionRate,1);
+    const done=await waitForTask(app,response.body.id);assert.equal(done.status,"succeeded",done.error);assert.equal(done.result.gateKind,"agent");assert.equal(done.result.decision,"enable_agent_prefer",JSON.stringify(done.result));assert.equal(done.result.candidate.agentExecutionRate,1);
     const gate=app.store.getEvalGate(response.body.id);assert.equal(gate.passed,1);assert.equal(gate.candidate.averageTokens,50);
     const candidate=app.store.listEvalRuns(source.id).find((item)=>item.requestedMode==="agent_required");assert.equal(candidate.agentMetrics.totalTokens,50);assert.equal(candidate.agentMetrics.toolCalls,2);
   } finally {globalThis.fetch=originalFetch;await app.close();}

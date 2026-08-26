@@ -110,7 +110,7 @@ test("agent preserves 北京大成 as an organization for monthly incoming clues
   store.upsertEnum({sourceId:source.id,tableName:"alpha_user",columnName:"city",value:"北京",count:10,ratio:1});
   store.upsertKnowledge({sourceId:source.id,pageType:"term",slug:"进线线索",title:"进线线索",aliases:'["线索"]',tablesJson:'["alpha_crm_clue"]',content:"CRM 收到的进线线索",sqlContent:"按 clue_create_time 统计",antiExamples:"机构名不能当作城市",verified:1,owner:"owner"});
   const wrongSql="SELECT clue_id FROM alpha_crm_clue WHERE city = '北京市'";
-  const correctSql="SELECT clue_id, office_name, clue_create_time FROM alpha_crm_clue WHERE office_name LIKE '%北京大成%' AND clue_create_time >= DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01') AND clue_create_time < DATE_FORMAT(DATE_ADD(CURRENT_DATE(), INTERVAL 1 MONTH), '%Y-%m-01')";
+  const correctSql="SELECT clue_id, office_name, clue_create_time FROM alpha_crm_clue WHERE office_name LIKE '%北京大成%' AND clue_create_time >= '2026-08-01' AND clue_create_time < '2026-09-01'";
   let queryCalls=0;
   const connector={explain:async()=>[{rows:2}],query:async()=>{queryCalls++;return [[{clue_id:1,office_name:"北京大成",clue_create_time:"2026-08-10"}],[{name:"clue_id"},{name:"office_name"},{name:"clue_create_time"}]];}};
   const actions=[
@@ -127,7 +127,7 @@ test("agent preserves 北京大成 as an organization for monthly incoming clues
     assert.equal(answer.evidence.toolTrace[0].errorCode,"INTENT_ENTITY_DROPPED");
     assert.match(answer.evidence.sql,/office_name.*北京大成/i);
     const audit=store.listAudits(source.id,1)[0];
-    assert.equal(audit.intentVersion,"1.1");
+    assert.equal(audit.intentVersion,"2.0");
     assert.deepEqual(audit.intent.entities.map((item)=>item.text),["北京大成"]);
     assert.equal(audit.retrievalTrace.selectedTables.includes("alpha_crm_clue"),true);
   } finally {globalThis.fetch=originalFetch;store.close();}
@@ -222,6 +222,46 @@ test("agent rejects a valid but unrelated table before executing a business-obje
     assert.equal(queries,1);assert.equal(answer.conclusion,"查询到订单。");
     assert.equal(answer.evidence.toolTrace[0].errorCode,"INTENT_SUBJECT_DROPPED");
     assert.match(answer.evidence.toolTrace[0].summary,/业务对象/);
+  } finally {globalThis.fetch=originalFetch;store.close();}
+});
+
+test("agent result contract rejects an executable analytical shortcut before EXPLAIN and accepts the repaired lineage",async()=>{
+  const {store,source}=await createFixture();
+  const definitions={
+    lead_entity:{comment:"线索主表",columns:[
+      ["id","bigint",1,"线索主键"],["created_at","datetime",0,"线索进线时间"],["allocated_owner_id","varchar",0,"线索分配人ID"],["is_won","tinyint",0,"是否赢单"],
+    ]},
+    deal_event:{comment:"线索成单事件",columns:[["id","bigint",1,"事件主键"],["lead_id","bigint",0,"线索ID"],["completed_at","datetime",0,"订单成单时间"]]},
+    lead_owner_rel:{comment:"线索销售负责人关系",columns:[["lead_id","bigint",0,"线索ID"],["owner_id","varchar",0,"当前负责销售ID"],["owner_name","varchar",0,"销售姓名"],["is_deleted","tinyint",0,"逻辑删除"]]},
+  };
+  for(const [table,{comment,columns}] of Object.entries(definitions)) {
+    store.upsertTable({sourceId:source.id,tableName:table,rowEstimate:20,grade:"A",active:1,comment});
+    for(const [columnName,dataType,isPrimary,columnComment] of columns)store.upsertColumn({sourceId:source.id,tableName:table,columnName,dataType,isPrimary,isSensitive:0,comment:columnComment});
+  }
+  store.upsertRelation({sourceId:source.id,fromTable:"deal_event",fromCol:"lead_id",toTable:"lead_entity",toCol:"id",cardinality:"N:1",confidence:1,status:"confirmed",inferenceSource:"foreign_key"});
+  store.upsertRelation({sourceId:source.id,fromTable:"lead_owner_rel",fromCol:"lead_id",toTable:"lead_entity",toCol:"id",cardinality:"N:1",confidence:1,status:"confirmed",inferenceSource:"foreign_key"});
+  const wrongSql="SELECT allocated_owner_id AS owner_id, COUNT(*) AS won_count FROM lead_entity WHERE created_at >= '2026-08-01' AND created_at < '2026-09-01' AND is_won = 1 GROUP BY allocated_owner_id ORDER BY won_count DESC";
+  const correctSql="SELECT r.owner_id, MAX(r.owner_name) AS owner_name, COUNT(DISTINCT l.id) AS won_count FROM deal_event e JOIN lead_entity l ON l.id = e.lead_id JOIN lead_owner_rel r ON r.lead_id = l.id WHERE e.completed_at >= '2026-08-01' AND e.completed_at < '2026-09-01' AND r.is_deleted = 0 GROUP BY r.owner_id ORDER BY won_count DESC";
+  let explains=0;let queries=0;
+  const connector={explain:async()=>{explains++;return [{rows:10}];},query:async()=>{queries++;return [[{owner_id:"owner-1",owner_name:"销售甲",won_count:3}],[{name:"owner_id"},{name:"owner_name"},{name:"won_count"}]];}};
+  const actions=[
+    {thought:"先尝试单表统计。",tool:"run_sql",args:{sql:wrongSql}},
+    {thought:"按结果契约改用成单事件、当前负责人和线索去重。",tool:"run_sql",args:{sql:correctSql}},
+    {thought:"提交通过契约的排行。",tool:"submit_answer",args:{sql:correctSql,conclusion:"销售乙排名第一，共 999 条成单线索。",delta:"+999"}},
+  ];
+  const originalFetch=globalThis.fetch;globalThis.fetch=async()=>llmResponse(actions.shift());
+  try {
+    const answer=await createQueryService({store,connector,config:config()}).ask({sourceId:source.id,question:"按当前销售负责人统计本月实际成单线索排行",userName:"tester"});
+    assert.equal(queries,1);assert.equal(explains,1);
+    assert.equal(answer.evidence.toolTrace[0].ok,false);
+    assert.match(answer.evidence.toolTrace[0].errorCode,/INTENT_(?:MEASURE|TIME_ROLE|DIMENSION)/);
+    assert.equal(answer.evidence.resultContract.validations[0].ok,true);
+    assert.equal(answer.conclusion,"排行查询已完成，共返回 1 行结果；具体排名与指标值以结果表为准。");
+    assert.equal(answer.delta,undefined);
+    assert.deepEqual(answer.rows,[{owner_id:"owner-1",owner_name:"销售甲",won_count:3}]);
+    assert.doesNotMatch(answer.conclusion,/销售乙|999/);
+    assert.match(answer.evidence.sql,/completed_at/);
+    assert.match(answer.evidence.sql,/COUNT\(DISTINCT/);
   } finally {globalThis.fetch=originalFetch;store.close();}
 });
 
@@ -437,13 +477,26 @@ test("tool result rows are bounded by row, byte and cell limits",()=>{
   assert.ok(Buffer.byteLength(JSON.stringify(result.rows))<=64*1024);
 });
 
+test("unconfirmed direct joins receive a bounded confirmed bridge path hint",()=>{
+  const relations=[
+    {fromTable:"clue_owner_rel",fromCol:"seller_id",toTable:"seller",toCol:"seller_id"},
+    {fromTable:"clue_owner_rel",fromCol:"clue_id",toTable:"crm_clue",toCol:"clue_id"},
+    {fromTable:"feed_action",fromCol:"seller_id",toTable:"seller",toCol:"seller_id"},
+    {fromTable:"feed_action",fromCol:"clue_id",toTable:"crm_clue",toCol:"clue_id"},
+  ];
+  const path=agentInternal.suggestConfirmedRelationPath("使用了未确认的 JOIN：seller.seller_id = crm_clue.seller_id",relations,new Set(["clue_owner_rel"]));
+  assert.deepEqual(path.tables,["seller","clue_owner_rel","crm_clue"]);
+  assert.deepEqual(path.intermediateTables,["clue_owner_rel"]);
+  assert.deepEqual(path.joins,["clue_owner_rel.seller_id = seller.seller_id","clue_owner_rel.clue_id = crm_clue.clue_id"]);
+});
+
 test("search_context reuses the embedding index for hybrid exploration",async()=>{
   const {store,source}=await createFixture();const connector={explain:async()=>[{rows:1}],query:async()=>[[],[]]};let embedded=0;
   const embeddingIndex={enabled:()=>true,loadVectors:()=>({pageVectors:new Map([["term:有效客户",[1,0]]]),tableVectors:new Map([["crm_customer",[1,0]]])}),embedQuestion:async()=>{embedded++;return [1,0];}};
   const actions=[{thought:"用同义表达继续检索。",tool:"search_context",args:{query:"opaque semantic phrase"}},{thought:"本用例只验证检索，不执行 SQL。",tool:"refuse",args:{reason:"检索验证完成。"}}];const requests=[];const originalFetch=globalThis.fetch;globalThis.fetch=async(_url,init)=>{requests.push(JSON.parse(init.body));return llmResponse(actions.shift());};
   try {
     const service=createQueryService({store,connector,embeddingIndex,config:config("required",{retrieval:{vectorWeight:.5,minSimilarity:.2,semanticThreshold:.5}})});const result=await service.ask({sourceId:source.id,question:"查询有效客户",userName:"tester"});assert.equal(result.refused,true);assert.ok(embedded>=2);
-    const searchResult=parseHarnessResult(requests[1].messages.at(-1).content);assert.equal(searchResult.retrievalMode,"hybrid");assert.equal(searchResult.pages[0].title,"有效客户");assert.deepEqual(searchResult.relatedTables,["crm_customer"]);
+    const searchResult=parseHarnessResult(requests[1].messages.at(-1).content);assert.equal(searchResult.retrievalMode,"hybrid");assert.equal(searchResult.pages[0].title,"有效客户");assert.deepEqual(searchResult.relatedTables,["crm_customer"]);assert.ok(searchResult.capabilities.some((item)=>item.key==="subject:customer"&&item.executionTables.includes("crm_customer")));
   } finally {globalThis.fetch=originalFetch;store.close();}
 });
 
@@ -465,14 +518,19 @@ test("agent search_context expands bound term-anchor aliases",async()=>{
 
 test("validate_semantic_plan compiles and binds a published ontology plan to the executed SQL",async()=>{
   const {store,source}=await createFixture();
+  store.upsertColumn({sourceId:source.id,tableName:"crm_customer",columnName:"segment_code",dataType:"varchar",isPrimary:0,isSensitive:0,comment:"客户分层"});
+  store.upsertKnowledge({sourceId:source.id,pageType:"term",slug:"VIP客户",title:"VIP 客户",aliases:"[]",tablesJson:'["crm_customer"]',content:"VIP 客户",sqlContent:"",antiExamples:"",verified:1,owner:"owner"});
   const semantic=createSemanticSchemaService({store});
-  const schema={name:"crm",displayName:"客户模型",objectTypes:[{apiName:"customer",displayName:"客户",primaryKey:"id",properties:[{apiName:"id",displayName:"客户编号",type:"integer",required:true,mapping:{table:"crm_customer",column:"customer_id"}},{apiName:"notes",displayName:"客户备注",type:"string",required:false,mapping:{table:"crm_customer",column:"notes"}}]}],linkTypes:[]};
+  const schema={name:"crm",displayName:"客户模型",objectTypes:[
+    {apiName:"customer",displayName:"客户",primaryKey:"id",properties:[{apiName:"id",displayName:"客户编号",type:"integer",required:true,mapping:{table:"crm_customer",column:"customer_id"}},{apiName:"notes",displayName:"客户备注",type:"string",required:false,mapping:{table:"crm_customer",column:"notes"}},{apiName:"segment",displayName:"客户分层",type:"enum",required:true,constraints:{enumValues:["vip","standard"]},mapping:{table:"crm_customer",column:"segment_code"}}]},
+    {apiName:"vip_customer",displayName:"VIP 客户",parent:"customer",discriminator:{property:"segment",values:["vip"]},properties:[]},
+  ],linkTypes:[]};
   const draft=semantic.saveDraft(source.id,schema,"tester");
   assert.equal(semantic.publish(draft.id,"tester").ok,true);
   const runtime=queryInternal.buildSemanticRuntime(store,source.id);
   assert.equal(runtime.ok,true);
-  const plan={rootObject:"customer",dimensions:[{property:"customer.id",alias:"customer_id"}],metrics:[],filters:[],timeDimension:null,orderBy:[],limit:100};
-  const compiled=compileSemanticQueryPlan(plan,{schema:runtime.published.schema,catalog:runtime.catalog,maxRows:100});
+  const plan={rootObject:"vip_customer",dimensions:[{property:"vip_customer.id",alias:"customer_id"}],metrics:[],filters:[],timeDimension:null,orderBy:[],limit:100};
+  const compiled=compileSemanticQueryPlan(plan,{schema:runtime.published.schema,catalog:runtime.catalog,maxRows:100,ontologySchemaVersion:runtime.published.version});
   const actions=[
     {thought:"先用发布语义模型编译客户查询。",tool:"validate_semantic_plan",args:{plan}},
     {thought:"执行 Harness 返回的确定性 SQL。",tool:"run_sql",args:{sql:compiled.sql}},
@@ -484,13 +542,15 @@ test("validate_semantic_plan compiles and binds a published ontology plan to the
   globalThis.fetch=async(_url,init)=>{requests.push(JSON.parse(init.body));return llmResponse(actions.shift());};
   try {
     const service=createQueryService({store,connector,config:config("required",{semanticQueryPlanMode:"prefer"})});
-    const answer=await service.ask({sourceId:source.id,question:"查询有效客户编号",userName:"tester"});
+    const answer=await service.ask({sourceId:source.id,question:"查询 VIP 客户编号",userName:"tester"});
     assert.equal(executedSql,answer.evidence.sql);
-    assert.match(executedSql,/SELECT DISTINCT .*customer_id.*crm_customer/i);
+    assert.match(executedSql,/SELECT DISTINCT .*customer_id.*crm_customer.*segment_code` = 'vip'/is);
     assert.equal(answer.evidence.coverage,"semantic");
     assert.equal(answer.evidence.ontologySchemaVersion,1);
     assert.deepEqual(answer.evidence.queryPlan,plan);
-    assert.deepEqual(answer.evidence.semanticPath.objects,["customer"]);
+    assert.deepEqual(answer.evidence.semanticPath.objects,["vip_customer"]);
+    assert.deepEqual(answer.evidence.resultContract.semanticBinding,{version:"semantic-row-domain-v1",ontologySchemaVersion:1,rootObject:"vip_customer",immutable:true});
+    assert.deepEqual(answer.evidence.resultContract.slots.find((item)=>item.kind==="semantic_row_domain")?.values,[{value:"vip",valueType:"string"}]);
     assert.deepEqual(answer.evidence.toolTrace.map((item)=>[item.tool,item.ok]),[["validate_semantic_plan",true],["run_sql",true],["submit_answer",true]]);
     const firstPrompt=requests[0].messages.at(-1).content;
     assert.match(firstPrompt,/"semanticModel"/);
@@ -498,7 +558,7 @@ test("validate_semantic_plan compiles and binds a published ontology plan to the
     const audit=store.listAudits(source.id,1)[0];
     assert.equal(audit.ontologySchemaVersion,1);
     assert.deepEqual(audit.queryPlan,plan);
-    assert.deepEqual(audit.semanticPath.objects,["customer"]);
+    assert.deepEqual(audit.semanticPath.objects,["vip_customer"]);
   } finally {globalThis.fetch=originalFetch;store.close();}
 });
 
@@ -512,6 +572,54 @@ test("sanitized thoughts redact secrets while keeping the key name",()=>{
   const safe=agentInternal.sanitizeThought("正在连接 password=hunter2 的数据源。");
   assert.match(safe,/password=\[REDACTED\]/);
   assert.doesNotMatch(safe,/hunter2|\$1/);
+});
+
+test("deterministic intent preflight covers time ranking comparison and filter clarifications",()=>{
+  for(const code of ["TIME_RANGE_UNKNOWN","RANKING_DIMENSION_UNKNOWN","RANKING_MEASURE_UNKNOWN","RANKING_LIMIT_INVALID","COMPARISON_BASELINE_UNKNOWN","FILTER_EXPRESSION_UNSUPPORTED"]) {
+    const clarification=agentInternal.blockingIntentClarification({ambiguities:[{code,blocking:true,message:`${code} 需要确认`,options:["选项一"]}]});
+    assert.ok(clarification,code);
+    assert.match(clarification.question,/需要确认/);
+  }
+  const unresolvable=agentInternal.unresolvableBlockingIntent({ambiguities:[{code:"MEASURE_DEFINITION_REQUIRED",blocking:true,message:"缺少指标定义"}]});
+  assert.equal(unresolvable.code,"MEASURE_DEFINITION_REQUIRED");
+});
+
+test("clarified evidence gaps map missing attribution to a stable deterministic schema error",()=>{
+  const eventTimeIntent={requirements:[{id:"dimension:seller",kind:"dimension",value:"seller",attribution:"event_time",required:true}]};
+  const gap=agentInternal.clarifiedEvidenceGap(eventTimeIntent,{ok:true,coverageContract:{missing:["dimension:seller"]}});
+  assert.deepEqual(gap.missingFacets,["dimension:seller"]);
+  assert.equal(gap.errorCode,"INTENT_DIMENSION_ATTRIBUTION_BINDING_MISSING");assert.match(gap.reason,/事件发生时负责人.*快照/);
+  const currentCovered={requirements:[{id:"dimension:seller",kind:"dimension",value:"seller",attribution:"current",required:true}]};
+  assert.equal(agentInternal.clarifiedEvidenceGap(currentCovered,{ok:true,coverageContract:{missing:[]}}),null);
+  assert.equal(agentInternal.clarifiedEvidenceGap(eventTimeIntent,{ok:false,coverageContract:{missing:["dimension:seller"]}}),null,"refresh transport failures follow their existing retry path");
+  const generic=agentInternal.clarifiedEvidenceGap({requirements:[{id:"time:completion",kind:"time",required:true}]},{ok:true,coverageContract:{missing:["time:completion"]}});
+  assert.equal(generic.errorCode,"INTENT_REQUIRED_RETRIEVAL_FACET_MISSING");assert.deepEqual(generic.missingFacets,["time:completion"]);
+});
+
+test("intent evidence fingerprint changes with executable business scope but ignores clarification presentation",()=>{
+  const base={
+    version:"2.0",rawQuestion:"原问题",normalizedQuestion:"原问题",semanticQuestion:"原问题",
+    subjects:["clue"],entities:[],filters:[{id:"filter:status",field:"status",operator:"eq",value:"active",valueType:"string",attachesTo:"clue",immutable:true}],
+    timeRange:{start:"2026-08-01",endExclusive:"2026-09-01"},comparisonRange:null,timeRole:{value:"completion"},
+    shape:{kind:"ranking",requestedLimit:50},dimensions:[{id:"dimension:seller",value:"seller",attribution:"current"}],
+    measures:[{id:"measure:won",value:"won",aggregation:"count_distinct",grain:"clue"}],scope:{products:[],deletionMode:"default_active"},
+    requirements:[{id:"subject:clue",kind:"subject",value:"clue"}],retrievalTerms:["线索"],ambiguities:[{code:"EXAMPLE",blocking:true,message:"展示文案"}],
+  };
+  const fingerprint=agentInternal.intentEvidenceFingerprint(base);
+  const presentationOnly=structuredClone(base);
+  presentationOnly.rawQuestion="改写后的问题";presentationOnly.normalizedQuestion="改写后的问题";presentationOnly.semanticQuestion="改写后的问题";presentationOnly.ambiguities=[];
+  assert.equal(agentInternal.intentEvidenceFingerprint(presentationOnly),fingerprint);
+  const mutations=[
+    (intent)=>{intent.timeRange.endExclusive="2026-10-01";},
+    (intent)=>{intent.dimensions[0].attribution="event_time";},
+    (intent)=>{intent.dimensions.push({id:"dimension:product",value:"product"});},
+    (intent)=>{intent.filters[0].value="inactive";},
+    (intent)=>{intent.scope.products=["alphaGpt"];},
+  ];
+  for(const mutate of mutations) {
+    const changed=structuredClone(base);mutate(changed);
+    assert.notEqual(agentInternal.intentEvidenceFingerprint(changed),fingerprint);
+  }
 });
 
 test("a malformed tool action is fed back to the model instead of killing the loop",async()=>{

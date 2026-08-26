@@ -36,7 +36,7 @@ export function seedDemo(store, appSecret) {
   for (const item of [
     {kind:"金额单位",scope:"global",tableName:"payment_transaction",columnName:"amount",question:"amount 字段是否统一以“分”为单位？",evidence:"采样值中位数 8,900，P95 86,420；18 张表字段类型与分布一致。",options:["全部按分处理","逐表确认","仅支付域按分"]},
     {kind:"JOIN 路径",scope:"table",tableName:"sales_refund",columnName:"order_no",question:"退款记录应通过 order_no 关联销售订单吗？",evidence:"采样 10,000 行值域重叠 99.73%，右侧唯一，推断 N:1。",options:["确认该关联","标记为候选","不允许关联"]},
-    {kind:"枚举含义",scope:"column",tableName:"payment_transaction",columnName:"pay_status",question:"支付状态 30 是否表示“已退款”？",evidence:"值 30 占 3.8%，99.1% 可找到退款记录。",options:["已退款","退款处理中","补充说明"]},
+    {kind:"枚举含义",scope:"column",tableName:"payment_transaction",columnName:"pay_status",enumValue:"30",question:"支付状态 30 是否表示“已退款”？",evidence:"值 30 占 3.8%，99.1% 可找到退款记录。",options:["已退款","退款处理中","补充说明"]},
   ]) store.addQuestion({sourceId:source.id,...item});
   store.addRule({sourceId:source.id,name:"排除测试账号",content:"crm_customer.is_test = 0",appliesTo:"crm_customer",verified:1});
   store.addRule({sourceId:source.id,name:"软删除过滤规则",content:"crm_customer.deleted_at IS NULL",appliesTo:"crm_customer",verified:1});

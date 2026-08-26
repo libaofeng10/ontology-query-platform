@@ -374,7 +374,7 @@ function validateKnowledgeCoverage(schema,catalog,warnings) {
   const pages=catalog?.knowledgePages;
   if(!Array.isArray(pages)||!pages.length) return;
   const conflicts=findKnowledgeOntologyConflicts(pages,catalog.columnsByTable||{},schemaMappedColumns(schema));
-  for(const conflict of conflicts.slice(0,20)) warnings.push(issue("ONTOLOGY_KNOWLEDGE_COLUMN_UNMAPPED",`knowledge.${conflict.slug}`,`已验证知识页「${conflict.page}」引用了 ${conflict.table}.${conflict.column}，但该字段未映射为任何属性；语义问数会因此降级到兼容链路`));
+  for(const conflict of conflicts.slice(0,20)) warnings.push(issue("ONTOLOGY_KNOWLEDGE_COLUMN_UNMAPPED",`knowledge.${conflict.slug}`,`已验证知识页「${conflict.page}」引用了 ${conflict.table}.${conflict.column}，但该字段未映射为任何属性；命中该知识的问数将安全阻断，直至知识与本体映射完成对齐`));
 }
 
 function validateDisjointKnowledge(schema,catalog,warnings) {
