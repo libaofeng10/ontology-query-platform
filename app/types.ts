@@ -35,6 +35,8 @@ export type Evidence = {
 };
 export type QueryAnswer = { id:string; sessionId?:string; question:string; conclusion:string; delta?:string; columns:QueryColumn[]; rows:QueryRow[]; resultSets?:QueryResultSet[]; chart:{type:"line"|"bar"|"pie";xKey:string;yKey:string}|null; evidence:Evidence };
 export type QueryRefusal = { refused:true; reason:string; errorCode?:string; failureClass?:string; sessionId?:string; missingTerm?:string; missingConfiguration?:string[]; missingFacets?:string[]; missingAssets?:Array<{kind:string;label:string}>; attemptedSql?:string; planningMode?:"semantic"|"legacy"|"agent"; planningAttempts?:number; toolTrace?:QueryToolTrace[]; clarifications?:Array<{question:string;answer:string}> };
+export type CapabilityGap = { key:string; code:string; assetLabel:string; count:number; lastAskedAt:string|null; sampleQuestions:string[]; remedy:{action:string;prefill?:{pageType?:string;title?:string;field?:string}}; status:"open"|"resolved" };
+export type CapabilityGapBoard = { gaps:CapabilityGap[]; generatedAt:string; auditWindow:number };
 export type QueryClarification = { clarification:{pendingId:string;question:string;options:string[];allowFreeText:boolean;expiresAt:string}; sessionId:string; planningMode:"agent"; planningAttempts:number; toolTrace:QueryToolTrace[]; tokenUsage?:{promptTokens:number;completionTokens:number;totalTokens:number;available:boolean} };
 export type QueryResponse = QueryAnswer|QueryRefusal|QueryClarification;
 export type QuerySession = { id:string; sourceId:number; userName:string; title:string; messageCount:number; createdAt:string; updatedAt:string };

@@ -12,6 +12,7 @@ import { createTaskService } from "./task-service.mjs";
 import { createEvaluationService } from "./evaluation-service.mjs";
 import { createStore } from "./store.mjs";
 import { createOntologyGraphService } from "./ontology-graph-service.mjs";
+import { createCapabilityGapService } from "./capability-gap-service.mjs";
 import { createOntologyCandidateGenerator } from "./ontology-candidate-generator.mjs";
 import { createOntologyCandidateService } from "./ontology-candidate-service.mjs";
 import { createOntologyCalibrationService } from "./ontology-calibration-service.mjs";
@@ -54,6 +55,7 @@ export function createApp(overrides={}) {
   const ontologyDomainDrafts=createOntologyDomainDraftService({store,candidates:ontologyCandidates,semanticSchemas});
   const ontologyGenerationAudits=createOntologyGenerationAuditService({auditDir:runtime.ontologyAi.auditDir});
   const graph=createOntologyGraphService({store,knowledge});
+  const capabilityGaps=createCapabilityGapService({store});
   const queries=createQueryService({store,connector,config:settingsConfig,embeddingIndex});
   const evaluation=createEvaluationService({store,connector,queries,config:settingsConfig});
   const tasks=createTaskService({store,discovery,handlers:{evaluation:evaluation.run,evaluation_gate:evaluation.runGate,evaluation_agent_gate:evaluation.runAgentGate,ontology_generation:ontologyCandidates.runGeneration,ontology_link_generation:ontologyCandidates.runSupplementalLinks,ontology_domain_modeling:ontologyDomainModeling.run,embedding_reindex:({source,onProgress})=>embeddingIndex.reindex(source.id,{onProgress:({done,total,currentStep})=>onProgress({progress:done,total:Math.max(total,1),currentStep})})}});tasks.recover();
@@ -151,6 +153,7 @@ export function createApp(overrides={}) {
       if(req.method==="POST"&&url.pathname==="/api/eval/agent-gate"){const body=await readJson(req);const source=requiredSource(store,identity,body.sourceId||1,"editor");if(source.isDemo||source.lastTestOk!==1)throw badRequest("Agent 对照门禁需要已通过只读连接测试的真实数据源");return send(res,202,tasks.create({sourceId:source.id,taskType:"evaluation_agent_gate",payload:{setName:body.setName,tolerance:body.tolerance,maxP95LatencyRatio:body.maxP95LatencyRatio,maxAverageTokenRatio:body.maxAverageTokenRatio,maxClarificationRate:body.maxClarificationRate,maxBudgetFallbackRate:body.maxBudgetFallbackRate,maxRepeatedActionRate:body.maxRepeatedActionRate,minToolSuccessRate:body.minToolSuccessRate}}));}
       if(req.method==="GET"&&url.pathname==="/api/eval/runs"){const sourceId=requiredSourceId(store,identity,url.searchParams.get("sourceId"));return send(res,200,evaluation.listRuns(sourceId));}
       if(req.method==="GET"&&url.pathname==="/api/audits"){const sourceId=url.searchParams.get("sourceId")?requiredSourceId(store,identity,url.searchParams.get("sourceId"),"editor"):null;authorize(identity,"editor");return send(res,200,store.listAudits(sourceId,Math.min(500,Number(url.searchParams.get("limit")||100))));}
+      if(req.method==="GET"&&url.pathname==="/api/capability-gaps"){const sourceId=requiredSourceId(store,identity,url.searchParams.get("sourceId")||1,"editor");authorize(identity,"editor");return send(res,200,capabilityGaps.listGaps(sourceId,{limit:Math.min(500,Number(url.searchParams.get("limit")||500))}));}
       return send(res,404,{error:"接口不存在",requestId});
     }catch(error){const status=Number(error.status||500);if(error.retryAfter)res.setHeader("retry-after",String(error.retryAfter));if(status>=500)console.error(`[${requestId}]`,safeError(error));return send(res,status,{error:status>=500?"服务处理失败":error.message,detail:runtime.nodeEnv==="development"?safeError(error):undefined,requestId});}
   }

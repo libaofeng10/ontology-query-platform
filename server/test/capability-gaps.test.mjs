@@ -94,3 +94,36 @@ test("fail reason fingerprints strip literals, numbers and table tokens",()=>{
   assert.equal(first,second);
   assert.doesNotMatch(first,/crm_lead|120|线索/);
 });
+
+test("capability gap API is editor-gated and returns the aggregated board",async(t)=>{
+  const {createApp}=await import("../src/server.mjs");
+  const {Readable}=await import("node:stream");
+  const root=await mkdtemp(join(tmpdir(),"ontoquery-gap-api-"));
+  const app=createApp({dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"gap-api-secret",connector:{close:async()=>{}},nodeEnv:"test",apiIdentities:[
+    {name:"editor",role:"editor",token:"token-editor",sourceIds:"*"},
+    {name:"analyst",role:"analyst",token:"token-analyst",sourceIds:"*"},
+  ],rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100}});
+  t.after(async()=>{await app.close();});
+  const source=app.store.createSource({name:"gap-api",kind:"mysql",host:"db",port:3306,dbName:"crm",userName:"ro",credential:"unused",isDemo:false});
+  app.store.addAudit({userName:"analyst",sourceId:source.id,question:"查询成交率",verdict:"refused",failReason:"缺少口径",failureClass:"schema_gap",intentJson:metricRefusalIntent("成交率")});
+
+  async function get(path,token){
+    const request=Readable.from([]);
+    request.method="GET";request.url=path;
+    request.headers={authorization:`Bearer ${token}`};
+    request.socket={remoteAddress:"127.0.0.1"};
+    let raw="";
+    const response={statusCode:200,headers:{},setHeader(name,value){this.headers[String(name).toLowerCase()]=value;},end(value){raw=value?String(value):"";}};
+    await app.handler(request,response);
+    return {status:response.statusCode,body:raw?JSON.parse(raw):{}};
+  }
+
+  const denied=await get(`/api/capability-gaps?sourceId=${source.id}`,"token-analyst");
+  assert.equal(denied.status,403);
+  const board=await get(`/api/capability-gaps?sourceId=${source.id}`,"token-editor");
+  assert.equal(board.status,200);
+  assert.equal(board.body.gaps.length,1);
+  assert.equal(board.body.gaps[0].assetLabel,"成交率");
+  assert.ok(board.body.generatedAt);
+  assert.equal(board.body.auditWindow,1);
+});
