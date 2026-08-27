@@ -16,9 +16,13 @@ import { buildQueryResultContract, validateQueryRunSet } from "./query-result-co
 import { failureClassFor } from "./query-errors.mjs";
 import { QUERY_PROMPT_DEFAULTS, QUERY_PROMPT_VERSION, renderQueryPrompt } from "./query-prompts.mjs";
 
-export function createQueryService({store,connector,config,embeddingIndex}) {
+export function createQueryService({store,connector,config,embeddingIndex,knowledge,evaluation,proposalService}) {
   const pendingLoops=new Map();const pendingBySession=new Map();
-  async function ask({sourceId,question,userName="local-user",sessionId,pendingId,semanticQueryPlanMode,queryAgentMode,ontologySchemaVersionId,signal,onEvent}) {
+  // server.mjs constructs evaluation AFTER queries (it depends on queries), so these two
+  // arrive via setDependencies backfill instead of the constructor — never reorder there.
+  const deps={knowledge:knowledge||null,evaluation:evaluation||null,proposalService:proposalService||null};
+  function setDependencies(next={}){if(next.knowledge)deps.knowledge=next.knowledge;if(next.evaluation)deps.evaluation=next.evaluation;if(next.proposalService)deps.proposalService=next.proposalService;}
+  async function ask({sourceId,question,userName="local-user",userRole="viewer",sessionId,pendingId,semanticQueryPlanMode,queryAgentMode,ontologySchemaVersionId,signal,onEvent,_skipMetricProposal=false}) {
     if(!pendingId)sweepExpiredPending();
     const source=store.getSource(sourceId);
     if(!source) throw httpError(404,"数据源不存在");
@@ -73,6 +77,11 @@ export function createQueryService({store,connector,config,embeddingIndex}) {
       return {refused:true,reason,failureClass:"retrieval_miss",missingTerm:question,missingAssets:refusalMissingAssets(context.queryIntent),sessionId:session.id};
     }
     const missingRetrievalFacets=missingRequiredRetrievalFacets(context.retrieval);
+    // Metric-proposal interception: only when the sole blocker is an unverified ratio
+    // metric definition. Missing subject/time/filter facets mean a metric page cannot
+    // unblock the question, so those fall through to the plain refusal below.
+    const proposalTerminal=await maybeProposeMetric({source,session,userName,userRole,question,context,missingRetrievalFacets,started,agentRollout,_skipMetricProposal,signal});
+    if(proposalTerminal)return proposalTerminal;
     if(missingRetrievalFacets.length) {
       const reason=`当前检索预算或已登记的表字段无法覆盖查询所需分面：${missingRetrievalFacets.join("、")}。系统不会用其他业务对象的表代替。`;
       store.addAudit({userName,sourceId,question,verdict:"refused",failReason:reason,durationMs:Date.now()-started,rowCount:0,planningMode:semanticRuntime.ok?"semantic":"legacy",semanticFallbackReason:semanticRuntime.ok?null:semanticRuntime.reason,failureClass:"schema_gap",...auditContext});
@@ -250,6 +259,69 @@ export function createQueryService({store,connector,config,embeddingIndex}) {
     async function refusedAfterFailure(reason,sql) { if(agentMode==="prefer"&&!agentTried){const terminal=await tryAgent();if(terminal)return terminal;}const safeSql=sql?redactTypedLiterals(sql):null;const failureClass=failureClassFor({stage:"guard",message:reason,code:/LIMIT/.test(reason)?"RESULT_INCOMPLETE":undefined});store.addAudit({userName,sourceId,question,retrievedPages:JSON.stringify(context.knowledge.map((page)=>page.title)),sql:safeSql,verdict:"failed",failReason:reason,durationMs:Date.now()-started,rowCount:0,planningAttempts:plannerCalls,failureClass,...auditContext,...auditPlanningFields(lastPlanned||{planningMode},semanticFallbackReason)}); return {refused:true,reason:`系统没有执行不可靠 SQL：${reason}`,failureClass,attemptedSql:safeSql||undefined,sessionId:session.id,planningMode,planningAttempts:plannerCalls}; }
   }
 
+  // A refused ratio-metric question can become a clarification round instead: propose
+  // harness-validated metric definitions, let an editor pick one, save it as a verified
+  // page, then transparently re-ask. The response shape is exactly QueryClarification,
+  // so the frontend needs zero changes.
+  async function maybeProposeMetric({source,session,userName,userRole,question,context,missingRetrievalFacets,started,agentRollout,_skipMetricProposal,signal}) {
+    if(!config.metricProposalEnabled||_skipMetricProposal)return null;
+    if(!deps.proposalService||!deps.knowledge)return null;
+    if(!["editor","admin"].includes(String(userRole||"")))return null;
+    const blocking=(context.queryIntent?.ambiguities||[]).filter((item)=>item?.blocking);
+    const metricBlockers=blocking.filter((item)=>item.code==="MEASURE_DEFINITION_REQUIRED");
+    if(!metricBlockers.length)return null;
+    // Every missing facet must belong to an unverified ratio measure; a missing
+    // subject/time/filter facet cannot be cured by a metric page.
+    const ratioMeasureIds=new Set((context.queryIntent?.measures||[]).filter((item)=>item.aggregation==="ratio"&&item.evidence?.level!=="verified_knowledge").map((item)=>item.id));
+    const requirementKinds=new Map((context.queryIntent?.requirements||[]).map((item)=>[item.id,item]));
+    const curable=missingRetrievalFacets.every((key)=>{const requirement=requirementKinds.get(key);return requirement?.kind==="measure"&&ratioMeasureIds.has(key);});
+    if(!curable)return null;
+    // MEASURE_GRAIN_AMBIGUOUS rides along with an undefined ratio metric and is cured by
+    // the same page (a verified definition carries its grain); any other blocker is not.
+    if(blocking.some((item)=>!["MEASURE_DEFINITION_REQUIRED","METRIC_AMBIGUOUS","MEASURE_GRAIN_AMBIGUOUS"].includes(item.code)))return null;
+    const assetLabel=String(metricBlockers[0].sourceText||"").trim();
+    if(!assetLabel)return null;
+    let proposal=null;
+    try { proposal=await deps.proposalService.propose("metric",{sourceId:source.id,question,context,assetLabel,signal}); }
+    catch { proposal=null; }
+    if(!proposal?.drafts?.length)return null;
+    invalidatePendingSession(session.id);
+    const pendingId=randomUUID();
+    const ttl=Number(config.queryAgentPendingTtlMs)>0?Number(config.queryAgentPendingTtlMs):10*60_000;
+    const expiresAt=Date.now()+ttl;
+    const auditContext=auditContextFields(context,agentRollout);
+    const auditId=store.addAudit({userName,sourceId:source.id,question,retrievedPages:JSON.stringify(context.knowledge.map((page)=>page.title)),verdict:"clarified",durationMs:Date.now()-started,rowCount:0,planningMode:"agent",planningAttempts:0,iterations:0,clarificationCount:1,...auditContext});
+    const options=[...proposal.drafts.map((draft)=>draft.summary),"都不对，先保持拒答"];
+    const response={clarification:{pendingId,question:`『${assetLabel}』还没有已验证的指标口径。请选择一个口径定义（确认后会保存为已验证指标页并继续查询）：`,options,allowFreeText:true,expiresAt:new Date(expiresAt).toISOString()},sessionId:session.id,planningMode:"agent",planningAttempts:0,toolTrace:[],tokenUsage:{promptTokens:0,completionTokens:0,totalTokens:0,available:false}};
+    pendingLoops.set(pendingId,{id:pendingId,kind:"knowledge_proposal",proposalKind:"metric",sourceId:source.id,sessionId:session.id,userName,userRole,question,proposal,started,expiresAt,publicState:{question,response}});
+    pendingBySession.set(session.id,pendingId);
+    return {...response,_auditId:auditId,_sessionQuestion:question};
+  }
+
+  async function resumeProposalPending({pending,source,session,userName,answer,signal,onEvent}) {
+    const drafts=pending.proposal.drafts;
+    const normalizedAnswer=String(answer||"").trim();
+    const chosenIndex=drafts.findIndex((draft)=>draft.summary===normalizedAnswer);
+    if(chosenIndex<0) {
+      // "都不对" and any free text both refuse in v1: an unvetted textual definition must
+      // never become a verified page.
+      const reason=`口径提议未被确认（回复："${normalizedAnswer.slice(0,80)}"）。已保持拒答；可在知识资产页手工补充『${pending.proposal.assetLabel}』的指标定义。`;
+      const auditId=store.addAudit({userName,sourceId:source.id,question:pending.question,verdict:"refused",failReason:reason,durationMs:Date.now()-pending.started,rowCount:0,planningMode:"agent",planningAttempts:0,clarificationCount:1,failureClass:"schema_gap"});
+      return {refused:true,reason,failureClass:"schema_gap",sessionId:session.id,planningMode:"agent",planningAttempts:0,_auditId:auditId,_sessionQuestion:pending.question};
+    }
+    try { await deps.proposalService.confirmProposal({sourceId:pending.sourceId,question:pending.question,drafts},chosenIndex,{userName}); }
+    catch(error) {
+      const reason=`口径确认失败：${failureMessage(error)}`;
+      const auditId=store.addAudit({userName,sourceId:source.id,question:pending.question,verdict:"failed",failReason:reason,durationMs:Date.now()-pending.started,rowCount:0,planningMode:"agent",planningAttempts:0,clarificationCount:1,failureClass:"schema_gap"});
+      return {refused:true,reason,failureClass:"schema_gap",sessionId:session.id,planningMode:"agent",planningAttempts:0,_auditId:auditId,_sessionQuestion:pending.question};
+    }
+    // The old loop's resume closure snapshotted the catalog before the page landed
+    // (query-agent-loop.mjs buildCatalog), so re-ask from scratch instead of resuming.
+    const result=await ask({sourceId:pending.sourceId,question:pending.question,userName,userRole:pending.userRole,sessionId:session.id,signal,onEvent,_skipMetricProposal:true});
+    result._sessionQuestion??=pending.question;
+    return result;
+  }
+
   function finalizeAgentOutcome({outcome,source,session,userName,question,context,started,agentMode,agentRollout}) {
     const clarificationCount=Array.isArray(outcome.clarifications)?outcome.clarifications.length:0;
     const resolvedIntent=outcome.queryIntent||context.queryIntent;
@@ -298,6 +370,7 @@ export function createQueryService({store,connector,config,embeddingIndex}) {
     if(pending.expiresAt<=Date.now()){deletePending(pending);throw httpError(410,"待澄清的 Agent Loop 已过期，请重新提问");}
     if(pending.sourceId!==source.id||pending.sessionId!==session.id||pending.userName!==userName)throw httpError(403,"不能恢复其他用户、会话或数据源的 Agent Loop");
     deletePending(pending);
+    if(pending.kind==="knowledge_proposal")return resumeProposalPending({pending,source,session,userName,answer,signal,onEvent});
     let outcome;
     try{outcome=await pending.resume(answer,{signal,onEvent});}catch(error){if(signal?.aborted)throw error;const snapshot=error?.queryAgentSnapshot&&typeof error.queryAgentSnapshot==="object"?error.queryAgentSnapshot:{};outcome={...snapshot,status:"failed",reason:`Agent Loop 恢复失败：${failureMessage(error)}`,iterations:snapshot.iterations||0,toolTrace:snapshot.toolTrace||[],clarifications:snapshot.clarifications||[],durationMs:snapshot.durationMs??Date.now()-pending.started};}
     const terminal=finalizeAgentOutcome({outcome,source,session,userName,question:pending.question,context:pending.context,started:pending.started,agentMode:pending.agentMode,agentRollout:pending.agentRollout});if(terminal)return terminal;
@@ -313,7 +386,7 @@ export function createQueryService({store,connector,config,embeddingIndex}) {
   function deletePending(pending){pendingLoops.delete(pending.id);if(pendingBySession.get(pending.sessionId)===pending.id)pendingBySession.delete(pending.sessionId);}
   function discardPending({pendingId,sourceId,sessionId,userName}){const pending=pendingLoops.get(pendingId);if(!pending)return false;if(pending.sourceId!==sourceId||pending.sessionId!==sessionId||pending.userName!==userName)return false;deletePending(pending);return true;}
   function getPendingClarification({sessionId,userName}){sweepExpiredPending();const id=pendingBySession.get(sessionId);if(!id)return null;const pending=pendingLoops.get(id);if(!pending||pending.userName!==userName)return null;return pending.publicState||null;}
-  return {ask,discardPending,getPendingClarification};
+  return {ask,discardPending,getPendingClarification,setDependencies};
 }
 
 function buildSemanticRuntime(store,sourceId,ontologySchemaVersionId) {
@@ -393,7 +466,7 @@ async function buildContext(store,sourceId,question,priorContext={},deps={}) {
   const allowedColumns=Object.fromEntries(tables.map((table)=>[table.tableName,columns[table.tableName].map((column)=>column.columnName)]));
   const scopedKeys=new Set(tables.map((table)=>table.tableName));
   const columnKinds=Object.fromEntries(Object.entries(columnSemantics.columnKinds).filter(([key])=>scopedKeys.has(key.split(".")[0])));
-  return {tables,columns,allowedColumns,columnKinds,valueKinds:detectQuestionValueKinds(contextualQuestion),enums,enumItemsByColumn,relations,rules,knowledge:retrieval.pages,retrieval,termAliases,queryIntent,retrievalQuestion,ontologySchema};
+  return {tables,columns,allowedColumns,columnKinds,valueKinds:detectQuestionValueKinds(contextualQuestion),enums,enumItemsByColumn,relations,rules,knowledge:retrieval.pages,retrieval,termAliases,queryIntent,retrievalQuestion,ontologySchema,parseOptions,allColumns,knowledgePages};
 }
 
 function requiredExecutionTables(retrieval) {

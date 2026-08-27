@@ -28,6 +28,7 @@ export const config = {
   queryAgentMaxSqlCalls: numberFromEnv("QUERY_AGENT_MAX_SQL_CALLS", 5),
   queryAgentMaxScannedRows: numberFromEnv("QUERY_AGENT_MAX_SCANNED_ROWS", 5_000_000),
   queryAgentPendingTtlMs: numberFromEnv("QUERY_AGENT_PENDING_TTL_MS", 600_000),
+  metricProposalEnabled: String(process.env.METRIC_PROPOSAL_ENABLED??"false").toLowerCase()==="true",
   rateLimits: {
     queryPerMinute:numberFromEnv("RATE_LIMIT_QUERY_PER_MINUTE",30),
     writePerMinute:numberFromEnv("RATE_LIMIT_WRITE_PER_MINUTE",120),

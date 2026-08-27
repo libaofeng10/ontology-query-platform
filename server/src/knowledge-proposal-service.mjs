@@ -17,7 +17,7 @@ const NUMERATOR_EVENT_TERMS=[
 ];
 const TIME_ROLE_TERMS=/(?:time|date|_at)$|时间|日期/i;
 
-export function createKnowledgeProposalService({store,config,knowledge,evaluation,callJson=callLlmJsonWithTrace,fetchImpl=globalThis.fetch}) {
+export function createKnowledgeProposalService({store,config,knowledge,callJson=callLlmJsonWithTrace,fetchImpl}) {
   const KIND_HANDLERS={metric:{shortlist:shortlistCandidates,messages:metricProposalMessages,compose:composeDraftPage,validate:validateDraftPage}};
 
   async function propose(kind,{sourceId,question,context,assetLabel,signal}={}) {
@@ -27,7 +27,9 @@ export function createKnowledgeProposalService({store,config,knowledge,evaluatio
     if(!shortlist.tables.length)return null;
     let output;
     try {
-      const traced=await callJson(config.llm,handler.messages({question,assetLabel,shortlist}),{timeoutMs:Number(config.queryLlmTimeoutMs)||90_000,fetchImpl,signal});
+      // Resolve fetch at call time: capturing globalThis.fetch at construction would pin
+      // the implementation before test stubs (or runtime polyfills) replace it.
+      const traced=await callJson(config.llm,handler.messages({question,assetLabel,shortlist}),{timeoutMs:Number(config.queryLlmTimeoutMs)||90_000,fetchImpl:fetchImpl||globalThis.fetch,signal});
       output=traced.value;
     } catch { return null; }
     const formulas=Array.isArray(output?.proposals)?output.proposals.slice(0,5):[];
@@ -48,7 +50,9 @@ export function createKnowledgeProposalService({store,config,knowledge,evaluatio
     const existing=store.getKnowledge(pending.sourceId,"metric",draft.slug);
     if(existing?.verified)throw new Error(`已存在同名的已验证指标页：${existing.title}`);
     const saved=await knowledge.save(pending.sourceId,{...draft.page,verified:true,owner:userName||"editor"});
-    try { evaluation?.create?.(pending.sourceId,{setName:"口径确认",question:pending.question,goldSql:null,category:"口径确认"}); }
+    // The doc wants this case recorded WITHOUT a gold SQL, but evaluation.create validates
+    // goldSql as required — so go through the store, which is the layer that allows null.
+    try { store.addEvalCase?.({sourceId:pending.sourceId,setName:"口径确认",question:pending.question,goldSql:null,category:"口径确认",heldOut:0}); }
     catch { /* Eval bookkeeping must never block the confirmation. */ }
     return saved;
   }
