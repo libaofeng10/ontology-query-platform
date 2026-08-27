@@ -70,13 +70,13 @@ export function createQueryService({store,connector,config,embeddingIndex}) {
     if(context.retrieval.coverage==="none") {
       const reason="问题未命中已定义的术语、指标、表或字段。请先补充业务术语，系统不会在覆盖域外猜测 SQL。";
       store.addAudit({userName,sourceId,question,verdict:"refused",failReason:reason,durationMs:Date.now()-started,rowCount:0,planningMode:semanticRuntime.ok?"semantic":"legacy",semanticFallbackReason:semanticRuntime.ok?null:semanticRuntime.reason,failureClass:"retrieval_miss",...auditContext});
-      return {refused:true,reason,failureClass:"retrieval_miss",missingTerm:question,sessionId:session.id};
+      return {refused:true,reason,failureClass:"retrieval_miss",missingTerm:question,missingAssets:refusalMissingAssets(context.queryIntent),sessionId:session.id};
     }
     const missingRetrievalFacets=missingRequiredRetrievalFacets(context.retrieval);
     if(missingRetrievalFacets.length) {
       const reason=`当前检索预算或已登记的表字段无法覆盖查询所需分面：${missingRetrievalFacets.join("、")}。系统不会用其他业务对象的表代替。`;
       store.addAudit({userName,sourceId,question,verdict:"refused",failReason:reason,durationMs:Date.now()-started,rowCount:0,planningMode:semanticRuntime.ok?"semantic":"legacy",semanticFallbackReason:semanticRuntime.ok?null:semanticRuntime.reason,failureClass:"schema_gap",...auditContext});
-      return {refused:true,reason,failureClass:"schema_gap",missingFacets:missingRetrievalFacets,sessionId:session.id};
+      return {refused:true,reason,failureClass:"schema_gap",missingFacets:missingRetrievalFacets,missingAssets:refusalMissingAssets(context.queryIntent,missingRetrievalFacets),sessionId:session.id};
     }
     // 已验证知识与已发布本体是两个受信任契约。二者对同一张已建模表给出
     // 不同物理字段时，没有任何一方可以被 legacy/Agent 隐式降级为“更可信”。
@@ -727,6 +727,25 @@ function agentEvidenceSelection(store,sourceId,outcome={},context={}) {
   const ruleNames=new Set(Array.isArray(outcome?.exploredRuleNames)?outcome.exploredRuleNames:(context.rules||[]).map((rule)=>rule.name));
   return {pages:store.listKnowledge(sourceId).filter((page)=>pageSlugs.has(page.slug)),rules:store.listRules(sourceId).filter((rule)=>ruleNames.has(rule.name))};
 }
+// Sanitized gap descriptors for the refusal card: business words only (intent surface text
+// and facet kinds), never physical table or column names.
+function refusalMissingAssets(intent,missingFacetKeys=[]) {
+  const assets=[];
+  const seen=new Set();
+  const push=(kind,label)=>{const text=String(label||"").trim();if(!text)return;const key=`${kind}|${text}`;if(seen.has(key))return;seen.add(key);assets.push({kind,label:text});};
+  for(const ambiguity of intent?.ambiguities||[]) {
+    if(!ambiguity?.blocking)continue;
+    if(ambiguity.code==="MEASURE_DEFINITION_REQUIRED"||ambiguity.code==="METRIC_AMBIGUOUS")push("metric",ambiguity.sourceText);
+  }
+  const requirements=new Map((intent?.requirements||[]).map((item)=>[item.id,item]));
+  for(const key of missingFacetKeys) {
+    const requirement=requirements.get(key);
+    const kind=requirement?.kind||String(key).split(":")[0]||"facet";
+    push(kind==="measure"?"metric":kind,requirement?.surfaceText||requirement?.value||String(key).split(":").slice(1).join(":"));
+  }
+  return assets;
+}
+
 function auditContextFields(context={},agentRollout=null,snapshot=null) {
   const hasSnapshot=Boolean(snapshot&&Array.isArray(snapshot.retrievalEvidence));
   const retrievals=hasSnapshot?snapshot.retrievalEvidence.filter(Boolean):[context.retrieval].filter(Boolean);
@@ -761,4 +780,4 @@ function selectQueryAgentRollout({mode,trafficPercent=100,cohortKey="",explicit=
   return {configuredMode,effectiveMode:bucket<percent?"prefer":"off",trafficPercent:percent,bucket,reason:bucket<percent?"in_cohort":"out_of_cohort"};
 }
 
-export const _internal={buildContext,buildSemanticRuntime,planSql,planSemanticQuery,summarize,llmOptions,ensureSummaryConsistency,deterministicAnalyticalConclusion,inferChart,semanticQuestionMatches,normalizeAgentMode,rankingLimitPreflight,selectQueryAgentRollout,contextualRetrievalQuestion,isContextualFollowUp,nextSessionContext,sessionSafeIntent,plannedQuerySpecs,combineQueryRuns,missingExhaustiveAccountTables,scopedKnowledgeOntologyConflicts};
+export const _internal={buildContext,buildSemanticRuntime,planSql,planSemanticQuery,summarize,llmOptions,ensureSummaryConsistency,deterministicAnalyticalConclusion,inferChart,semanticQuestionMatches,normalizeAgentMode,rankingLimitPreflight,selectQueryAgentRollout,contextualRetrievalQuestion,isContextualFollowUp,nextSessionContext,sessionSafeIntent,plannedQuerySpecs,combineQueryRuns,missingExhaustiveAccountTables,scopedKnowledgeOntologyConflicts,refusalMissingAssets};
