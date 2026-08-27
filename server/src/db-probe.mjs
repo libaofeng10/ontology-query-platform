@@ -7,7 +7,7 @@ const DEFAULT_SAMPLE_ROWS = 10_000;
 const DEFAULT_ENUM_MAX_DISTINCT_RATIO = 0.05;
 // Identifier-shaped columns are never business dictionaries: a phone number column whose
 // sample happens to hold one value must not become an allow-list of one legal value.
-const ENUM_NAME_BLACKLIST = /(_id|_no|_code|cell|phone|mobile|email|name|time|date|_at)$/i;
+export const ENUM_NAME_BLACKLIST = /(_id|_no|_code|cell|phone|mobile|email|name|time|date|_at)$/i;
 
 function quoteIdentifier(value) {
   const identifier=String(value??"");

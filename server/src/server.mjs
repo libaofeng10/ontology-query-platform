@@ -24,6 +24,7 @@ import { createEmbeddingIndex } from "./embedding-index.mjs";
 import { callLlmJson } from "./llm-client.mjs";
 import { callLlmEmbedding } from "./embedding-client.mjs";
 import { applySensitiveCatalogMigration } from "./sensitive-catalog-migration.mjs";
+import { applyEnumCatalogMigration } from "./enum-catalog-migration.mjs";
 import { createRelationDocumentService } from "./relation-document-service.mjs";
 import { createOntologyCandidateCritic } from "./ontology-candidate-critic.mjs";
 import { createOntologyDomainPlanner } from "./ontology-domain-plan.mjs";
@@ -35,6 +36,7 @@ export function createApp(overrides={}) {
   const runtime={...config,...overrides,rateLimits:{...config.rateLimits,...overrides.rateLimits},ontologyAi:{...config.ontologyAi,...overrides.ontologyAi}};
   const store=overrides.store||createStore(runtime.dbPath);seedDemo(store,runtime.appSecret);
   const sensitiveCatalogMigration=applySensitiveCatalogMigration(store);
+  const enumCatalogMigration=applyEnumCatalogMigration(store);
   const settings=createSettingsService({store,baseConfig:runtime,appSecret:runtime.appSecret,lockedKeys:lockedSettingKeys(overrides)});
   const settingsConfig=settings.config;
   const connector=overrides.connector||createConnector({appSecret:runtime.appSecret,timeoutMs:()=>settingsConfig.queryTimeoutMs});
@@ -63,7 +65,7 @@ export function createApp(overrides={}) {
     const url=new URL(req.url,"http://localhost");
     try {
       if(req.method==="GET"&&url.pathname==="/api/health")return send(res,200,{ok:true,service:"ontology-query-api",time:new Date().toISOString(),requestId});
-      if(req.method==="GET"&&url.pathname==="/api/ready"){store.db.prepare("SELECT 1").get();return send(res,200,{ok:true,store:"ready",sensitiveFieldRules:{version:sensitiveCatalogMigration.version,promotedColumns:sensitiveCatalogMigration.promotedColumns,skipped:sensitiveCatalogMigration.skipped},requestId});}
+      if(req.method==="GET"&&url.pathname==="/api/ready"){store.db.prepare("SELECT 1").get();return send(res,200,{ok:true,store:"ready",sensitiveFieldRules:{version:sensitiveCatalogMigration.version,promotedColumns:sensitiveCatalogMigration.promotedColumns,skipped:sensitiveCatalogMigration.skipped},enumDictionaryRules:{version:enumCatalogMigration.version,removedColumns:enumCatalogMigration.removedColumns,removedHumanMeanings:enumCatalogMigration.removedHumanMeanings,skipped:enumCatalogMigration.skipped},requestId});}
       const identity=authenticate(req,runtime);applyRateLimit(req,res,url,identity,runtime,limiter);
 
       if(req.method==="GET"&&url.pathname==="/api/bootstrap"){
@@ -173,7 +175,7 @@ export function createApp(overrides={}) {
   }
 
   async function close(){await tasks.close();await connector.close();store.close();}
-  return {handler,close,store,ontologyCandidates,ontologyCalibration,relationDocuments,sensitiveCatalogMigration};
+  return {handler,close,store,ontologyCandidates,ontologyCalibration,relationDocuments,sensitiveCatalogMigration,enumCatalogMigration};
 }
 
 function setSecurityHeaders(req,res,runtime,requestId){const origin=req.headers.origin;if(origin&&runtime.allowedOrigins.includes(origin)){res.setHeader("access-control-allow-origin",origin);res.setHeader("vary","Origin");}res.setHeader("access-control-allow-methods","GET,POST,PUT,DELETE,OPTIONS");res.setHeader("access-control-allow-headers","authorization,content-type,x-request-id,x-ontoquery-token");res.setHeader("access-control-max-age","86400");res.setHeader("cache-control","no-store");res.setHeader("x-content-type-options","nosniff");res.setHeader("referrer-policy","no-referrer");res.setHeader("x-request-id",requestId);}

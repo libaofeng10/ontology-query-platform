@@ -397,6 +397,14 @@ export function createStore(dbPath) {
       return db.prepare(`SELECT source_id AS sourceId,table_name AS tableName,column_name AS columnName,data_type AS dataType,nullable,null_rate AS nullRate,cardinality,is_sensitive AS isSensitive,comment,is_primary AS isPrimary,is_unique AS isUnique,is_indexed AS isIndexed FROM ds_column WHERE source_id=? AND table_name=? AND present=1 ORDER BY rowid`).all(sourceId,tableName).map((column)=>({...column,profile:profiles.get(column.columnName)||null}));
     },
     listEnums: (sourceId, tableName) => db.prepare(`SELECT column_name AS columnName,value,count,ratio,meaning,meaning_source AS meaningSource FROM ds_enum WHERE source_id=? AND table_name=? ORDER BY column_name,count DESC`).all(sourceId, tableName),
+    listEnumColumns: () => db.prepare(`SELECT source_id AS sourceId,table_name AS tableName,column_name AS columnName,COUNT(*) AS valueCount,COALESCE(SUM(CASE WHEN meaning_source='human' THEN 1 ELSE 0 END),0) AS humanMeaningCount FROM ds_enum GROUP BY source_id,table_name,column_name ORDER BY source_id,table_name,column_name`).all(),
+    // Deletes whole columns, never single values: query-service keeps validating a column as a
+    // closed dictionary while any row of it survives, so a partial delete keeps the defect.
+    deleteEnumColumns(columns=[]) {
+      const remove=db.prepare(`DELETE FROM ds_enum WHERE source_id=? AND table_name=? AND column_name=?`);
+      const run=db.transaction((items)=>{let changes=0;for(const item of items)changes+=remove.run(item.sourceId,item.tableName,item.columnName).changes;return changes;});
+      return run(Array.isArray(columns)?columns:[]);
+    },
     upsertTermAnchor(input) {
       const item={vocabulary:String(input.vocabulary||"").trim(),canonicalId:String(input.canonicalId||"").trim(),prefLabelZh:input.prefLabelZh==null?null:String(input.prefLabelZh).trim()||null,prefLabelEn:input.prefLabelEn==null?null:String(input.prefLabelEn).trim()||null,altLabels:[...new Set((Array.isArray(input.altLabels)?input.altLabels:[]).map((value)=>String(value).trim()).filter(Boolean))],kind:String(input.kind||"object").trim().toLowerCase(),broaderCanonicalId:input.broaderCanonicalId==null?null:String(input.broaderCanonicalId).trim()||null,note:input.note==null?null:String(input.note).trim()||null};
       if(!item.vocabulary||!item.canonicalId)throw new Error("术语锚点 vocabulary 与 canonicalId 必填");
