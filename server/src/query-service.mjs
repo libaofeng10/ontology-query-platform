@@ -42,8 +42,10 @@ export function createQueryService({store,connector,config,embeddingIndex}) {
     if(!isLlmConfigured(config.llm)) {
       const issues=llmConfigurationIssues(config.llm);
       const reason=`真实数据源已连接，但 LLM 配置不可用：${issues.join("；")}。为避免猜测或伪造结果，系统拒绝生成 SQL。`;
-      store.addAudit({userName,sourceId,question,verdict:"refused",failReason:reason,durationMs:Date.now()-started,rowCount:0});
-      return {refused:true,reason,missingConfiguration:issues,sessionId:session.id};
+      // buildContext has not run yet, so there is no intent to persist — failureClass alone
+      // lets the gap board bucket these rows without the degraded fingerprint path.
+      store.addAudit({userName,sourceId,question,verdict:"refused",failReason:reason,durationMs:Date.now()-started,rowCount:0,failureClass:"llm_unconfigured"});
+      return {refused:true,reason,missingConfiguration:issues,failureClass:"llm_unconfigured",sessionId:session.id};
     }
 
     const context=await buildContext(store,sourceId,question,session.context,{embeddingIndex,retrieval:config.retrieval,conversationHistory,ontologySchemaVersionId});
@@ -61,8 +63,8 @@ export function createQueryService({store,connector,config,embeddingIndex}) {
     const semanticRuntime=semanticMode==="off"?{ok:false,reason:"语义 Query Plan 已关闭"}:buildSemanticRuntime(store,sourceId,ontologySchemaVersionId);
     if(semanticMode==="required"&&!semanticRuntime.ok) {
       const reason=`语义 Query Plan 为强制模式，但当前不可用：${semanticRuntime.reason}`;
-      store.addAudit({userName,sourceId,question,verdict:"refused",failReason:reason,durationMs:Date.now()-started,rowCount:0,planningMode:"semantic",semanticFallbackReason:semanticRuntime.reason,failureClass:"schema_gap",...auditContext});
-      return {refused:true,reason,failureClass:"schema_gap",sessionId:session.id};
+      store.addAudit({userName,sourceId,question,verdict:"refused",failReason:reason,durationMs:Date.now()-started,rowCount:0,planningMode:"semantic",semanticFallbackReason:semanticRuntime.reason,failureClass:"ontology_missing",...auditContext});
+      return {refused:true,reason,failureClass:"ontology_missing",sessionId:session.id};
     }
     if(context.retrieval.coverage==="none"&&semanticRuntime.ok&&semanticQuestionMatches(question,semanticRuntime.published.schema)) context.retrieval.coverage="semantic";
     if(context.retrieval.coverage==="none") {
@@ -98,7 +100,8 @@ export function createQueryService({store,connector,config,embeddingIndex}) {
         outcome=await runQueryAgent({store,connector,config,source,question,context,conversationHistory,embeddingIndex,semanticRuntime,signal,onEvent});
       } catch(error) {
         if(signal?.aborted) throw error;
-        outcome={status:"failed",reason:`Agent Loop 失败：${failureMessage(error)}`,iterations:0,toolTrace:[],durationMs:Date.now()-started};
+        const protocolFailure=error?.code==="LLM_PROTOCOL_FORMAT"||error?.code==="LLM_TOOL_UNAUTHORIZED";
+        outcome={status:"failed",reason:`Agent Loop 失败：${failureMessage(error)}`,...(protocolFailure?{failureClass:"protocol_error"}:{}),iterations:0,toolTrace:[],durationMs:Date.now()-started};
       }
       const terminal=finalizeAgentOutcome({outcome,source,session,userName,question,context,started,agentMode,agentRollout});if(terminal)return terminal;
       agentFallbackReason=outcome.reason||"Agent Loop 未在预算内收敛";

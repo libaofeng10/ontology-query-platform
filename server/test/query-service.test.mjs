@@ -433,3 +433,58 @@ test("weak or vector-only knowledge recall outside the required execution closur
   const weakRecall={...base,retrieval:{...base.retrieval,diagnostics:{...base.retrieval.diagnostics,pages:[{key:"term:alpha-gpt-office",lexical:.55,semantic:0}],facets:[{...base.retrieval.diagnostics.facets[0],authoritativePageKeys:["term:alpha-gpt-office"]}]}}};
   assert.deepEqual(_internal.scopedKnowledgeOntologyConflicts(weakRecall,semanticRuntime),[],"even a weakly recalled page cannot cross the required facet execution closure");
 });
+
+test("refusal audits persist a non-empty intent for every pre-planning gate",async()=>{
+  const dir=await mkdtemp(join(tmpdir(),"ontoquery-audit-intent-"));const store=createStore(join(dir,"store.sqlite"));
+  const source=store.createSource({name:"real",kind:"mysql",host:"db",port:3306,dbName:"crm",userName:"ro",credential:"unused",isDemo:false});
+  store.upsertTable({sourceId:source.id,tableName:"crm_customer",rowEstimate:10,grade:"A",active:1,comment:"客户"});
+  store.upsertColumn({sourceId:source.id,tableName:"crm_customer",columnName:"customer_id",dataType:"bigint",isPrimary:1,isSensitive:0,comment:"客户编号"});
+  store.upsertKnowledge({sourceId:source.id,pageType:"term",slug:"有效客户",title:"有效客户",aliases:"[]",tablesJson:'["crm_customer"]',content:"已实名客户",sqlContent:"按客户编号查询",antiExamples:"",verified:1,owner:"owner"});
+  const connector={explain:async()=>[{rows:10}],query:async()=>[[{customer_id:7}],[{name:"customer_id"}]]};
+  const originalFetch=globalThis.fetch;
+  globalThis.fetch=async()=>{throw new Error("拒答路径不得调用 LLM");};
+  try {
+    const service=createQueryService({store,connector,config:{llm:{baseUrl:"http://llm.test/v1",apiKey:"test",model:"test"},queryMaxRows:100,explainMaxRows:1000}});
+
+    // ranking limit refusal
+    const ranking=await service.ask({sourceId:source.id,question:"查询有效客户 Top 1000",userName:"tester"});
+    assert.equal(ranking.refused,true);
+    assert.equal(ranking.failureClass,"policy_block");
+    let audit=store.listAudits(source.id,1)[0];
+    assert.equal(audit.failureClass,"policy_block");
+    assert.ok(audit.intent,"ranking 拒答的 intent_json 必须非空");
+    assert.equal(audit.intent.version&&true,true);
+
+    // coverage none refusal
+    const miss=await service.ask({sourceId:source.id,question:"统计仓库温度传感器读数",userName:"tester"});
+    assert.equal(miss.refused,true);
+    assert.equal(miss.failureClass,"retrieval_miss");
+    audit=store.listAudits(source.id,1)[0];
+    assert.equal(audit.failureClass,"retrieval_miss");
+    assert.ok(audit.intent,"coverage none 拒答的 intent_json 必须非空");
+
+    // semantic required but unavailable → ontology_missing
+    const semanticService=createQueryService({store,connector,config:{llm:{baseUrl:"http://llm.test/v1",apiKey:"test",model:"test"},queryMaxRows:100,explainMaxRows:1000,semanticQueryPlanMode:"required"}});
+    const semantic=await semanticService.ask({sourceId:source.id,question:"查询有效客户",userName:"tester"});
+    assert.equal(semantic.refused,true);
+    assert.equal(semantic.failureClass,"ontology_missing");
+    audit=store.listAudits(source.id,1)[0];
+    assert.equal(audit.failureClass,"ontology_missing");
+    assert.ok(audit.intent,"semantic 强制拒答的 intent_json 必须非空");
+  } finally { globalThis.fetch=originalFetch;store.close(); }
+});
+
+test("llm-unconfigured refusals are classified for the gap board without an intent",async()=>{
+  const dir=await mkdtemp(join(tmpdir(),"ontoquery-audit-llm-"));const store=createStore(join(dir,"store.sqlite"));
+  const source=store.createSource({name:"real",kind:"mysql",host:"db",port:3306,dbName:"crm",userName:"ro",credential:"unused",isDemo:false});
+  try {
+    const service=createQueryService({store,connector:{},config:{llm:{baseUrl:"",apiKey:"",model:""},queryMaxRows:100,explainMaxRows:1000}});
+    const answer=await service.ask({sourceId:source.id,question:"查询有效客户",userName:"tester"});
+    assert.equal(answer.refused,true);
+    assert.equal(answer.failureClass,"llm_unconfigured");
+    const audit=store.listAudits(source.id,1)[0];
+    assert.equal(audit.verdict,"refused");
+    assert.equal(audit.failureClass,"llm_unconfigured");
+    assert.equal(audit.intent,null);
+  } finally { store.close(); }
+});

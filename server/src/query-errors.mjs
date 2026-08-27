@@ -1,5 +1,7 @@
 export const QUERY_FAILURE_CLASSES=new Set([
   "intent_error","retrieval_miss","schema_gap","guard_false_positive","policy_block","data_quality","execution_error","budget_exhausted","result_incomplete",
+  // Governance-facing classes: the capability-gap board groups refusals by these.
+  "llm_unconfigured","ontology_missing","protocol_error","enum_dictionary",
 ]);
 
 export function toolFailure({stage="internal",code="INTERNAL_ERROR",error,retryable=false,details}={}) {
@@ -12,7 +14,9 @@ export function failureClassFor({stage,code,message}={}) {
   if(value.startsWith("INTENT_"))return "intent_error";
   if(value==="RETRIEVAL_MISS")return "retrieval_miss";
   if(value==="SCHEMA_GAP"||value==="UNKNOWN_TABLE"||value==="UNKNOWN_COLUMN"||value==="AMBIGUOUS_COLUMN")return "schema_gap";
+  if(value==="ENUM_VALUE_INVALID")return "enum_dictionary";
   if(value==="ENUM_OWNERSHIP_AMBIGUOUS"||value==="GUARD_FALSE_POSITIVE")return "guard_false_positive";
+  if(value==="LLM_PROTOCOL_FORMAT"||value==="LLM_TOOL_UNAUTHORIZED"||value==="PROTOCOL_ERROR")return "protocol_error";
   if(value==="RESULT_INCOMPLETE"||value==="SCOPE_INCOMPLETE")return "result_incomplete";
   if(value.includes("BUDGET")||stage==="budget")return "budget_exhausted";
   if(stage==="query"||stage==="explain"||value==="EXECUTION_ERROR")return "execution_error";
