@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 export function createDiscoveryService({store,connector,wikiDir,config={},relationModel:relationModelOverride}) {
   const relationConfig={maxCandidates:600,batchSize:20,timeoutMs:60_000,minConfidence:0.55,sampleLimit:500,overlapConcurrency:4,overlapTimeoutMs:10_000,...config.relationModel};
   const profilingConfig={enabled:false,sampleLimit:1000,maxTablesPerRefresh:20,timeoutMs:10_000,...config.profiling};
+  const discoveryConfig={enumMaxDistinctRatio:0.05,...config.discovery};
   const relationModel=relationModelOverride||createRelationModelService({llm:config.llm||{},batchSize:relationConfig.batchSize,timeoutMs:relationConfig.timeoutMs});
 
   async function discover(source,{onProgress=()=>{}}={}) {
@@ -43,7 +44,7 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
       const initialGrade=gradeTable(table);
       if(initialGrade.grade!=="C") {
         const profileThisTable=Boolean(profilingConfig.enabled)&&profiledTableCount<profilingConfig.maxTablesPerRefresh;
-        const probed=await probeTable(connector,source,table,columnsByTable[table.tableName]||[],{profiling:{...profilingConfig,enabled:profileThisTable}});
+        const probed=await probeTable(connector,source,table,columnsByTable[table.tableName]||[],{enumMaxDistinctRatio:discoveryConfig.enumMaxDistinctRatio,profiling:{...profilingConfig,enabled:profileThisTable}});
         if(profileThisTable)profiledTableCount++;
         probeResults.set(table.tableName,probed);
         if(probed.lastWrite) table.daysSinceWrite=Math.max(0,Math.floor((Date.now()-new Date(probed.lastWrite).getTime())/86_400_000));

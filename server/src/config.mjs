@@ -62,6 +62,9 @@ export const config = {
     overlapConcurrency:integerRangeFromEnv("RELATION_OVERLAP_CONCURRENCY",1,16,4),
     overlapTimeoutMs:integerRangeFromEnv("RELATION_OVERLAP_TIMEOUT_MS",100,120_000,10_000),
   },
+  discovery: {
+    enumMaxDistinctRatio:numberRatioFromEnv("ENUM_MAX_DISTINCT_RATIO",0.05),
+  },
   profiling: {
     enabled:String(process.env.COLUMN_PROFILING_ENABLED??"false").toLowerCase()==="true",
     sampleLimit:integerRangeFromEnv("COLUMN_PROFILING_SAMPLE_LIMIT",1,1000,1000),

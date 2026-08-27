@@ -254,6 +254,7 @@ export type SettingsData = {
   llm:{ baseUrl:string; apiKey:MaskedSecret; model:string };
   embedding:{ baseUrl:string; apiKey:MaskedSecret; model:string; dimensions:number|null };
   retrieval:{ vectorEnabled:boolean; topK:number; vectorWeight:number; minSimilarity:number; semanticThreshold:number };
+  discovery:{enumMaxDistinctRatio:number};
   profiling:{enabled:boolean;sampleLimit:number;maxTablesPerRefresh:number;timeoutMs:number};
   query:{ semanticQueryPlanMode:"off"|"prefer"|"required"; queryAgentMode:"off"|"prefer"|"required"; queryAgentTrafficPercent:number; queryAgentMaxIterations:number; queryAgentMaxSqlCalls:number; queryAgentMaxScannedRows:number; queryAgentPendingTtlMs:number; queryMaxRows:number; explainMaxRows:number; queryTimeoutMs:number; queryLlmTimeoutMs:number };
   ontologyAi:{mode:"off"|"review"|"auto_draft";autoConfirmScore:number;maxTables:number;maxFields:number;timeoutMs:number;criticEnabled:boolean;calibrationMinSamples:number;calibrationMinPrecision:number;maxManualObjectRate:number;maxFailureRate:number;maxP95LatencyMs:number;maxAverageTokens:number};
@@ -267,6 +268,7 @@ export type SettingsInput = {
   llm?:Partial<{ baseUrl:string|null; apiKey:string|null; model:string|null }>;
   embedding?:Partial<{ baseUrl:string|null; apiKey:string|null; model:string|null; dimensions:number|null }>;
   retrieval?:Partial<{ vectorEnabled:boolean; topK:number; vectorWeight:number; minSimilarity:number; semanticThreshold:number }>;
+  discovery?:Partial<{enumMaxDistinctRatio:number}>;
   profiling?:Partial<{enabled:boolean;sampleLimit:number;maxTablesPerRefresh:number;timeoutMs:number}>;
   query?:Partial<{ semanticQueryPlanMode:"off"|"prefer"|"required"; queryAgentMode:"off"|"prefer"|"required"; queryAgentTrafficPercent:number; queryAgentMaxIterations:number; queryAgentMaxSqlCalls:number; queryAgentMaxScannedRows:number; queryAgentPendingTtlMs:number; queryMaxRows:number; explainMaxRows:number; queryTimeoutMs:number; queryLlmTimeoutMs:number }>;
   ontologyAi?:Partial<{mode:"off"|"review"|"auto_draft";autoConfirmScore:number;maxTables:number;maxFields:number;timeoutMs:number;criticEnabled:boolean;calibrationMinSamples:number;calibrationMinPrecision:number;maxManualObjectRate:number;maxFailureRate:number;maxP95LatencyMs:number;maxAverageTokens:number}>;

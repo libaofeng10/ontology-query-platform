@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { probeTable } from "../src/db-probe.mjs";
 
-test("large-table enum probes aggregate a bounded input sample",async()=>{
+test("a sample that cannot cover the whole table yields cardinality but no dictionary",async()=>{
   const queries=[];
   const connector={query:async(_source,sql)=>{
     queries.push(sql);
@@ -17,10 +17,70 @@ test("large-table enum probes aggregate a bounded input sample",async()=>{
   assert.equal(queries.length,1);
   assert.match(queries[0],/FROM \(SELECT `status` FROM `orders` WHERE `status` IS NOT NULL LIMIT 10000\) AS ontoquery_sample GROUP BY `status`/);
   assert.equal(result.lastWrite,updateTime);
+  assert.equal(result.columns[0].cardinality,2);
+  assert.deepEqual(result.columns[0].enums,[]);
+});
+
+test("a low-cardinality business dictionary covered by the sample is still registered",async()=>{
+  const connector={query:async()=>[[{value:"paid",count:8},{value:"pending",count:2}]]};
+  const result=await probeTable(connector,{},
+    {tableName:"orders",rowEstimate:800},
+    [{columnName:"status",dataType:"varchar(32)"}],
+  );
+
+  assert.equal(result.columns[0].cardinality,2);
   assert.deepEqual(result.columns[0].enums.map(({value,count,ratio})=>({value,count,ratio})),[
     {value:"paid",count:8,ratio:0.8},
     {value:"pending",count:2,ratio:0.2},
   ]);
+});
+
+test("identifier-shaped columns never become dictionaries even with a single sampled value",async()=>{
+  const connector={query:async()=>[[{value:"13774665233",count:1}]]};
+  const result=await probeTable(connector,{},
+    {tableName:"alpha",rowEstimate:5_000},
+    [{columnName:"alp_cell",dataType:"varchar(32)"},{columnName:"contract_no",dataType:"varchar(64)"},{columnName:"biz_state",dataType:"varchar(16)"}],
+  );
+
+  const byName=Object.fromEntries(result.columns.map((column)=>[column.columnName,column]));
+  assert.equal(byName.alp_cell.cardinality,1);
+  assert.deepEqual(byName.alp_cell.enums,[]);
+  assert.deepEqual(byName.contract_no.enums,[]);
+  assert.equal(byName.biz_state.enums.length,1);
+});
+
+test("distinct values above the cardinality ratio are not a dictionary",async()=>{
+  const rows=Array.from({length:12},(_item,index)=>({value:`v${index}`,count:1}));
+  const connector={query:async()=>[rows]};
+  const narrow=await probeTable(connector,{},
+    {tableName:"orders",rowEstimate:100},
+    [{columnName:"status",dataType:"varchar(32)"}],
+  );
+  assert.equal(narrow.columns[0].cardinality,12);
+  assert.deepEqual(narrow.columns[0].enums,[]);
+
+  const wide=await probeTable(connector,{},
+    {tableName:"orders",rowEstimate:4_000},
+    [{columnName:"status",dataType:"varchar(32)"}],
+  );
+  assert.equal(wide.columns[0].enums.length,12);
+});
+
+test("the cardinality ratio threshold is configurable",async()=>{
+  const connector={query:async()=>[[{value:"a",count:1},{value:"b",count:1}]]};
+  const strict=await probeTable(connector,{},
+    {tableName:"orders",rowEstimate:100},
+    [{columnName:"status",dataType:"varchar(32)"}],
+    {enumMaxDistinctRatio:0.01},
+  );
+  assert.deepEqual(strict.columns[0].enums,[]);
+
+  const relaxed=await probeTable(connector,{},
+    {tableName:"orders",rowEstimate:100},
+    [{columnName:"status",dataType:"varchar(32)"}],
+    {enumMaxDistinctRatio:0.5},
+  );
+  assert.equal(relaxed.columns[0].enums.length,2);
 });
 
 test("small tables may still use an exact last-write probe",async()=>{
@@ -63,7 +123,7 @@ test("email and name-comment fields are marked sensitive before enum sampling",a
 test("profiling samples a table once and never profiles sensitive columns",async()=>{
   const queries=[];const connector={query:async(_source,sql)=>{queries.push(sql);if(sql.includes("GROUP BY"))return [[{value:"active",count:2}]];return [[{id:2,status:"active",customer_code:"CUS-000002"},{id:1,status:"active",customer_code:"CUS-000001"}]];}};
   const result=await probeTable(connector,{},
-    {tableName:"customer",rowEstimate:2},
+    {tableName:"customer",rowEstimate:500},
     [{columnName:"id",dataType:"bigint",isPrimary:1},{columnName:"status",dataType:"varchar(20)"},{columnName:"customer_code",dataType:"text"},{columnName:"email",dataType:"varchar(255)"}],
     {profiling:{enabled:true,sampleLimit:100,timeoutMs:1000}},
   );

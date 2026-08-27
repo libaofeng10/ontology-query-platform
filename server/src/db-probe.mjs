@@ -4,6 +4,10 @@ import { buildColumnProfile } from "./column-profile.mjs";
 const TIME_TYPE = /date|time|timestamp/i;
 const LOW_CARDINALITY_TYPE = /tinyint|enum|boolean|bool|char|varchar/i;
 const DEFAULT_SAMPLE_ROWS = 10_000;
+const DEFAULT_ENUM_MAX_DISTINCT_RATIO = 0.05;
+// Identifier-shaped columns are never business dictionaries: a phone number column whose
+// sample happens to hold one value must not become an allow-list of one legal value.
+const ENUM_NAME_BLACKLIST = /(_id|_no|_code|cell|phone|mobile|email|name|time|date|_at)$/i;
 
 function quoteIdentifier(value) {
   const identifier=String(value??"");
@@ -11,7 +15,7 @@ function quoteIdentifier(value) {
   return `\`${identifier.replaceAll("`","``")}\``;
 }
 
-export async function probeTable(connector, source, table, columns, { maxEnumValues=20, sampleRows=DEFAULT_SAMPLE_ROWS, profiling={} } = {}) {
+export async function probeTable(connector, source, table, columns, { maxEnumValues=20, sampleRows=DEFAULT_SAMPLE_ROWS, enumMaxDistinctRatio=DEFAULT_ENUM_MAX_DISTINCT_RATIO, profiling={} } = {}) {
   const tableName = quoteIdentifier(table.tableName);
   const sampleLimit = Math.max(1,Math.floor(Number(sampleRows)||DEFAULT_SAMPLE_ROWS));
   const results = [];
@@ -29,9 +33,11 @@ export async function probeTable(connector, source, table, columns, { maxEnumVal
         const col = quoteIdentifier(column.columnName);
         const [rows] = await connector.query(source,`SELECT ${col} AS value, COUNT(*) AS count FROM (SELECT ${col} FROM ${tableName} WHERE ${col} IS NOT NULL LIMIT ${sampleLimit}) AS ontoquery_sample GROUP BY ${col} ORDER BY count DESC LIMIT ${Number(maxEnumValues)+1}`);
         if (rows.length && rows.length <= maxEnumValues) {
-          const total = rows.reduce((sum,row)=>sum+Number(row.count),0);
           item.cardinality=rows.length;
-          item.enums=rows.map((row)=>({value:String(row.value),count:Number(row.count),ratio:total?Number(row.count)/total:0}));
+          if (isEnumDictionary(column.columnName,rows.length,estimatedRows,sampleLimit,enumMaxDistinctRatio)) {
+            const total = rows.reduce((sum,row)=>sum+Number(row.count),0);
+            item.enums=rows.map((row)=>({value:String(row.value),count:Number(row.count),ratio:total?Number(row.count)/total:0}));
+          }
         }
       } catch { /* Individual probes are best effort and sequential. */ }
     }
@@ -39,6 +45,15 @@ export async function probeTable(connector, source, table, columns, { maxEnumVal
   }
   if(profiling?.enabled)await attachProfiles(connector,source,table,results,{sampleLimit:profiling.sampleLimit,timeoutMs:profiling.timeoutMs});
   return { columns:results, lastWrite };
+}
+
+// A sampled distinct-value list is only a complete dictionary when the sample covered the whole
+// table, the values repeat often enough to be categories, and the column is not an identifier.
+function isEnumDictionary(columnName,distinctCount,estimatedRows,sampleLimit,maxDistinctRatio) {
+  if (!(estimatedRows > 0 && estimatedRows <= sampleLimit)) return false;
+  const ratioBase = Math.min(estimatedRows,sampleLimit);
+  if (!(distinctCount / ratioBase < Number(maxDistinctRatio))) return false;
+  return !ENUM_NAME_BLACKLIST.test(String(columnName??""));
 }
 
 async function attachProfiles(connector,source,table,columns,{sampleLimit,timeoutMs}={}) {
@@ -63,4 +78,4 @@ async function attachProfiles(connector,source,table,columns,{sampleLimit,timeou
   }
 }
 
-export const dbProbeInternal={quoteIdentifier,attachProfiles};
+export const dbProbeInternal={quoteIdentifier,attachProfiles,isEnumDictionary};

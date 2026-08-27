@@ -24,6 +24,9 @@ const GROUPS = {
     minSimilarity: { envVar: "RETRIEVAL_MIN_SIMILARITY", validate: ratio },
     semanticThreshold: { envVar: "RETRIEVAL_SEMANTIC_THRESHOLD", validate: ratio },
   },
+  discovery: {
+    enumMaxDistinctRatio: { envVar: "ENUM_MAX_DISTINCT_RATIO", validate: ratio },
+  },
   profiling: {
     enabled: { envVar: "COLUMN_PROFILING_ENABLED", validate: bool },
     sampleLimit: { envVar: "COLUMN_PROFILING_SAMPLE_LIMIT", validate: intRange(1, 1000) },
@@ -62,7 +65,7 @@ const GROUPS = {
 
 export function createSettingsService({ store, baseConfig, appSecret, lockedKeys = [] }) {
   const locked = new Set(lockedKeys);
-  const state = { llm: {}, embedding: {}, retrieval: {}, profiling: {}, query: {}, ontologyAi: {}, prompts: {} };
+  const state = { llm: {}, embedding: {}, retrieval: {}, discovery: {}, profiling: {}, query: {}, ontologyAi: {}, prompts: {} };
   const sources = {};
 
   function defaultsFor(group, key) {
@@ -149,6 +152,7 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
   const llmView = viewOf(state.llm, ["baseUrl", "apiKey", "model"]);
   const embeddingView = viewOf(state.embedding, ["baseUrl", "apiKey", "model", "dimensions"]);
   const retrievalView = viewOf(state.retrieval, ["vectorEnabled", "topK", "vectorWeight", "minSimilarity", "semanticThreshold"]);
+  const discoveryView = viewOf(state.discovery, ["enumMaxDistinctRatio"]);
   const profilingView = viewOf(state.profiling, ["enabled", "sampleLimit", "maxTablesPerRefresh", "timeoutMs"]);
   const ontologyAiView = viewOf(state.ontologyAi, ["mode", "autoConfirmScore", "maxTables", "maxFields", "timeoutMs", "criticEnabled", "calibrationMinSamples", "calibrationMinPrecision", "maxManualObjectRate", "maxFailureRate", "maxP95LatencyMs", "maxAverageTokens"]);
   const promptsView = viewOf(state.prompts, Object.keys(QUERY_PROMPT_SPECS));
@@ -157,6 +161,7 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
     llm: llmView,
     embedding: embeddingView,
     retrieval: retrievalView,
+    discovery: discoveryView,
     profiling: profilingView,
     ontologyAi: ontologyAiView,
     prompts: promptsView,
