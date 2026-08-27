@@ -350,8 +350,7 @@ test("prefer mode falls back to the legacy pipeline after an agent protocol fail
   const connector={explain:async()=>[{rows:1}],query:async()=>[[{customer_id:11}],[{name:"customer_id"}]]};
   const replies=[
     {needsExploration:"需要进一步探索客户口径"},
-    {thought:"尝试越过白名单。",tool:"raw_database",args:{}},
-    {thought:"继续尝试未授权工具。",tool:"raw_database",args:{}},
+    {thought:"尝试越过白名单。",tool:"raw_database",args:{}}, // semantic violation → immediate termination, no retry
     {sql:"SELECT customer_id FROM crm_customer"},
     {conclusion:"兼容链路返回 1 位客户。"},
   ];
@@ -622,13 +621,13 @@ test("intent evidence fingerprint changes with executable business scope but ign
   }
 });
 
-test("a malformed tool action is fed back to the model instead of killing the loop",async()=>{
+test("a malformed tool action earns one protocol retry that does not burn an iteration",async()=>{
   const {store,source}=await createFixture();
   const connector={explain:async()=>[{rows:1}],query:async()=>[[{customer_id:9}],[{name:"customer_id"}]]};
   const actions=[
-    {tool:"run_sql",args:{sql:"SELECT customer_id FROM crm_customer"}}, // missing thought → tolerated with a default
-    {thought:"提交结论。",tool:"unknown_tool",args:{}},                    // unauthorized tool → protocol feedback, loop continues
-    {thought:"改用授权工具提交。",tool:"submit_answer",args:{sql:"SELECT customer_id FROM crm_customer",conclusion:"查询到客户编号 9。"}},
+    {tool:"run_sql",args:{sql:"SELECT customer_id FROM crm_customer"}}, // missing thought → format violation, one retry
+    {thought:"补上进度说明后重发。",tool:"run_sql",args:{sql:"SELECT customer_id FROM crm_customer"}},
+    {thought:"提交结论。",tool:"submit_answer",args:{sql:"SELECT customer_id FROM crm_customer",conclusion:"查询到客户编号 9。"}},
   ];
   const originalFetch=globalThis.fetch;
   globalThis.fetch=async()=>llmResponse(actions.shift());
@@ -637,5 +636,72 @@ test("a malformed tool action is fed back to the model instead of killing the lo
     const answer=await service.ask({sourceId:source.id,question:"查询有效客户",userName:"tester"});
     assert.equal(answer.conclusion,"查询到客户编号 9。");
     assert.equal(answer.evidence.planningMode,"agent");
+    const audit=store.listAudits(source.id,1)[0];
+    const retryTraces=audit.toolTrace.filter((item)=>item.tool==="protocol_retry");
+    assert.equal(retryTraces.length,1);
+    assert.match(retryTraces[0].reason,/thought/);
+    // The retry is recorded in the trace but does not consume a reasoning iteration:
+    // only the two real actions count.
+    assert.equal(audit.iterations,2);
+    assert.deepEqual(audit.toolTrace.map((item)=>item.tool),["protocol_retry","run_sql","submit_answer"]);
+  } finally { globalThis.fetch=originalFetch;store.close(); }
+});
+
+test("an empty tool name earns one protocol retry",async()=>{
+  const {store,source}=await createFixture();
+  const connector={explain:async()=>[{rows:1}],query:async()=>[[{customer_id:9}],[{name:"customer_id"}]]};
+  const actions=[
+    {thought:"忘了写工具名。",args:{sql:"SELECT customer_id FROM crm_customer"}},
+    {thought:"补上工具名重发。",tool:"run_sql",args:{sql:"SELECT customer_id FROM crm_customer"}},
+    {thought:"提交结论。",tool:"submit_answer",args:{sql:"SELECT customer_id FROM crm_customer",conclusion:"查询到客户编号 9。"}},
+  ];
+  const originalFetch=globalThis.fetch;
+  globalThis.fetch=async()=>llmResponse(actions.shift());
+  try {
+    const service=createQueryService({store,connector,config:config()});
+    const answer=await service.ask({sourceId:source.id,question:"查询有效客户",userName:"tester"});
+    assert.equal(answer.conclusion,"查询到客户编号 9。");
+    const audit=store.listAudits(source.id,1)[0];
+    assert.equal(audit.toolTrace.filter((item)=>item.tool==="protocol_retry").length,1);
+  } finally { globalThis.fetch=originalFetch;store.close(); }
+});
+
+test("two consecutive format violations terminate the loop",async()=>{
+  const {store,source}=await createFixture();
+  const connector={explain:async()=>[{rows:1}],query:async()=>[[{customer_id:9}],[{name:"customer_id"}]]};
+  const actions=[
+    {tool:"run_sql",args:{sql:"SELECT customer_id FROM crm_customer"}},
+    {args:{sql:"SELECT customer_id FROM crm_customer"}},
+  ];
+  const originalFetch=globalThis.fetch;
+  globalThis.fetch=async()=>llmResponse(actions.shift());
+  try {
+    const service=createQueryService({store,connector,config:config()});
+    const answer=await service.ask({sourceId:source.id,question:"查询有效客户",userName:"tester"});
+    assert.equal(answer.refused,true);
+    assert.match(answer.reason,/thought|工具动作/);
+    assert.equal(store.listAudits(source.id,1)[0].verdict,"failed");
+  } finally { globalThis.fetch=originalFetch;store.close(); }
+});
+
+test("requesting an unauthorized tool terminates immediately without a protocol retry",async()=>{
+  const {store,source}=await createFixture();
+  const connector={explain:async()=>[{rows:1}],query:async()=>[[{customer_id:9}],[{name:"customer_id"}]]};
+  let calls=0;
+  const actions=[
+    {thought:"试图越权。",tool:"unknown_tool",args:{}},
+    {thought:"不该到这里。",tool:"submit_answer",args:{sql:"SELECT customer_id FROM crm_customer",conclusion:"不应产生。"}},
+  ];
+  const originalFetch=globalThis.fetch;
+  globalThis.fetch=async()=>{calls++;return llmResponse(actions.shift());};
+  try {
+    const service=createQueryService({store,connector,config:config()});
+    const answer=await service.ask({sourceId:source.id,question:"查询有效客户",userName:"tester"});
+    assert.equal(answer.refused,true);
+    assert.match(answer.reason,/未授权工具/);
+    assert.equal(calls,1);
+    const audit=store.listAudits(source.id,1)[0];
+    assert.equal(audit.verdict,"failed");
+    assert.equal(audit.toolTrace.some((item)=>item.tool==="protocol_retry"),false);
   } finally { globalThis.fetch=originalFetch;store.close(); }
 });

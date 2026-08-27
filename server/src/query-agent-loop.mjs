@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { callLlmTools } from "./llm-client.mjs";
+import { callLlmTools, isProtocolFormatError } from "./llm-client.mjs";
 import { retrieveKnowledge } from "./knowledge-retrieval.mjs";
 import { compileSemanticQueryPlan, semanticPlanningView } from "./semantic-query-plan.mjs";
 import { guardSql } from "./sql-guard.mjs";
@@ -244,9 +244,16 @@ export async function runQueryAgent({store,connector,config,source,question,cont
         action=await callLlmTools(config.llm,messages,availableAgentTools({searchContextSucceeded}),toolLlmOptions(config.llm,remaining,activeSignal));
       } catch(error) {
         throwIfAborted(activeSignal);
-        if(isLlmProtocolError(error)&&++consecutiveProtocolErrors<2) {
+        // Only format violations (malformed JSON, empty tool name, missing thought) earn one
+        // deterministic retry. Requesting an unauthorized tool is a semantic violation and
+        // terminates immediately — feeding it back would invite privilege probing.
+        if(isProtocolFormatError(error)&&++consecutiveProtocolErrors<2) {
+          const reason=safeError(error);
+          toolTrace.push({tool:"protocol_retry",phase:currentPhase,thought:"模型返回违反工具协议的格式，已要求按协议重发。",argsHash:hash("{}"),durationMs:0,ok:false,summary:`协议格式违规：${reason}`,reason});
+          emitEvent(activeOnEvent,{type:"tool_result",step,tool:"protocol_retry",ok:false,summary:`协议格式违规：${reason}`,durationMs:0});
           emitEvent(activeOnEvent,{type:"step",step,status:"failed"});
-          messages.push({role:"user",content:`Harness 协议错误：${safeError(error)}。请严格按协议重新返回一个 JSON 动作：{"thought":"...","tool":"...","args":{...}}，不要输出其他文本。`});
+          messages.push({role:"user",content:`Harness 协议错误：${reason}。请严格按协议重新返回一个 JSON 动作：{"thought":"...","tool":"...","args":{...}}，不要输出其他文本。`});
+          index--; // A format slip must not burn a reasoning iteration; the wall-clock deadline still bounds the loop.
           continue;
         }
         throw error;
@@ -901,7 +908,6 @@ function clipText(value,maxLength) {
 }
 
 function sqlHash(sql) { return hash(String(sql||"").trim().replace(/\s+/g," ")); }
-function isLlmProtocolError(error) { return /工具动作|未授权工具|未返回合法 JSON|未返回内容/.test(String(error?.message||"")); }
 function normalizeIdentifier(value) { return String(value||"").replaceAll("`","").toLowerCase(); }
 function quoteIdentifier(value) { return `\`${String(value).replaceAll("`","``")}\``; }
 function isTerminalTool(tool) { return tool==="submit_answer"||tool==="refuse"; }

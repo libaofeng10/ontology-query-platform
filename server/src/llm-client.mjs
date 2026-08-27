@@ -30,14 +30,20 @@ export async function callLlmTools(llm,messages,tools,options={}) {
   const {timeoutMs=60_000,fetchImpl=globalThis.fetch,extraBody={},signal}=options;
   const data=await requestChatCompletion(llm,requestMessages,{timeoutMs,fetchImpl,extraBody:{tools:nativeTools,tool_choice:"required",...extraBody},signal});
   const message=data.choices?.[0]?.message;
-  const action=normalizeToolAction(message);
+  let action;
+  try { action=normalizeToolAction(message); } catch(error) { throw protocolFormatError(error.message); }
   const usage=normalizeUsage(data.usage);
-  const thought=String(action.thought||message?.content||"").trim()||"正在分析。";
+  // In the JSON-content mode message.content is the JSON action itself, so it cannot double
+  // as the thought fallback; a missing thought there is a format violation. Native tool_calls
+  // often carry no content at all, so demanding one there would break compliant models.
+  const thought=String(action.thought||(action.jsonProtocol?"":message?.content)||"").trim();
+  if(!thought&&action.jsonProtocol) throw protocolFormatError("LLM 工具动作缺少 thought（协议要求每轮提供一句进度说明）");
   const tool=String(action.tool||"").trim();
-  if(!tool) throw new Error("LLM 未返回工具动作（required 模式要求每轮调用一个授权工具）");
-  if(!definitions.some((item)=>item.name===tool)) throw new Error(`LLM 请求了未授权工具：${tool}`);
-  const args=parseToolArguments(action.args);
-  return {thought,tool,args,usage};
+  if(!tool) throw protocolFormatError("LLM 未返回工具动作（required 模式要求每轮调用一个授权工具）");
+  if(!definitions.some((item)=>item.name===tool)) { const error=new Error(`LLM 请求了未授权工具：${tool}`);error.code="LLM_TOOL_UNAUTHORIZED";throw error; }
+  let args;
+  try { args=parseToolArguments(action.args); } catch(error) { throw protocolFormatError(error.message); }
+  return {thought:thought||"正在分析。",tool,args,usage};
 }
 
 export function isLlmConfigured(llm) { return llmConfigurationIssues(llm).length===0; }
@@ -64,6 +70,8 @@ function llmHttpError(status) {
 }
 
 function abortError() { const error=new Error("LLM 请求已取消");error.name="AbortError";error.code="ABORT_ERR";return error; }
+function protocolFormatError(message) { const error=new Error(message);error.code="LLM_PROTOCOL_FORMAT";return error; }
+export function isProtocolFormatError(error) { return error?.code==="LLM_PROTOCOL_FORMAT"; }
 function traceError(message,rawContent,usage) { const error=new Error(message);error.rawContent=rawContent??null;error.usage=usage;return error; }
 function normalizeUsage(value) { if(!value||typeof value!=="object")return null;const promptTokens=Number(value.prompt_tokens??value.input_tokens??0);const completionTokens=Number(value.completion_tokens??value.output_tokens??0);const totalTokens=Number(value.total_tokens??promptTokens+completionTokens);return {promptTokens:Number.isFinite(promptTokens)?promptTokens:0,completionTokens:Number.isFinite(completionTokens)?completionTokens:0,totalTokens:Number.isFinite(totalTokens)?totalTokens:0}; }
 
@@ -98,9 +106,10 @@ function normalizeToolAction(message) {
   try { parsed=JSON.parse(content); }
   catch { throw new Error("LLM 工具动作不是合法 JSON"); }
   if(!parsed||typeof parsed!=="object"||Array.isArray(parsed)) throw new Error("LLM 工具动作必须是 JSON 对象");
-  if(Array.isArray(parsed.tool_calls)) return normalizeToolAction({content:parsed.thought,tool_calls:parsed.tool_calls});
+  if(Array.isArray(parsed.tool_calls)) return {...normalizeToolAction({content:parsed.thought,tool_calls:parsed.tool_calls}),jsonProtocol:true};
   const wrapped=objectValue(parsed.tool_call)||objectValue(parsed.function_call)||objectValue(parsed.function)||objectValue(parsed.action)||objectValue(parsed.tool);
   if(wrapped) return {
+    jsonProtocol:true,
     thought:parsed.thought??parsed.reasoning,
     tool:wrapped.tool??wrapped.name,
     args:wrapped.args??wrapped.arguments??wrapped.parameters??wrapped.input,
@@ -108,6 +117,7 @@ function normalizeToolAction(message) {
   const actionName=typeof parsed.action==="string"?parsed.action:undefined;
   const toolName=typeof parsed.tool==="string"?parsed.tool:undefined;
   return {
+    jsonProtocol:true,
     thought:parsed.thought??parsed.reasoning,
     tool:toolName??actionName??parsed.name,
     args:parsed.args??parsed.arguments??parsed.parameters??parsed.input??parsed.action_input,
