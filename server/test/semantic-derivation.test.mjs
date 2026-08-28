@@ -97,3 +97,31 @@ test("an undetermined page role becomes a blocking ambiguity that names the page
   assert.equal(found.undeterminedSource,"metric:rate");
   assert.match(found.message,/结构化周期声明/);
 });
+
+const DECLARING_PAGE=metricPage({content:"分母是统计周期内进入的唯一线索，分子是其中成单的唯一线索。统计周期固定绑定 alpha_crm_clue.clue_create_time。"});
+
+test("an explicit period request that contradicts the page becomes a conflict clarification",()=>{
+  // The page binds the period to entry time. The question explicitly asks to count
+  // by completion time. Neither side may silently win.
+  const intent=parseQueryIntent("按成单时间统计本月的成交率",{concepts:[conceptFor(DECLARING_PAGE)],filterConcepts:[],rowDomainConcepts:[],protectedTermAliases:[]});
+  assert.equal(intent.timeRole,null);
+  const found=intent.ambiguities.find((item)=>item.code==="TIME_ROLE_AMBIGUOUS");
+  assert.ok(found);
+  assert.deepEqual(found.conflict,{declared:"entry",requested:"completion",source:"metric:rate"});
+  assert.deepEqual(found.options,["entry","completion"]);
+  assert.match(found.message,/不会自行改变已发布口径/);
+});
+
+test("the metric's own name never counts as an explicit period request",()=>{
+  // 成交率 contains 成交; that is the metric's identity, not a request to bind the
+  // period to completion time. The declared entry role must stand unchallenged.
+  const intent=parseQueryIntent("分析一下本月抖音渠道的成交率",{concepts:[conceptFor(DECLARING_PAGE)],filterConcepts:[],rowDomainConcepts:[],protectedTermAliases:[]});
+  assert.equal(intent.timeRole?.value,"entry");
+  assert.equal(intent.ambiguities.some((item)=>item.code==="TIME_ROLE_AMBIGUOUS"),false);
+});
+
+test("an explicit period request that agrees with the page passes straight through",()=>{
+  const intent=parseQueryIntent("按进线时间统计本月的成交率",{concepts:[conceptFor(DECLARING_PAGE)],filterConcepts:[],rowDomainConcepts:[],protectedTermAliases:[]});
+  assert.equal(intent.timeRole?.value,"entry");
+  assert.equal(intent.ambiguities.some((item)=>item.code==="TIME_ROLE_AMBIGUOUS"),false);
+});

@@ -112,7 +112,7 @@ export function parseQueryIntent(question,{now=new Date(),concepts=[],filterConc
   if(shape.kind==="ranking"&&shape.requestedLimitInvalid)ambiguities.push({code:"RANKING_LIMIT_INVALID",message:`排行数量“${shape.requestedLimitInvalid}”不是有效的正整数`,blocking:true,options:["补充有效的 Top 数量","不指定数量，使用系统安全上限"]});
   if(measures.some((item)=>item.grain==="unknown"))ambiguities.push({code:"MEASURE_GRAIN_AMBIGUOUS",message:"统计指标的去重粒度不明确，COUNT(*) 不能作为默认业务口径",blocking:true,options:["按业务对象去重","按事件或订单去重","使用已登记指标口径"]});
   if(timeResolution.unknown)ambiguities.push({code:"TIME_RANGE_UNKNOWN",message:`时间范围“${timeResolution.unknown.sourceText}”无法安全解析为唯一的左闭右开日期区间`,blocking:true,options:["本周","本月","本季度","今年","补充明确起止日期"],sourceText:timeResolution.unknown.sourceText,reason:timeResolution.unknown.reason});
-  if((timeRange||shape.kind==="trend")&&timeRole?.ambiguous)ambiguities.push({code:"TIME_ROLE_AMBIGUOUS",message:timeRole.undetermined?`已验证指标页（${timeRole.undetermined.source}）的定义同时提到多个业务事件时间，无法唯一判断统计周期应绑定哪一个。请在页面补充结构化周期声明，或先选择本次口径`:"时间要求可确定，但无法唯一判断应绑定哪个业务事件时间",blocking:true,options:timeRole.candidates.map((item)=>item.value),...(timeRole.undetermined?{undeterminedSource:timeRole.undetermined.source}:{})});
+  if((timeRange||shape.kind==="trend")&&timeRole?.ambiguous)ambiguities.push({code:"TIME_ROLE_AMBIGUOUS",message:timeRole.conflict?`已验证指标页（${timeRole.conflict.source}）声明统计周期绑定 ${timeRole.conflict.declared}，但问题要求按 ${timeRole.conflict.requested} 统计。系统不会自行改变已发布口径，请选择本次采用哪一个`:timeRole.undetermined?`已验证指标页（${timeRole.undetermined.source}）的定义同时提到多个业务事件时间，无法唯一判断统计周期应绑定哪一个。请在页面补充结构化周期声明，或先选择本次口径`:"时间要求可确定，但无法唯一判断应绑定哪个业务事件时间",blocking:true,options:timeRole.candidates.map((item)=>item.value),...(timeRole.undetermined?{undeterminedSource:timeRole.undetermined.source}:{}),...(timeRole.conflict?{conflict:timeRole.conflict}:{})});
   if((timeRange||shape.kind==="trend")&&measures.length&&!timeRole)ambiguities.push({code:"TIME_ROLE_UNKNOWN",message:"指标包含时间要求，但没有识别出对应的业务事件时间",blocking:true,options:["创建或进入时间","完成或成单时间","支付或回款时间"]});
   if(shape.kind==="trend"&&!shape.timeGrain)ambiguities.push({code:"TIME_GRAIN_UNKNOWN",message:"趋势问题没有说明按日、周、月、季度还是年汇总",blocking:true,options:["按日","按周","按月"]});
   if(shape.kind==="comparison"&&!comparisonRange)ambiguities.push({code:"COMPARISON_BASELINE_UNKNOWN",message:"对比问题没有形成明确的当前期和基准期窗口",blocking:true,options:["补充当前统计周期","明确同比或环比"]});
@@ -1104,6 +1104,20 @@ function detectMeasures(text,subjects,shape,concepts=[]) {
   return found;
 }
 
+// A metric's own name usually contains an event word — asking for 成交率 mentions
+// 成交 without asking for the completion time — so a bare keyword scan cannot tell a
+// request apart from the metric's identity. Only an explicit "按/以/根据 X 时间"
+// construction counts as the question naming its own period. Deliberately narrow:
+// when it finds nothing the declared page role stands, which is the safe default.
+const EXPLICIT_PERIOD_PATTERN=/(?:按|以|依据|根据|based on)\s*([^，。；、\s]{1,10}?)\s*(?:时间|日期|口径)/g;
+function explicitQuestionTimeRole(text) {
+  const roles=new Set();
+  for(const [,phrase] of String(text||"").matchAll(EXPLICIT_PERIOD_PATTERN)) {
+    for(const concept of TIME_ROLE_CONCEPTS)if(concept.pattern.test(phrase))roles.add(concept.value);
+  }
+  return roles.size===1?[...roles][0]:null;
+}
+
 function detectTimeRole(text,timeRange,measures,required=false) {
   if(!timeRange&&!required)return null;
   // Evidence ranking: a verified metric's own period derivation outranks keyword
@@ -1113,6 +1127,14 @@ function detectTimeRole(text,timeRange,measures,required=false) {
   const knowledgeDerivation=knowledgeMeasure?.timeRoleDerivation;
   if(knowledgeDerivation&&(knowledgeDerivation.status==="declared"||knowledgeDerivation.status==="inferred")) {
     const concept=TIME_ROLE_CONCEPTS.find((item)=>item.value===knowledgeDerivation.value);
+    // The page wins over stray keywords, but not over an explicit request: if the
+    // question asks for a different event time outside the metric's own name, the
+    // two must be reconciled by the user rather than one silently overriding.
+    const requested=explicitQuestionTimeRole(text);
+    if(concept&&requested&&requested!==concept.value) {
+      const requestedConcept=TIME_ROLE_CONCEPTS.find((item)=>item.value===requested);
+      if(requestedConcept)return {ambiguous:true,candidates:[concept,requestedConcept],conflict:{declared:concept.value,requested:requested,source:knowledgeDerivation.source}};
+    }
     if(concept)return {value:concept.value,sourceText:knowledgeMeasure.sourceText||timeRange?.sourceText||concept.value,terms:[...concept.terms],attachesTo:knowledgeMeasure.id||null,evidence:{level:"verified_knowledge",page:knowledgeDerivation.source,...(knowledgeDerivation.periodColumn?{periodColumn:knowledgeDerivation.periodColumn}:{})}};
   }
   if(knowledgeDerivation&&isUndetermined(knowledgeDerivation)) {
