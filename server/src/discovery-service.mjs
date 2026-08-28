@@ -3,6 +3,7 @@ import { probeTable } from "./db-probe.mjs";
 import { generateRelationCandidates } from "./relation-candidates.mjs";
 import { createRelationModelService } from "./relation-model-service.mjs";
 import { detectSensitiveField } from "./sensitive-fields.mjs";
+import { generateEnumMeaningQuestions } from "./enum-meaning-candidates.mjs";
 import { gradeTable } from "./table-grading.mjs";
 import { writeJoinPage, writeRulePage, writeTablePage } from "./ontology-writer.mjs";
 import { join } from "node:path";
@@ -120,6 +121,8 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     }
     store.finishSchemaRefresh(source.id,normalized,[...new Set(relationKeys)]);
     store.closeStaleRelationQuestions(source.id);
+    emit(onProgress,88,"从列注释生成枚举含义待确认项");
+    generateEnumMeaningQuestions(store,source.id);
     const snapshot=saveSnapshot(source.id,normalized,schemaDiff);
     emit(onProgress,90,"写入可审阅本体页面");
     await writeOntology(source.id);
