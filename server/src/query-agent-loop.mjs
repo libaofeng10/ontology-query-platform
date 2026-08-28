@@ -6,7 +6,7 @@ import { guardSql } from "./sql-guard.mjs";
 import { buildQueryColumnSemantics, columnSemanticKind, detectQuestionValueKinds, redactTypedLiterals } from "./query-column-semantics.mjs";
 import { normalizeQueryRow } from "./query-result-normalization.mjs";
 import { exhaustiveAccountTables, missingExhaustiveAccountProductColumns, missingExhaustiveAccountTables, missingIntentSubjectFacets, missingRequiredRetrievalFacets, queryIntentFilterError, queryResultContractValidation } from "./query-scope-coverage.mjs";
-import { applyIntentClarification, buildIntentRetrievalQuestion, parseQueryIntent } from "./query-intent.mjs";
+import { applyIntentClarification, buildIntentRetrievalQuestion, describeIntentFacets, parseQueryIntent } from "./query-intent.mjs";
 import { buildQueryResultContract, validateQueryRunSet } from "./query-result-contract.mjs";
 import { dominantFailureClass, toolFailure } from "./query-errors.mjs";
 import { QUERY_PROMPT_DEFAULTS, renderQueryPrompt } from "./query-prompts.mjs";
@@ -604,7 +604,7 @@ export async function runQueryAgent({store,connector,config,source,question,cont
     const missingScopes=missingExhaustiveAccountTables(question,context,runs.flatMap((run)=>run.verdict.tables||[]));
     if(missingScopes.length)return {result:{ok:false,error:`问题要求查询所有账号，但提交结果遗漏账号主表：${missingScopes.join("、")}`},terminal:null};
     const missingSubjectFacets=missingIntentSubjectFacets(queryIntent,retrievalEvidence,runs.flatMap((run)=>run.verdict.tables||[]));
-    if(missingSubjectFacets.length)return {result:toolFailure({stage:"intent",code:"INTENT_SUBJECT_INCOMPLETE",error:`提交结果遗漏业务对象分面：${missingSubjectFacets.join("、")}`,retryable:true,details:{missingFacets:missingSubjectFacets}}),terminal:null};
+    if(missingSubjectFacets.length)return {result:toolFailure({stage:"intent",code:"INTENT_SUBJECT_INCOMPLETE",error:`提交结果遗漏业务对象：${describeIntentFacets(queryIntent,missingSubjectFacets).join("、")}`,retryable:true,details:{missingFacets:missingSubjectFacets}}),terminal:null};
     const missingProductColumns=missingExhaustiveAccountProductColumns(question,context,runs.map((run)=>({sql:run.sql,tables:run.verdict.tables||[]})));
     if(missingProductColumns.length)return {result:{ok:false,error:`问题要求查询所有账号，但提交结果没有返回产品维度：${missingProductColumns.join("、")}`},terminal:null};
     const resultContract=resultContractForRuns(runs);
@@ -826,7 +826,7 @@ function clarifiedEvidenceGap(intent,retrieval) {
   return {
     errorCode:"INTENT_REQUIRED_RETRIEVAL_FACET_MISSING",
     missingFacets,
-    reason:`澄清后的结构化查询口径仍缺少可执行的已发布分面：${missingFacets.join("、")}；系统不会在覆盖不完整时继续规划或执行 SQL。`,
+    reason:`澄清后的结构化查询口径仍缺少可执行的已发布能力：${describeIntentFacets(intent,missingFacets).join("、")}；系统不会在覆盖不完整时继续规划或执行 SQL。`,
   };
 }
 function intentEvidenceFingerprint(intent) {

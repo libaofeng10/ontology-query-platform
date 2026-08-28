@@ -25,7 +25,13 @@ export function validateKnowledgeSemantics(page,{columnsByTable={}}={}) {
   if(concept.aggregation==="ratio") {
     const formula=concept.metricDefinition?.formula;
     if(!formula)errors.push({code:"RATIO_FORMULA_UNPARSED",message:"比例指标的参考 SQL 无法解析出分子、分母公式。请检查是否为顶层除法、CASE WHEN 谓词、且仅含 AND 条件"});
-    else if(formula.numerator?.predicateBinding==="unsupported"||formula.denominator?.predicateBinding==="unsupported")errors.push({code:"RATIO_PREDICATE_UNSUPPORTED",message:"公式谓词无法绑定到已登记的物理列。请确认表名、列名与数据源目录一致"});
+    else if(formula.numerator?.predicateBinding==="unsupported"||formula.denominator?.predicateBinding==="unsupported") {
+      // Name the column that failed to resolve. A gap board entry that only says
+      // "some predicate does not bind" cannot be acted on without re-deriving the
+      // page by hand, which is the work the board exists to remove.
+      const unresolved=[...new Set([...(formula.numerator?.unresolvedColumns||[]),...(formula.denominator?.unresolvedColumns||[])])];
+      errors.push({code:"RATIO_PREDICATE_UNSUPPORTED",message:unresolved.length?`公式谓词无法绑定到目录中的唯一物理列：${unresolved.join("、")}（列名不存在，或在页面声明的多张表中重名）`:"公式谓词无法绑定到已登记的物理列。请确认表名、列名与数据源目录一致",...(unresolved.length?{unresolvedColumns:unresolved}:{})});
+    }
   }
   if(concept.aggregation==="unknown")warnings.push({code:"AGGREGATION_UNKNOWN",message:"无法从参考 SQL 识别聚合方式，查询时该指标只能作为检索线索而非可执行口径"});
 

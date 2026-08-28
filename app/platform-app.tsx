@@ -240,6 +240,10 @@ function KnowledgeWorkspace({sourceId,pages,role,prefill,onPrefillConsumed,onRef
   },[sourceId,canViewGaps,pages]);
   function applyRemedy(gap:CapabilityGap){
     if(!sourceId)return;
+    // A page-health gap points at a page that already exists: open it for editing so the
+    // operator fixes the declaration in place instead of creating a rival definition.
+    const existing=gap.remedy.action==="edit_knowledge_page"?pages.find((page)=>page.pageType===gap.remedy.prefill?.pageType&&page.slug===gap.remedy.prefill?.slug):undefined;
+    if(existing)return openEdit(existing);
     const pageType=gap.remedy.prefill?.pageType==="metric"?"metric" as const:"term" as const;
     setEditor({sourceId,pageType,title:gap.remedy.prefill?.title||gap.assetLabel,aliases:[],tables:[],content:"",sqlContent:"",antiExamples:"",verified:false,owner:""});
   }
@@ -254,7 +258,7 @@ function CapabilityGapPanel({board,onApplyRemedy}:{board:CapabilityGapBoard;onAp
   const resolvedGaps=board.gaps.filter((gap)=>gap.status==="resolved");
   if(!board.gaps.length)return null;
   return <section className="panel capability-gap-panel"><div className="panel-title"><div><h2>知识缺口</h2><p>基于最近 {board.auditWindow} 条拒答/失败审计实时聚合；补齐资产后缺口自动闭环。</p></div><span className="gap-count">{openGaps.length} 个待处理</span></div>
-    {openGaps.length?<div className="gap-list">{openGaps.map((gap)=><article key={gap.key}><div className="gap-main"><strong>{gap.assetLabel}</strong><small>被问 {gap.count} 次 · 最近 {formatDate(gap.lastAskedAt,"—")} · {gap.code.startsWith("CLASS:")?"未分类缺口":gap.code}</small>{gap.sampleQuestions.length?<p>{gap.sampleQuestions[0]}</p>:null}</div>{["create_metric_page","create_term_page"].includes(gap.remedy.action)?<button onClick={()=>onApplyRemedy(gap)}><Icon name="plus" size={13}/>补充定义</button>:<span className="gap-action-hint">{gapActionLabel(gap.remedy.action)}</span>}</article>)}</div>:<p className="gap-empty">没有待处理缺口。</p>}
+    {openGaps.length?<div className="gap-list">{openGaps.map((gap)=>{const pageHealth=gap.key.startsWith("PAGE:");return <article key={gap.key}><div className="gap-main"><strong>{gap.assetLabel}</strong><small>{pageHealth?`已验证页面语义${gap.code==="PAGE_SEMANTIC_INVALID"?"不可用":"降级"} · 更新于 ${formatDate(gap.lastAskedAt,"—")}`:`被问 ${gap.count} 次 · 最近 ${formatDate(gap.lastAskedAt,"—")} · ${gap.code.startsWith("CLASS:")?"未分类缺口":gap.code}`}</small>{gap.detail?<p className="gap-detail">{gap.detail}</p>:gap.sampleQuestions.length?<p>{gap.sampleQuestions[0]}</p>:null}</div>{["create_metric_page","create_term_page","edit_knowledge_page"].includes(gap.remedy.action)?<button onClick={()=>onApplyRemedy(gap)}><Icon name={pageHealth?"arrow":"plus"} size={13}/>{pageHealth?"修正声明":"补充定义"}</button>:<span className="gap-action-hint">{gapActionLabel(gap.remedy.action)}</span>}</article>;})}</div>:<p className="gap-empty">没有待处理缺口。</p>}
     {resolvedGaps.length?<details className="gap-resolved"><summary>{resolvedGaps.length} 个已闭环</summary>{resolvedGaps.map((gap)=><article key={gap.key}><div className="gap-main"><strong>{gap.assetLabel}</strong><small>被问 {gap.count} 次 · 已有匹配的已验证资产</small></div><span className="gap-resolved-pill"><Icon name="check" size={12}/>已闭环</span></article>)}</details>:null}
   </section>;
 }

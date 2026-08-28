@@ -775,6 +775,31 @@ export function buildIntentRetrievalFacets(intent) {
   return facets;
 }
 
+// Refusal copy is read by business users: internal facet ids ("filter:channel:0")
+// must never appear in it. This renders each missing facet as the business surface
+// the user actually typed, falling back to the facet's field — never its value,
+// because filter values can be personal data.
+const FACET_KIND_LABELS={subject:"业务对象",measure:"指标",filter:"筛选",dimension:"维度",time:"时间口径",product:"产品",entity:"机构",scope:"查询范围",organization_name:"机构名称",knowledge_row_domain:"业务口径"};
+const SUBJECT_SURFACE_LABELS={clue:"线索",account:"账号",customer:"客户",order:"订单",case:"案件",revenue:"收入"};
+export function describeIntentFacets(intent,facetKeys=[]) {
+  const requirements=new Map((intent?.requirements||[]).map((item)=>[item.id,item]));
+  const described=(facetKeys||[]).map((key)=>{
+    const segments=String(key||"").split(":");
+    const requirement=requirements.get(key);
+    const kind=requirement?.kind||segments[0]||"facet";
+    const kindLabel=FACET_KIND_LABELS[kind]||"查询能力";
+    let label="";
+    if(kind==="subject")label=SUBJECT_SURFACE_LABELS[requirement?.value||segments[1]]||requirement?.value||segments[1]||"";
+    else if(kind==="filter"||kind==="organization_name")label=requirement?.fieldSurface||requirement?.field||segments[1]||"";
+    else if(kind==="entity")label=segments[2]||"";
+    else if(kind==="scope")label="全量";
+    else label=requirement?.sourceText||requirement?.surfaceText||requirement?.value||segments[1]||"";
+    const surface=String(label||"").trim();
+    return surface&&surface!==kindLabel?`${kindLabel}「${surface}」`:kindLabel;
+  });
+  return [...new Set(described)];
+}
+
 export function queryIntentSqlErrors(intent,sql) {
   const errors=[];
   const text=String(sql||"");
@@ -1351,7 +1376,7 @@ function aggregateBeside(sql,slash,direction,page,columnsByTable) {
   const scopedPage={...page,content:"",antiExamples:"",sqlContent:body};
   const columns=extractKnowledgeColumnRefs(scopedPage,columnsByTable).map((item)=>`${item.table}.${item.column}`);
   const predicateBinding=predicateSignatures(body,page,columnsByTable);
-  return {aggregation:String(match[1]).toLowerCase(),distinct,columns,predicates:predicateBinding.predicates,predicateBinding:predicateBinding.status};
+  return {aggregation:String(match[1]).toLowerCase(),distinct,columns,predicates:predicateBinding.predicates,predicateBinding:predicateBinding.status,...(predicateBinding.unresolvedColumns?{unresolvedColumns:predicateBinding.unresolvedColumns}:{})};
 }
 
 function matchingParen(value,open) {
@@ -1373,12 +1398,12 @@ function predicateSignatures(value,page,columnsByTable,{strictFragment=false}={}
   const direct=new RegExp(`(${identifier})\\s*(>=|<=|<>|!=|=|>|<)\\s*(${literal})`,"gi");
   const reverse=new RegExp(`(${literal})\\s*(>=|<=|<>|!=|=|>|<)\\s*(${identifier})`,"gi");
   const nullCheck=new RegExp(`(${identifier})\\s+IS\\s+(NOT\\s+)?NULL`,"gi");
-  const predicates=[];const spans=[];let unresolved=false;let comparisons=0;
+  const predicates=[];const spans=[];const unresolvedColumns=[];let unresolved=false;let comparisons=0;
   const add=(rawColumn,operator,rawLiteral,match)=>{
     comparisons++;
     const column=resolveKnowledgePredicateColumn(rawColumn,page,columnsByTable);
     const value=canonicalLiteral(rawLiteral);
-    if(!column||!value){unresolved=true;return;}
+    if(!column||!value){unresolved=true;if(!column)unresolvedColumns.push(String(rawColumn).replaceAll("`",""));return;}
     predicates.push({column,operator,valueType:value.type,value:value.value});
     if(match)spans.push({start:match.index,end:match.index+match[0].length});
   };
@@ -1391,7 +1416,8 @@ function predicateSignatures(value,page,columnsByTable,{strictFragment=false}={}
     const remainder=chars.join("").replace(/^\s*WHERE\b/i,"").replace(/\bAND\b/gi,"").replace(/[()\s;]+/g,"");
     if(remainder)return {status:"unsupported",predicates:[],reason:"predicate_fragment_not_fully_consumed",remainder};
   }
-  return {status:unresolved||comparisons!==uniquePredicates.length?"unsupported":"physical",predicates:uniquePredicates,...(unresolved?{reason:"predicate_column_or_literal_unresolved"}:{})};
+  const unresolvedColumnNames=[...new Set(unresolvedColumns)];
+  return {status:unresolved||comparisons!==uniquePredicates.length?"unsupported":"physical",predicates:uniquePredicates,...(unresolvedColumnNames.length?{unresolvedColumns:unresolvedColumnNames}:{}),...(unresolved?{reason:"predicate_column_or_literal_unresolved"}:{})};
 }
 
 function resolveKnowledgePredicateColumn(rawValue,page,columnsByTable) {

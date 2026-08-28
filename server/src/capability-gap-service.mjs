@@ -1,4 +1,5 @@
 import { knowledgeIntentConcepts, catalogFilterConcepts } from "./query-intent.mjs";
+import { validateKnowledgeSemantics } from "./knowledge-semantics.mjs";
 
 // Aggregates refused/failed audit rows into a governance backlog of capability gaps.
 // Pure read + deterministic recomputation: no new tables, no LLM calls, no replay of
@@ -17,13 +18,37 @@ const FILTER_GAP_CODES=new Set(["FILTER_FIELD_UNKNOWN","FILTER_VALUE_BINDING_UNK
 export function createCapabilityGapService({store}) {
   function listGaps(sourceId,{limit=500}={}) {
     const audits=store.listAudits(sourceId,limit).filter((row)=>["refused","failed"].includes(row.verdict));
-    const gaps=aggregateGaps(audits);
     const resolution=buildResolutionContext(store,sourceId);
+    const gaps=[...aggregateGaps(audits),...pageHealthGaps(resolution)];
     for(const gap of gaps)gap.status=gapStatus(gap,resolution);
     gaps.sort((left,right)=>(left.status==="open"?0:1)-(right.status==="open"?0:1)||right.count-left.count||String(right.lastAskedAt||"").localeCompare(String(left.lastAskedAt||"")));
     return {gaps,generatedAt:new Date().toISOString(),auditWindow:audits.length};
   }
   return {listGaps};
+}
+
+// A verified page with semantic defects is worse than a missing one: it answers with
+// authority it cannot back. Health is recomputed live with the same validator the save
+// path uses, so a page fixed via Markdown sync drops off the board on the next read.
+// The detail names the specific missing declaration (e.g. contract.periodColumn), which
+// is what the acceptance criterion "指向具体页面与具体缺失声明" means.
+function pageHealthGaps({knowledgePages,columnsByTable}) {
+  const gaps=[];
+  for(const page of knowledgePages||[]) {
+    if(!page.verified)continue;
+    const result=validateKnowledgeSemantics(page,{columnsByTable});
+    if(result.semanticHealth==="ok")continue;
+    const issue=result.errors?.[0]||result.warnings?.[0]||null;
+    gaps.push({
+      key:`PAGE:${page.pageType}:${page.slug}`,
+      code:result.semanticHealth==="invalid"?"PAGE_SEMANTIC_INVALID":"PAGE_SEMANTIC_DEGRADED",
+      assetLabel:page.title,count:1,lastAskedAt:page.updatedAt||null,sampleQuestions:[],
+      detail:issue?`${issue.code}：${issue.message}`:null,
+      remedy:{action:"edit_knowledge_page",prefill:{pageType:page.pageType,slug:page.slug,title:page.title}},
+      status:"open",
+    });
+  }
+  return gaps;
 }
 
 function aggregateGaps(audits) {
@@ -107,7 +132,7 @@ function buildResolutionContext(store,sourceId) {
   const ontologyRecord=store.getPublishedOntologySchema?.(sourceId)||null;
   const termAnchors=store.listTermAnchors?.()||[];
   const filterConcepts=catalogFilterConcepts(tables,columnsByTable,ontologyRecord?.sourceId===sourceId?ontologyRecord.schema:null,termAnchors);
-  return {metricConcepts,filterConcepts};
+  return {metricConcepts,filterConcepts,knowledgePages,columnsByTable};
 }
 
 function gapStatus(gap,{metricConcepts,filterConcepts}) {
@@ -126,4 +151,4 @@ function gapStatus(gap,{metricConcepts,filterConcepts}) {
 
 function normalizeLabel(value) { return String(value||"").trim().toLowerCase().replace(/[\s“”"'‘’]+/g,""); }
 
-export const _internal={aggregateGaps,gapKey:(descriptor)=>descriptor.key,gapDescriptors,gapRemedy,gapStatus,failReasonFingerprint,buildResolutionContext};
+export const _internal={aggregateGaps,gapKey:(descriptor)=>descriptor.key,gapDescriptors,gapRemedy,gapStatus,failReasonFingerprint,buildResolutionContext,pageHealthGaps};

@@ -11,7 +11,7 @@ import { findKnowledgeOntologyMappingConflicts } from "./knowledge-column-refs.m
 import { probeZeroResult } from "./query-result-probe.mjs";
 import { normalizeQueryRow } from "./query-result-normalization.mjs";
 import { missingExhaustiveAccountProductColumns, missingExhaustiveAccountTables, missingIntentSubjectFacets, missingRequiredRetrievalFacets, queryIntentFilterError, queryResultContractValidation } from "./query-scope-coverage.mjs";
-import { applyGlobalRowDomainRules, buildIntentRetrievalQuestion, catalogFilterConcepts, knowledgeIntentConcepts, knowledgeIntentRowDomains, mergeContextualQueryIntent, parseQueryIntent } from "./query-intent.mjs";
+import { applyGlobalRowDomainRules, buildIntentRetrievalQuestion, catalogFilterConcepts, describeIntentFacets, knowledgeIntentConcepts, knowledgeIntentRowDomains, mergeContextualQueryIntent, parseQueryIntent } from "./query-intent.mjs";
 import { buildQueryResultContract, validateQueryRunSet } from "./query-result-contract.mjs";
 import { failureClassFor } from "./query-errors.mjs";
 import { QUERY_PROMPT_DEFAULTS, QUERY_PROMPT_VERSION, renderQueryPrompt } from "./query-prompts.mjs";
@@ -83,7 +83,7 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
     const proposalTerminal=await maybeProposeMetric({source,session,userName,userRole,question,context,missingRetrievalFacets,started,agentRollout,_skipMetricProposal,signal});
     if(proposalTerminal)return proposalTerminal;
     if(missingRetrievalFacets.length) {
-      const reason=`当前检索预算或已登记的表字段无法覆盖查询所需分面：${missingRetrievalFacets.join("、")}。系统不会用其他业务对象的表代替。`;
+      const reason=`当前检索预算或已登记的表字段无法覆盖查询所需能力：${describeIntentFacets(context.queryIntent,missingRetrievalFacets).join("、")}。系统不会用其他业务对象的表代替。`;
       store.addAudit({userName,sourceId,question,verdict:"refused",failReason:reason,durationMs:Date.now()-started,rowCount:0,planningMode:semanticRuntime.ok?"semantic":"legacy",semanticFallbackReason:semanticRuntime.ok?null:semanticRuntime.reason,failureClass:"schema_gap",...auditContext});
       return {refused:true,reason,failureClass:"schema_gap",missingFacets:missingRetrievalFacets,missingAssets:refusalMissingAssets(context.queryIntent,missingRetrievalFacets),sessionId:session.id};
     }
@@ -185,7 +185,7 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
       const missingProductColumns=rejected||missingSubjectFacets.length||missingAccountScopes.length?[]:missingExhaustiveAccountProductColumns(question,context,guarded.map((item)=>({sql:item.verdict.sql,tables:item.verdict.tables||[]})));
       if(rejected||missingSubjectFacets.length||missingAccountScopes.length||missingProductColumns.length) {
         const guardReason=missingSubjectFacets.length
-          ?`当前查询集合没有覆盖用户要求的业务对象分面：${missingSubjectFacets.join("、")}。必须补齐对应对象查询后再执行`
+          ?`当前查询集合没有覆盖用户要求的业务对象：${describeIntentFacets(context.queryIntent,missingSubjectFacets).join("、")}。必须补齐对应对象查询后再执行`
           :missingAccountScopes.length
           ?`问题要求查询所有账号，但当前查询遗漏账号主表：${missingAccountScopes.join("、")}。必须覆盖全部账号体系后再执行`
           :missingProductColumns.length?`问题要求查询所有账号，但当前结果没有返回产品维度：${missingProductColumns.join("、")}。必须保留产品标识且不能缩小为单一产品`
