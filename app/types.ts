@@ -55,6 +55,11 @@ export type DiscoveryTable = {
   comment:string|null; daysSinceWrite:number|null;
 };
 
+export type TableSelectionRow = {
+  tableName:string; rowEstimate:number; comment:string|null;
+  included:number|boolean; decidedBy:string|null; probed:boolean; grade:"A"|"B"|"C"|null;
+};
+
 export type DiscoverySummary = {
   sourceId:number; tables:DiscoveryTable[]; totalTables:number;
   grades:{A:number;B:number;C:number}; sensitiveFields:number; relations:number; pendingQuestions:number;

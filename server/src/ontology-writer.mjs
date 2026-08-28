@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const DIRS = ["tables", "terms", "metrics", "joins", "rules"];
@@ -16,6 +16,14 @@ export async function ensureOntologyStructure(root) {
 | joins/ | join | from, to, cardinality, verified |
 | rules/ | rule | tables, verified, SQL 片段 |
 `, false);
+}
+
+// An excluded table's page is deleted even if a human marked it verified: exclusion means
+// the table left the platform's world, and a verified page for a nonexistent table would
+// keep feeding retrieval with dead references.
+export async function removeTablePage(root, tableName) {
+  try { await unlink(join(root, "tables", `${safeFileName(tableName)}.md`)); return { removed:true }; }
+  catch (error) { if (error.code === "ENOENT") return { removed:false }; throw error; }
 }
 
 export async function writeTablePage(root, table, columns, enums = [], relations = []) {

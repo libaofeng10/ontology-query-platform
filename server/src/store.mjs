@@ -10,6 +10,11 @@ const SCHEMA = [
     last_test_at TEXT, last_test_ok INTEGER, last_test_error TEXT, last_discovery_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
+  `CREATE TABLE IF NOT EXISTS ds_table_selection (
+    source_id INTEGER NOT NULL, table_name TEXT NOT NULL, included INTEGER NOT NULL DEFAULT 1,
+    decided_by TEXT, decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(source_id, table_name)
+  )`,
   `CREATE TABLE IF NOT EXISTS ds_table (
     source_id INTEGER NOT NULL, table_name TEXT NOT NULL, row_estimate INTEGER DEFAULT 0,
     grade TEXT, grade_override TEXT, active INTEGER DEFAULT 1, last_probe_at TEXT, comment TEXT,
@@ -394,6 +399,38 @@ export function createStore(dbPath) {
     },
     listTables: (sourceId) => db.prepare(`SELECT source_id AS sourceId, table_name AS tableName, row_estimate AS rowEstimate, grade, grade_override AS gradeOverride, active, last_probe_at AS lastProbeAt, comment, days_since_write AS daysSinceWrite FROM ds_table WHERE source_id=? AND present=1 ORDER BY CASE grade WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 3 END, table_name`).all(sourceId),
     setTableGrade(sourceId, tableName, grade) { return db.prepare(`UPDATE ds_table SET grade=?,grade_override=?,active=? WHERE source_id=? AND table_name=?`).run(grade,grade,grade==="C"?0:1,sourceId,tableName).changes; },
+    // Table selection is decided BEFORE probing: excluded tables never get a probe, never
+    // enter ds_table, and therefore never surface anywhere downstream. Unlike grade C
+    // (a quality judgment on a probed table), exclusion is a scope decision — the table
+    // does not belong to this platform's world at all.
+    listTableSelections: (sourceId) => db.prepare(`SELECT table_name AS tableName, included, decided_by AS decidedBy, decided_at AS decidedAt FROM ds_table_selection WHERE source_id=? ORDER BY table_name`).all(sourceId),
+    excludedTableNames: (sourceId) => new Set(db.prepare(`SELECT table_name AS tableName FROM ds_table_selection WHERE source_id=? AND included=0`).all(sourceId).map((row)=>row.tableName)),
+    saveTableSelections(sourceId, selections, decidedBy=null) {
+      const upsert=db.prepare(`INSERT INTO ds_table_selection (source_id,table_name,included,decided_by,decided_at) VALUES (?,?,?,?,CURRENT_TIMESTAMP)
+        ON CONFLICT(source_id,table_name) DO UPDATE SET included=excluded.included, decided_by=excluded.decided_by, decided_at=CURRENT_TIMESTAMP`);
+      db.transaction(()=>{ for(const item of selections) upsert.run(sourceId,item.tableName,item.included?1:0,decidedBy); })();
+      return selections.length;
+    },
+    // Excluding an already-probed table must erase it from the platform's world, not merely
+    // hide it: probed metadata (columns, enum values, relations, questions) would otherwise
+    // keep resurfacing through every consumer that reads those tables directly.
+    purgeExcludedTables(sourceId) {
+      const excluded=db.prepare(`SELECT table_name AS tableName FROM ds_table_selection WHERE source_id=? AND included=0`).all(sourceId).map((row)=>row.tableName);
+      let removed=0;
+      db.transaction(()=>{
+        for(const tableName of excluded) {
+          const gone=db.prepare(`DELETE FROM ds_table WHERE source_id=? AND table_name=?`).run(sourceId,tableName).changes;
+          if(!gone)continue;
+          removed++;
+          db.prepare(`DELETE FROM ds_column WHERE source_id=? AND table_name=?`).run(sourceId,tableName);
+          db.prepare(`DELETE FROM ds_column_profile WHERE source_id=? AND table_name=?`).run(sourceId,tableName);
+          db.prepare(`DELETE FROM ds_enum WHERE source_id=? AND table_name=?`).run(sourceId,tableName);
+          db.prepare(`UPDATE ds_relation SET present=0 WHERE source_id=? AND (from_table=? OR to_table=?)`).run(sourceId,tableName,tableName);
+          db.prepare(`UPDATE ds_question SET status='obsolete',answered_at=CURRENT_TIMESTAMP WHERE source_id=? AND status='pending' AND table_name=?`).run(sourceId,tableName);
+        }
+      })();
+      return removed;
+    },
     listColumns(sourceId,tableName) {
       const profiles=new Map(this.listColumnProfiles(sourceId,tableName).map((profile)=>[profile.columnName,profile]));
       return db.prepare(`SELECT source_id AS sourceId,table_name AS tableName,column_name AS columnName,data_type AS dataType,nullable,null_rate AS nullRate,cardinality,is_sensitive AS isSensitive,comment,is_primary AS isPrimary,is_unique AS isUnique,is_indexed AS isIndexed FROM ds_column WHERE source_id=? AND table_name=? AND present=1 ORDER BY rowid`).all(sourceId,tableName).map((column)=>({...column,profile:profiles.get(column.columnName)||null}));

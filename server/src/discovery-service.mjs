@@ -5,7 +5,7 @@ import { createRelationModelService } from "./relation-model-service.mjs";
 import { detectSensitiveField } from "./sensitive-fields.mjs";
 import { generateEnumMeaningQuestions } from "./enum-meaning-candidates.mjs";
 import { gradeTable } from "./table-grading.mjs";
-import { writeJoinPage, writeRulePage, writeTablePage } from "./ontology-writer.mjs";
+import { removeTablePage, writeJoinPage, writeRulePage, writeTablePage } from "./ontology-writer.mjs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
@@ -31,6 +31,16 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
 
     emit(onProgress,5,"读取 INFORMATION_SCHEMA");
     const schema=await introspectSchema(connector,source);
+    // Scope decision happens before anything else sees the schema: excluded tables are cut
+    // from tables, columns AND foreign keys here, so the probe, the relation candidates, the
+    // snapshot and the question generators all operate on a world where they don't exist.
+    const excluded=store.excludedTableNames(source.id);
+    if(excluded.size) {
+      schema.tables=schema.tables.filter((table)=>!excluded.has(table.tableName));
+      schema.columns=schema.columns.filter((column)=>!excluded.has(column.tableName));
+      schema.foreignKeys=schema.foreignKeys.filter((fk)=>!excluded.has(fk.fromTable)&&!excluded.has(fk.toTable));
+      store.purgeExcludedTables(source.id);
+    }
     const normalized=normalizeSchema(schema);
     const schemaDiff=compareSchema(store.getLatestSchemaSnapshot(source.id)?.schema,normalized);
     const inbound=new Map();
@@ -137,9 +147,30 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     return {...summary(source.id),schemaDiff:{...schemaDiff,currentVersion:snapshot.currentVersion}};
   }
 
+  // Lists every base table in the source database with its current selection state, without
+  // probing anything — this is what the user reviews BEFORE discovery runs. Demo sources have
+  // no live information_schema; their world is whatever the seed already registered.
+  async function previewTables(source) {
+    const selections=new Map(store.listTableSelections(source.id).map((item)=>[item.tableName,item]));
+    const known=new Map(store.listTables(source.id).map((table)=>[table.tableName,table]));
+    const rows=source.isDemo
+      ? store.listTables(source.id).map((table)=>({tableName:table.tableName,rowEstimate:table.rowEstimate,comment:table.comment}))
+      : (await introspectSchema(connector,source)).tables;
+    return rows.map((row)=>({
+      tableName:row.tableName,
+      rowEstimate:Number(row.rowEstimate)||0,
+      comment:row.comment||null,
+      included:selections.get(row.tableName)?.included??1,
+      decidedBy:selections.get(row.tableName)?.decidedBy??null,
+      probed:known.has(row.tableName),
+      grade:known.get(row.tableName)?.grade??null,
+    }));
+  }
+
   async function writeOntology(sourceId) {
     const sourceWikiDir=join(wikiDir,`source-${Number(sourceId)}`);
     const relations=store.listRelations(sourceId);
+    for(const tableName of store.excludedTableNames(sourceId)) await removeTablePage(sourceWikiDir,tableName);
     for(const table of store.listTables(sourceId)) {
       if(table.grade==="C") continue;
       await writeTablePage(sourceWikiDir,table,store.listColumns(sourceId,table.tableName),store.listEnums(sourceId,table.tableName),relations.filter((r)=>r.fromTable===table.tableName||r.toTable===table.tableName));
@@ -156,7 +187,7 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
 
   function demoSchema(sourceId) { const tables=store.listTables(sourceId); return normalizeSchema({tables,columns:tables.flatMap((table)=>store.listColumns(sourceId,table.tableName)),foreignKeys:store.listRelations(sourceId).map((item)=>({...item}))}); }
   function saveSnapshot(sourceId,schema,knownDiff=null) { const previous=store.getLatestSchemaSnapshot(sourceId); const checksum=checksumSchema(schema); const diff=knownDiff||compareSchema(previous?.schema,schema); if(!previous||previous.checksum!==checksum) { const saved=store.addSchemaSnapshot(sourceId,checksum,schema); return {...diff,previousVersion:previous?.version??null,currentVersion:saved.version}; } return {...diff,previousVersion:previous?.version??null,currentVersion:previous.version}; }
-  return {discover,summary,writeOntology};
+  return {discover,summary,writeOntology,previewTables};
 }
 
 function emit(callback,progress,currentStep) { callback({progress,total:100,currentStep}); }
