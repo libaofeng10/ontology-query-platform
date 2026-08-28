@@ -425,7 +425,7 @@ async function buildContext(store,sourceId,question,priorContext={},deps={}) {
   const ontologySchema=ontologyRecord?.sourceId===sourceId?ontologyRecord.schema:null;
   const enumItemsByColumn={};
   for(const table of allTables)for(const item of store.listEnums(sourceId,table.tableName))if(item.value!=="null")(enumItemsByColumn[`${table.tableName}.${item.columnName}`]??=[]).push(item);
-  let filterConcepts=catalogFilterConcepts(allTables,allColumns,ontologySchema,termAnchors);
+  let filterConcepts=catalogFilterConcepts(allTables,allColumns,ontologySchema,termAnchors,enumItemsByColumn);
   if(followUp&&trustedPriorTables.length)filterConcepts=contextualizeFilterConcepts(filterConcepts,trustedPriorTables);
   const rowDomainConcepts=knowledgeIntentRowDomains(knowledgePages,allColumns);
   const parseOptions={concepts:intentConcepts,filterConcepts,rowDomainConcepts:rowDomainConcepts.filter((item)=>item.activationPolicy!=="global_table"),protectedTermAliases:knowledgePages.filter((page)=>page.verified&&new Set(["term","rule"]).has(page.pageType)&&page.activationPolicy!=="global_table").flatMap((page)=>[page.title,...(page.aliases||[])]).filter(Boolean)};

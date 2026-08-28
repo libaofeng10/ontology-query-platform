@@ -7,7 +7,7 @@
 // confirmation it demands; before this module it demanded confirmations it had
 // never asked anyone for.
 
-const PAIR_PATTERN=/(-?\d+)\s*[:：、.．=\-]\s*([^\s:：;；,，|/]{1,24})/g;
+const PAIR_PATTERN=/(-?\d+)\s*[:：、.．=-]\s*([^\s:：;；,，|/]{1,24})/g;
 
 // A mapping is only credible when the comment is mostly mappings: a sentence that
 // happens to contain "限额 5000:元" should not become a dictionary.

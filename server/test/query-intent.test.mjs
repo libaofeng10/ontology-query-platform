@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyIntentClarification, buildIntentRetrievalQuestion, DEFAULT_BUSINESS_TIME_ZONE, knowledgeIntentConcepts, knowledgeIntentRowDomains, mergeContextualQueryIntent, parseQueryIntent, queryIntentSqlErrors } from "../src/query-intent.mjs";
+import { applyIntentClarification, buildIntentRetrievalQuestion, catalogFilterConcepts, DEFAULT_BUSINESS_TIME_ZONE, knowledgeIntentConcepts, knowledgeIntentRowDomains, mergeContextualQueryIntent, parseQueryIntent, queryIntentSqlErrors } from "../src/query-intent.mjs";
 
 test("relative calendar ranges use an explicit validated business time zone at the month boundary",()=>{
   const instant=new Date("2026-08-31T16:30:00.000Z");
@@ -459,4 +459,58 @@ test("同比 intent carries an explicit baseline window instead of degrading to 
   assert.deepEqual(merged.timeRange,{kind:"current_week",sourceText:"本周",start:"2026-08-24",endExclusive:"2026-08-31"});
   assert.deepEqual(merged.comparisonRange,{kind:"comparison_year_over_year",sourceText:"同比基准期",start:"2025-08-24",endExclusive:"2025-08-31"});
   assert.equal(merged.ambiguities.some((item)=>item.code==="COMPARISON_BASELINE_UNKNOWN"),false);
+});
+
+// T6: an operator-less “抖音渠道” is provable when 抖音 is a registered member of
+// that field's dictionary. Before this, the parser never recognized the phrasing
+// and the filter never reached the binding layer that resolves 抖音 to its code.
+const CHANNEL_TABLES=[{tableName:"clue",comment:"线索表"}];
+const CHANNEL_COLUMNS={clue:[
+  {columnName:"id",dataType:"bigint",isPrimary:1},
+  {columnName:"source_data_channel",dataType:"tinyint",comment:"数据来源"},
+  {columnName:"owner_cell",dataType:"varchar",comment:"负责人手机号",isSensitive:1},
+]};
+const CHANNEL_ENUMS={"clue.source_data_channel":[
+  {value:"0",meaning:"百度",meaningSource:"human"},
+  {value:"2",meaning:"抖音",meaningSource:"human"},
+  {value:"3",meaning:null,meaningSource:null},
+]};
+
+function channelConcepts(enums=CHANNEL_ENUMS) {
+  return catalogFilterConcepts(CHANNEL_TABLES,CHANNEL_COLUMNS,null,[],enums);
+}
+
+test("a confirmed enum meaning becomes parser vocabulary, and only a confirmed one",()=>{
+  const concept=channelConcepts().find((item)=>item.aliases[0]==="数据来源");
+  assert.deepEqual(concept.memberValues,["抖音","百度"],"未确认含义的取值 3 不得进入词表");
+
+  // A sensitive column contributes its field surface but never its values.
+  const sensitive=channelConcepts({"clue.owner_cell":[{value:"老王的客户",meaning:null,meaningSource:null}]}).find((item)=>item.aliases[0]==="负责人手机号");
+  assert.deepEqual(sensitive.memberValues,[],"敏感列的取值不得成为解析词表");
+});
+
+test("an operator-less member value parses into a declared filter instead of a rejection",()=>{
+  const filterConcepts=channelConcepts();
+  const intent=parseQueryIntent("本月抖音数据来源的线索数量",{now:new Date(2026,7,25),filterConcepts});
+  assert.deepEqual(intent.filters.map((item)=>[item.operator,item.value]),[["eq","抖音"]]);
+  assert.deepEqual(intent.filters[0].physicalColumns,["clue.source_data_channel"]);
+  assert.equal(intent.ambiguities.some((item)=>String(item.code).startsWith("FILTER_")),false,"闭集内可证的筛选不得再产生筛选类歧义");
+
+  // Field-first phrasing is the same proof.
+  assert.deepEqual(parseQueryIntent("数据来源抖音的线索数量",{filterConcepts}).filters.map((item)=>item.value),["抖音"]);
+
+  // The production shape: “渠道” is a static field concept with no dictionary of
+  // its own — membership licenses the adjacency, and the binding layer proves
+  // (or fails closed on) the actual column pairing.
+  const channel=parseQueryIntent("本月抖音渠道的线索数量",{now:new Date(2026,7,25),filterConcepts});
+  assert.deepEqual(channel.filters.map((item)=>[item.field,item.operator,item.value]),[["channel","eq","抖音"]]);
+});
+
+test("a value outside the dictionary is still refused rather than guessed",()=>{
+  const filterConcepts=channelConcepts();
+  const intent=parseQueryIntent("本月快手数据来源的线索数量",{now:new Date(2026,7,25),filterConcepts});
+  assert.deepEqual(intent.filters,[],"词表外的值不得被猜成等值筛选");
+
+  // An explicit operator keeps its own normalization path and its own value.
+  assert.deepEqual(parseQueryIntent("数据来源为抖音的线索数量",{filterConcepts}).filters.map((item)=>[item.operator,item.value]),[["eq","抖音"]]);
 });

@@ -180,15 +180,24 @@ export function knowledgeIntentConcepts(pages=[],columnsByTable={}) {
 // field candidates before the intent is frozen.  The parser still records a
 // business field surface, while physicalColumns remains proof supplied by the
 // published catalog rather than a name guessed later by the model.
-export function catalogFilterConcepts(tables=[],columnsByTable={},ontologySchema=null,termAnchors=[]) {
+export function catalogFilterConcepts(tables=[],columnsByTable={},ontologySchema=null,termAnchors=[],enumItemsByColumn={}) {
   const groups=new Map();
   const tableByName=new Map((tables||[]).map((table)=>[table.tableName,table]));
   const subjectLabels={clue:"线索",account:"账号",customer:"客户",order:"订单",case:"案件",revenue:"收入"};
-  const add=(alias,column,{numeric=false,provenance="catalog",semanticKind=null}={})=>{
+  const dictionaryByColumn=new Map(Object.entries(enumItemsByColumn||{}).map(([column,items])=>[String(column).toLowerCase(),items||[]]));
+  const add=(alias,column,{numeric=false,provenance="catalog",semanticKind=null,sensitive=false}={})=>{
     const surface=String(alias||"").trim();const physical=String(column||"").toLowerCase();
     if(!surface||surface.length>64||!physical.includes(".")||/^[\p{P}\p{S}\s]+$/u.test(surface))return;
-    const key=normalizeText(surface);const group=groups.get(key)||{alias:surface,columns:new Set(),terms:new Set(),numericStates:new Set(),semanticKinds:new Set(),provenance:new Set()};
+    const key=normalizeText(surface);const group=groups.get(key)||{alias:surface,columns:new Set(),terms:new Set(),numericStates:new Set(),semanticKinds:new Set(),provenance:new Set(),memberValues:new Map()};
     group.columns.add(physical);group.terms.add(surface);group.terms.add(physical);group.terms.add(physical.split(".").at(-1));group.numericStates.add(Boolean(numeric));if(semanticKind)group.semanticKinds.add(semanticKind);group.provenance.add(provenance);groups.set(key,group);
+    // A dictionary harvested from a sensitive column would turn real personal
+    // values into parser vocabulary, so those columns contribute a field surface
+    // only — never members.
+    if(sensitive)return;
+    for(const member of dictionaryMemberSurfaces(dictionaryByColumn.get(physical))) {
+      const memberKey=normalizeText(member);
+      if(memberKey&&!group.memberValues.has(memberKey)&&group.memberValues.size<MEMBER_VALUE_LIMIT)group.memberValues.set(memberKey,member);
+    }
   };
   for(const [tableName,columns] of Object.entries(columnsByTable||{})) {
     const table=tableByName.get(tableName)||{tableName,comment:""};
@@ -200,12 +209,13 @@ export function catalogFilterConcepts(tables=[],columnsByTable={},ontologySchema
       // fields are intentionally not promoted into generic filter concepts.
       if(column?.isSensitive&&!semanticKind)continue;
       const physical=`${tableName}.${column.columnName}`;const numeric=numericDataType(column.dataType);
-      add(column.columnName,physical,{numeric,semanticKind});
-      for(const alias of typedKindAliases(semanticKind))add(alias,physical,{numeric:false,semanticKind});
+      const sensitive=Boolean(column?.isSensitive);
+      add(column.columnName,physical,{numeric,semanticKind,sensitive});
+      for(const alias of typedKindAliases(semanticKind))add(alias,physical,{numeric:false,semanticKind,sensitive});
       const comment=String(column.comment||"").trim();
       if(comment) {
-        add(comment,physical,{numeric,semanticKind});
-        for(const subject of tableSubjects)if(subjectLabels[subject]&&!normalizeText(comment).startsWith(subjectLabels[subject]))add(`${subjectLabels[subject]}${comment}`,physical,{numeric,semanticKind});
+        add(comment,physical,{numeric,semanticKind,sensitive});
+        for(const subject of tableSubjects)if(subjectLabels[subject]&&!normalizeText(comment).startsWith(subjectLabels[subject]))add(`${subjectLabels[subject]}${comment}`,physical,{numeric,semanticKind,sensitive});
       }
     }
   }
@@ -217,7 +227,7 @@ export function catalogFilterConcepts(tables=[],columnsByTable={},ontologySchema
     const aliases=[property.displayName,property.apiName];
     const binding=property.termBinding;const anchor=binding?anchors.get(`${binding.vocabulary}\u0000${binding.canonicalId}`):null;
     aliases.push(anchor?.prefLabelZh,anchor?.prefLabelEn,...(anchor?.altLabels||[]));
-    for(const alias of aliases.filter(Boolean))add(alias,`${table}.${column}`,{numeric:numericDataType(metadata?.dataType),semanticKind:typedColumnKind(metadata),provenance:"published_ontology_property"});
+    for(const alias of aliases.filter(Boolean))add(alias,`${table}.${column}`,{numeric:numericDataType(metadata?.dataType),semanticKind:typedColumnKind(metadata),provenance:"published_ontology_property",sensitive:Boolean(metadata?.isSensitive)});
   }
   return [...groups.values()].map((group)=>{
     const fallback=`catalog_${safeConceptId(group.alias)}`;
@@ -230,10 +240,37 @@ export function catalogFilterConcepts(tables=[],columnsByTable={},ontologySchema
       physicalColumns:[...group.columns].sort(),
       numeric:categorical?false:group.numericStates.size===1?[...group.numericStates][0]:null,
       semanticKind:group.semanticKinds.size===1?[...group.semanticKinds][0]:null,
+      memberValues:[...group.memberValues.values()].sort(),
       provenance:[...group.provenance].sort(),
     };
   });
 }
+
+// The dictionary surfaces a person can actually type. A human-confirmed meaning
+// ("抖音") is the surface for a coded value; a raw value is only its own surface
+// when it is textual, because "2渠道" is not language anybody uses and admitting
+// it would make the parser guess. Unconfirmed meanings are excluded on purpose:
+// column comments go stale, and meaning_source is the level the binding layer
+// trusts. Mirrors knowledge-retrieval.mjs's verifiedEnumMeaning gate; kept local
+// to avoid coupling the parser to the retrieval module.
+const TRUSTED_MEANING_SOURCE=/^(?:verified|manual|human|user|ontology|knowledge|reviewed|confirmed)$/i;
+const MEMBER_VALUE_LIMIT=200;
+
+function dictionaryMemberSurfaces(items=[]) {
+  const surfaces=[];
+  for(const item of items||[]) {
+    const raw=String(item?.value??"").trim();
+    if(!raw||raw.toLowerCase()==="null")continue;
+    const meaning=String(item?.meaning||"").trim();
+    const surface=meaning&&TRUSTED_MEANING_SOURCE.test(String(item?.meaningSource||""))?meaning
+      :/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(raw)?null:raw;
+    if(!surface||[...surface].length>24||/^[\p{P}\p{S}\s]+$/u.test(surface))continue;
+    surfaces.push(surface);
+  }
+  return surfaces;
+}
+
+function conceptMemberValues(concept) {return Array.isArray(concept?.memberValues)?concept.memberValues:[];}
 
 function typedColumnKind(column={}) {
   const text=`${column.columnName||""} ${column.comment||""}`;
@@ -880,6 +917,31 @@ function detectBusinessFilters(value,{subjects=[],concepts=[],protectedTermAlias
     add(match,operator,numericValue?"number":"string",rawValue);
   }
 
+  // “抖音渠道的线索” omits the operator, yet the phrasing is provable when the
+  // value is a registered dictionary member — an observed textual value or a
+  // human-confirmed enum meaning. Membership licenses only the adjacency: the
+  // closed set decides whether the word is a value at all, while pairing it with
+  // this particular field is proven downstream by the filter binding layer, which
+  // fails closed when no ranked column carries the member. Anything outside the
+  // set falls through to the rejections below, so this never becomes a generic
+  // value-to-column guessing channel.
+  const memberSurfaces=[...new Set(aliases.flatMap(({concept})=>conceptMemberValues(concept)))].filter((surface)=>!aliasMap.has(normalizeText(surface))).sort((left,right)=>right.length-left.length||left.localeCompare(right));
+  if(memberSurfaces.length) {
+    const memberPattern=memberSurfaces.map(escapeRegExp).join("|");
+    const addMember=(match,aliasIndex,valueIndex)=>{
+      const start=match.index;const end=start+match[0].length;
+      if(overlaps(start,end)||protectedTermOverlap(start,end))return;
+      const concept=conceptFor(match[aliasIndex]);
+      if(!concept||concept.numeric===true)return;
+      const synthetic=[match[0],match[aliasIndex]];synthetic.index=start;
+      add(synthetic,"eq","string",String(match[valueIndex]).trim());
+    };
+    const memberValueFirst=new RegExp(`(${memberPattern})\\s*(${aliasPattern})${delimiterPattern}`,"giu");
+    for(const match of text.matchAll(memberValueFirst))addMember(match,2,1);
+    const memberFieldFirst=new RegExp(`(${aliasPattern})\\s*(${memberPattern})${delimiterPattern}`,"giu");
+    for(const match of text.matchAll(memberFieldFirst))addMember(match,1,2);
+  }
+
   const implicitValues="有效|无效|成功|失败|启用|禁用|开启|关闭|正常|异常|已激活|未激活|已支付|未支付";
   const fieldFirst=new RegExp(`(${aliasPattern})\\s*(${implicitValues})${delimiterPattern}`,"giu");
   for(const match of text.matchAll(fieldFirst))if(!overlaps(match.index,match.index+match[0].length)) {
@@ -955,7 +1017,7 @@ function filterAmbiguity(code,sourceText,message,{field=null,filterCandidate=nul
   return {code,message,blocking:true,sourceText,field,...(filterCandidate?{filterCandidate}:{}),options:["改为单个明确的字段等值筛选","改为明确的数值上限或下限","拆分为多个独立问题"]};
 }
 
-function frozenFilterCandidate(concept,alias,field) {return {value:concept.value||field,fieldId:concept.fieldId||field,aliases:[String(alias||"")],terms:[...(concept.terms||[])],physicalColumns:[...(concept.physicalColumns||[])],numeric:concept.numeric??null,semanticKind:concept.semanticKind||null,provenance:[...(concept.provenance||[])]};}
+function frozenFilterCandidate(concept,alias,field) {return {value:concept.value||field,fieldId:concept.fieldId||field,aliases:[String(alias||"")],terms:[...(concept.terms||[])],physicalColumns:[...(concept.physicalColumns||[])],numeric:concept.numeric??null,semanticKind:concept.semanticKind||null,memberValues:[...conceptMemberValues(concept)],provenance:[...(concept.provenance||[])]};}
 
 function filterFieldIdentity(alias,fallback="attribute") {
   const mappings=[
