@@ -273,6 +273,8 @@ const MIGRATIONS = [
   `ALTER TABLE ds_relation ADD COLUMN structural_score REAL`,
   `ALTER TABLE ds_relation ADD COLUMN structural_reason TEXT`,
   `ALTER TABLE ds_relation ADD COLUMN evaluated_at TEXT`,
+  `ALTER TABLE ds_knowledge_page ADD COLUMN contract_json TEXT`,
+  `ALTER TABLE ds_knowledge_page ADD COLUMN semantic_health TEXT`,
   `ALTER TABLE ds_question ADD COLUMN relation_id INTEGER`,
   `ALTER TABLE ds_question ADD COLUMN enum_value TEXT`,
   `ALTER TABLE ds_audit ADD COLUMN planning_mode TEXT`,
@@ -455,13 +457,13 @@ export function createStore(dbPath) {
     listAudits: (sourceId, limit=100) => db.prepare(`SELECT id,user_name AS userName,question,retrieved_pages AS retrievedPages,sql_text AS sql,verdict,fail_reason AS failReason,duration_ms AS durationMs,row_count AS rowCount,planning_mode AS planningMode,query_plan_json AS queryPlanJson,ontology_schema_version AS ontologySchemaVersion,semantic_path_json AS semanticPathJson,semantic_fallback_reason AS semanticFallbackReason,planning_attempts AS planningAttempts,iterations,clarification_count AS clarificationCount,tool_trace_json AS toolTraceJson,intent_version AS intentVersion,intent_json AS intentJson,prompt_version AS promptVersion,retrieval_trace_json AS retrievalTraceJson,failure_class AS failureClass,created_at AS createdAt FROM ds_audit WHERE (? IS NULL OR source_id=?) ORDER BY id DESC LIMIT ?`).all(sourceId,sourceId,limit).map((row)=>({...row,queryPlan:safeJson(row.queryPlanJson,null),semanticPath:safeJson(row.semanticPathJson,null),toolTrace:safeJson(row.toolTraceJson,[]),intent:safeJson(row.intentJson,null),retrievalTrace:safeJson(row.retrievalTraceJson,null)})),
     auditStats(sourceId) { return db.prepare(`SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN verdict='passed' THEN 1 ELSE 0 END),0) AS passed, COALESCE(SUM(CASE WHEN verdict IN ('refused','failed') THEN 1 ELSE 0 END),0) AS blocked, COALESCE(AVG(duration_ms),0) AS averageMs FROM ds_audit WHERE source_id=?`).get(sourceId); },
     upsertKnowledge(page) {
-      db.prepare(`INSERT INTO ds_knowledge_page(source_id,page_type,slug,title,aliases,tables_json,content,sql_content,anti_examples,verified,owner,verified_at,file_path,checksum)
-        VALUES(@sourceId,@pageType,@slug,@title,@aliases,@tablesJson,@content,@sqlContent,@antiExamples,@verified,@owner,@verifiedAt,@filePath,@checksum)
-        ON CONFLICT(source_id,page_type,slug) DO UPDATE SET title=excluded.title,aliases=excluded.aliases,tables_json=excluded.tables_json,content=excluded.content,sql_content=excluded.sql_content,anti_examples=excluded.anti_examples,verified=excluded.verified,owner=excluded.owner,verified_at=excluded.verified_at,file_path=excluded.file_path,checksum=excluded.checksum,updated_at=CURRENT_TIMESTAMP`).run({aliases:"[]",tablesJson:"[]",content:"",sqlContent:null,antiExamples:null,verified:0,owner:null,verifiedAt:null,filePath:null,checksum:null,...page});
+      db.prepare(`INSERT INTO ds_knowledge_page(source_id,page_type,slug,title,aliases,tables_json,content,sql_content,anti_examples,verified,owner,verified_at,file_path,checksum,contract_json,semantic_health)
+        VALUES(@sourceId,@pageType,@slug,@title,@aliases,@tablesJson,@content,@sqlContent,@antiExamples,@verified,@owner,@verifiedAt,@filePath,@checksum,@contractJson,@semanticHealth)
+        ON CONFLICT(source_id,page_type,slug) DO UPDATE SET title=excluded.title,aliases=excluded.aliases,tables_json=excluded.tables_json,content=excluded.content,sql_content=excluded.sql_content,anti_examples=excluded.anti_examples,verified=excluded.verified,owner=excluded.owner,verified_at=excluded.verified_at,file_path=excluded.file_path,checksum=excluded.checksum,contract_json=excluded.contract_json,semantic_health=excluded.semantic_health,updated_at=CURRENT_TIMESTAMP`).run({aliases:"[]",tablesJson:"[]",content:"",sqlContent:null,antiExamples:null,verified:0,owner:null,verifiedAt:null,filePath:null,checksum:null,contractJson:null,semanticHealth:null,...page});
       return this.getKnowledge(page.sourceId,page.pageType,page.slug);
     },
-    listKnowledge(sourceId) { return db.prepare(`SELECT id,source_id AS sourceId,page_type AS pageType,slug,title,aliases,tables_json AS tablesJson,content,sql_content AS sqlContent,anti_examples AS antiExamples,verified,owner,verified_at AS verifiedAt,file_path AS filePath,checksum,created_at AS createdAt,updated_at AS updatedAt FROM ds_knowledge_page WHERE source_id=? ORDER BY CASE page_type WHEN 'term' THEN 1 WHEN 'metric' THEN 2 WHEN 'rule' THEN 3 WHEN 'join' THEN 4 ELSE 5 END,verified DESC,title`).all(sourceId).map(parseKnowledge); },
-    getKnowledge(sourceId,pageType,slug) { const row=db.prepare(`SELECT id,source_id AS sourceId,page_type AS pageType,slug,title,aliases,tables_json AS tablesJson,content,sql_content AS sqlContent,anti_examples AS antiExamples,verified,owner,verified_at AS verifiedAt,file_path AS filePath,checksum,created_at AS createdAt,updated_at AS updatedAt FROM ds_knowledge_page WHERE source_id=? AND page_type=? AND slug=?`).get(sourceId,pageType,slug); return row?parseKnowledge(row):null; },
+    listKnowledge(sourceId) { return db.prepare(`SELECT id,source_id AS sourceId,page_type AS pageType,slug,title,aliases,tables_json AS tablesJson,content,sql_content AS sqlContent,anti_examples AS antiExamples,verified,owner,verified_at AS verifiedAt,file_path AS filePath,checksum,contract_json AS contractJson,semantic_health AS semanticHealth,created_at AS createdAt,updated_at AS updatedAt FROM ds_knowledge_page WHERE source_id=? ORDER BY CASE page_type WHEN 'term' THEN 1 WHEN 'metric' THEN 2 WHEN 'rule' THEN 3 WHEN 'join' THEN 4 ELSE 5 END,verified DESC,title`).all(sourceId).map(parseKnowledge); },
+    getKnowledge(sourceId,pageType,slug) { const row=db.prepare(`SELECT id,source_id AS sourceId,page_type AS pageType,slug,title,aliases,tables_json AS tablesJson,content,sql_content AS sqlContent,anti_examples AS antiExamples,verified,owner,verified_at AS verifiedAt,file_path AS filePath,checksum,contract_json AS contractJson,semantic_health AS semanticHealth,created_at AS createdAt,updated_at AS updatedAt FROM ds_knowledge_page WHERE source_id=? AND page_type=? AND slug=?`).get(sourceId,pageType,slug); return row?parseKnowledge(row):null; },
     deleteKnowledge(sourceId,pageType,slug) { return db.prepare(`DELETE FROM ds_knowledge_page WHERE source_id=? AND page_type=? AND slug=?`).run(sourceId,pageType,slug).changes; },
     listEvalCases(sourceId) { return db.prepare(`SELECT id,set_name AS setName,question,CASE WHEN held_out=1 THEN NULL ELSE gold_sql END AS goldSql,CASE WHEN gold_sql IS NULL OR gold_sql='' THEN 0 ELSE 1 END AS hasGoldSql,category,held_out AS heldOut FROM ds_eval WHERE source_id=? AND active=1 ORDER BY id`).all(sourceId); },
     getEvalCase(id) { return db.prepare(`SELECT id,source_id AS sourceId,set_name AS setName,question,gold_sql AS goldSql,category,held_out AS heldOut,active FROM ds_eval WHERE id=?`).get(id); },
@@ -750,7 +752,9 @@ export function createStore(dbPath) {
 }
 
 function parseKnowledge(row) {
-  const {tablesJson,...page}=row;return {...page,aliases:safeJson(row.aliases,[]),tables:safeJson(tablesJson,[]),verified:Boolean(row.verified)};
+  const {tablesJson,contractJson,...page}=row;
+  const contract=safeJson(contractJson,null);
+  return {...page,aliases:safeJson(row.aliases,[]),tables:safeJson(tablesJson,[]),verified:Boolean(row.verified),...(contract&&typeof contract==="object"?{contract}:{})};
 }
 
 function parseRelationDoc(row) { const {assertionsJson,...doc}=row;return {...doc,assertions:safeJson(assertionsJson,[])}; }

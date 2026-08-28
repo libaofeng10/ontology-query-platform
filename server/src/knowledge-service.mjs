@@ -38,7 +38,7 @@ export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
     const temp=`${file}.tmp-${process.pid}-${Date.now()}`;
     await writeFile(temp,markdown,"utf8");
     await rename(temp,file);
-    const saved=store.upsertKnowledge({...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),filePath:file,checksum});
+    const saved=store.upsertKnowledge({...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),contractJson:page.contract?JSON.stringify(page.contract):null,filePath:file,checksum});
     embeddingIndex?.ensurePageEmbedding(sourceId,saved).catch(()=>{});
     return saved;
   }
@@ -63,7 +63,7 @@ export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
           const input={...parsed,pageType,slug:entry.name.slice(0,-3),owner:parsed.meta.owner,verifiedAt:parsed.meta.verified_at};
           const page=validatePage(sourceId,input);const checksum=createHash("sha256").update(markdown).digest("hex");const existing=store.getKnowledge(sourceId,pageType,page.slug);
           if(existing?.checksum===checksum){result.unchanged++;continue;}
-          store.upsertKnowledge({...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),filePath:file,checksum});result.imported++;
+          store.upsertKnowledge({...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),contractJson:page.contract?JSON.stringify(page.contract):null,filePath:file,checksum});result.imported++;
         } catch(error) { result.errors.push({file:entry.name,error:String(error.message||error)}); }
       }
     }
@@ -82,7 +82,8 @@ function validatePage(sourceId,input) {
   if(!sqlContent) throw httpError(400,`${pageType} 页面必须提供 SQL 片段、ON 条件或参考 SQL`);
   const verified=Boolean(input.verified); const owner=String(input.owner||"").trim()||null;
   if(verified&&!owner) throw httpError(400,"verified 页面必须填写 owner");
-  return {sourceId:Number(sourceId),pageType,slug,title,aliases:stringArray(input.aliases),tables:stringArray(input.tables),content:String(input.content||"").trim(),sqlContent:sqlContent||null,antiExamples:String(input.antiExamples||"").trim()||null,verified:verified?1:0,owner,verifiedAt:verified?(input.verifiedAt||new Date().toISOString()):null};
+  const contract=normalizeContract(input.contract);
+  return {sourceId:Number(sourceId),pageType,slug,title,aliases:stringArray(input.aliases),tables:stringArray(input.tables),content:String(input.content||"").trim(),sqlContent:sqlContent||null,antiExamples:String(input.antiExamples||"").trim()||null,verified:verified?1:0,owner,verifiedAt:verified?(input.verifiedAt||new Date().toISOString()):null,...(contract?{contract}:{})};
 }
 
 function renderPage(page) {
@@ -93,7 +94,7 @@ aliases: ${JSON.stringify(page.aliases)}
 tables: ${JSON.stringify(page.tables)}
 verified: ${Boolean(page.verified)}
 owner: ${page.owner||""}
-verified_at: ${page.verifiedAt||""}
+verified_at: ${page.verifiedAt||""}${page.contract?`\ncontract: ${JSON.stringify(page.contract)}`:""}
 ---
 
 # ${page.title}
@@ -119,10 +120,29 @@ function parseMarkdown(markdown,pageType,fileName) {
   if(meta.type&&meta.type!==pageType)throw new Error(`页面类型与目录不一致：${meta.type}`);
   const body=markdown.slice(front[0].length);const title=body.match(/^#\s+(.+)$/m)?.[1]?.trim();if(!title)throw new Error("缺少一级标题");
   const content=(body.split(/^##\s+/m)[0].replace(/^#\s+.+$/m,"").trim());const sqlContent=body.match(/^##\s+(?:SQL 片段|参考 SQL|ON 条件)[^\n]*\n```sql\s*\n([\s\S]*?)\n```/m)?.[1]?.trim()||"";const antiExamples=body.match(/^##\s+反例[^\n]*\n([\s\S]*?)(?=^##\s+|$)/m)?.[1]?.trim()||"";
-  return {meta,title,content,sqlContent,antiExamples,aliases:parseArray(meta.aliases),tables:parseArray(meta.tables),verified:/^true$/i.test(meta.verified||"false"),owner:meta.owner||"",fileName};
+  return {meta,title,content,sqlContent,antiExamples,aliases:parseArray(meta.aliases),tables:parseArray(meta.tables),verified:/^true$/i.test(meta.verified||"false"),owner:meta.owner||"",contract:parseContract(meta.contract),fileName};
 }
 
 function parseArray(value) { if(!value)return [];try{const parsed=JSON.parse(value);return stringArray(parsed);}catch{return stringArray(value.replace(/^\[/,"").replace(/\]$/,"").replaceAll('"',""));} }
+
+// The machine-readable half of a page. Prose stays for human readers; anything the
+// harness must enforce is declared here so it never depends on parsing sentences.
+// Unknown keys are dropped rather than stored, so a typo cannot silently become a
+// contract the harness later trusts.
+const CONTRACT_KEYS=["timeRole","periodColumn","grain"];
+function normalizeContract(value) {
+  if(value==null)return null;
+  if(typeof value!=="object"||Array.isArray(value))throw httpError(400,"contract 必须是对象");
+  const result={};
+  for(const key of CONTRACT_KEYS) {
+    if(value[key]==null)continue;
+    const text=String(value[key]).trim();
+    if(text)result[key]=key==="periodColumn"?text:text.toLowerCase();
+  }
+  if(result.periodColumn&&!/^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$/.test(result.periodColumn))throw httpError(400,"contract.periodColumn 必须是 表名.列名 形式");
+  return Object.keys(result).length?result:null;
+}
+function parseContract(value) { if(!value)return null;try{return normalizeContract(JSON.parse(value));}catch{return null;} }
 
 function pushIfMissing(pages,keys,page){const key=`${page.pageType}:${page.slug}`;if(!keys.has(key)){keys.add(key);pages.push(page);}}
 function slugify(value){return String(value).trim().replace(/[\\/:*?"<>|]/g,"-").replace(/\s+/g,"-").slice(0,120);}
