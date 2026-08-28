@@ -112,7 +112,7 @@ export function parseQueryIntent(question,{now=new Date(),concepts=[],filterConc
   if(shape.kind==="ranking"&&shape.requestedLimitInvalid)ambiguities.push({code:"RANKING_LIMIT_INVALID",message:`排行数量“${shape.requestedLimitInvalid}”不是有效的正整数`,blocking:true,options:["补充有效的 Top 数量","不指定数量，使用系统安全上限"]});
   if(measures.some((item)=>item.grain==="unknown"))ambiguities.push({code:"MEASURE_GRAIN_AMBIGUOUS",message:"统计指标的去重粒度不明确，COUNT(*) 不能作为默认业务口径",blocking:true,options:["按业务对象去重","按事件或订单去重","使用已登记指标口径"]});
   if(timeResolution.unknown)ambiguities.push({code:"TIME_RANGE_UNKNOWN",message:`时间范围“${timeResolution.unknown.sourceText}”无法安全解析为唯一的左闭右开日期区间`,blocking:true,options:["本周","本月","本季度","今年","补充明确起止日期"],sourceText:timeResolution.unknown.sourceText,reason:timeResolution.unknown.reason});
-  if((timeRange||shape.kind==="trend")&&timeRole?.ambiguous)ambiguities.push({code:"TIME_ROLE_AMBIGUOUS",message:"时间要求可确定，但无法唯一判断应绑定哪个业务事件时间",blocking:true,options:timeRole.candidates.map((item)=>item.value)});
+  if((timeRange||shape.kind==="trend")&&timeRole?.ambiguous)ambiguities.push({code:"TIME_ROLE_AMBIGUOUS",message:timeRole.undetermined?`已验证指标页（${timeRole.undetermined.source}）的定义同时提到多个业务事件时间，无法唯一判断统计周期应绑定哪一个。请在页面补充结构化周期声明，或先选择本次口径`:"时间要求可确定，但无法唯一判断应绑定哪个业务事件时间",blocking:true,options:timeRole.candidates.map((item)=>item.value),...(timeRole.undetermined?{undeterminedSource:timeRole.undetermined.source}:{})});
   if((timeRange||shape.kind==="trend")&&measures.length&&!timeRole)ambiguities.push({code:"TIME_ROLE_UNKNOWN",message:"指标包含时间要求，但没有识别出对应的业务事件时间",blocking:true,options:["创建或进入时间","完成或成单时间","支付或回款时间"]});
   if(shape.kind==="trend"&&!shape.timeGrain)ambiguities.push({code:"TIME_GRAIN_UNKNOWN",message:"趋势问题没有说明按日、周、月、季度还是年汇总",blocking:true,options:["按日","按周","按月"]});
   if(shape.kind==="comparison"&&!comparisonRange)ambiguities.push({code:"COMPARISON_BASELINE_UNKNOWN",message:"对比问题没有形成明确的当前期和基准期窗口",blocking:true,options:["补充当前统计周期","明确同比或环比"]});
@@ -152,8 +152,8 @@ export function knowledgeIntentConcepts(pages=[],columnsByTable={}) {
   return (pages||[]).filter((page)=>page?.verified&&page.pageType==="metric").map((page)=>{
     const aliases=[page.title,...(page.aliases||[])].map((item)=>String(item||"").trim()).filter(Boolean);
     const definition=`${page.content||""} ${page.sqlContent||""}`;
-    const roles=TIME_ROLE_CONCEPTS.filter((item)=>item.pattern.test(definition));
-    const role=roles.length===1?roles[0]:null;
+    const timeRoleDerivation=inferKnowledgeTimeRole(page,definition,columnsByTable);
+    const grainDerivation=inferKnowledgeGrain(definition,page);
     let aggregation=inferKnowledgeAggregation(page.sqlContent);
     const formula=aggregation==="ratio"?inferKnowledgeRatioFormula(page,columnsByTable):null;
     const referencedColumns=extractKnowledgeColumnRefs(page,columnsByTable).map((item)=>`${item.table}.${item.column}`);
@@ -165,11 +165,13 @@ export function knowledgeIntentConcepts(pages=[],columnsByTable={}) {
       value:`knowledge_${safeConceptId(page.slug||page.title)}`,
       aliases,
       aggregation,
-      grain:aggregation==="precomputed"?"precomputed":inferKnowledgeGrain(definition),
-      timeRole:role?.value||null,
+      grain:aggregation==="precomputed"?"precomputed":grainDerivation.value,
+      grainDerivation:aggregation==="precomputed"?derivation("precomputed","inferred"):grainDerivation,
+      timeRole:timeRoleDerivation.value,
+      timeRoleDerivation,
       terms:[...aliases,...(page.tables||[]),...(String(page.sqlContent||"").match(/[a-z][a-z0-9_]{1,63}/ig)||[])],
       evidence:{level:"verified_knowledge",page:`${page.pageType}:${page.slug}`},
-      metricDefinition:{aggregation,columns:definitionColumns,tables:[...(page.tables||[])],source:`${page.pageType}:${page.slug}`,...(rowCount?{rowCount:true}:{}),...(formula?{formula}: {})},
+      metricDefinition:{aggregation,columns:definitionColumns,tables:[...(page.tables||[])],source:`${page.pageType}:${page.slug}`,...(timeRoleDerivation.value?{timeRole:timeRoleDerivation.value}:{}),...(timeRoleDerivation.periodColumn?{periodColumn:timeRoleDerivation.periodColumn}:{}),...(rowCount?{rowCount:true}:{}),...(formula?{formula}: {})},
     };
   });
 }
@@ -1095,6 +1097,8 @@ function detectMeasures(text,subjects,shape,concepts=[]) {
       target.evidence=concept.evidence||target.evidence||null;target.metricDefinition=concept.metricDefinition||target.metricDefinition||null;
       if(concept.aggregation&&concept.aggregation!=="unknown")target.aggregation=concept.aggregation;
       if(concept.grain)target.grain=concept.grain;if(concept.timeRole)target.timeRole=concept.timeRole;
+      if(concept.timeRoleDerivation)target.timeRoleDerivation=concept.timeRoleDerivation;
+      if(concept.grainDerivation)target.grainDerivation=concept.grainDerivation;
     } else {target.evidence=null;target.metricDefinition=null;}
   }
   return found;
@@ -1102,6 +1106,19 @@ function detectMeasures(text,subjects,shape,concepts=[]) {
 
 function detectTimeRole(text,timeRange,measures,required=false) {
   if(!timeRange&&!required)return null;
+  // Evidence ranking: a verified metric's own period derivation outranks keyword
+  // matches in the question. A question saying 成交率 mentions 成交, but the page
+  // defining the metric decides which event time the period binds to.
+  const knowledgeMeasure=(measures||[]).find((item)=>item.evidence?.level==="verified_knowledge"&&item.timeRoleDerivation);
+  const knowledgeDerivation=knowledgeMeasure?.timeRoleDerivation;
+  if(knowledgeDerivation&&(knowledgeDerivation.status==="declared"||knowledgeDerivation.status==="inferred")) {
+    const concept=TIME_ROLE_CONCEPTS.find((item)=>item.value===knowledgeDerivation.value);
+    if(concept)return {value:concept.value,sourceText:knowledgeMeasure.sourceText||timeRange?.sourceText||concept.value,terms:[...concept.terms],attachesTo:knowledgeMeasure.id||null,evidence:{level:"verified_knowledge",page:knowledgeDerivation.source,...(knowledgeDerivation.periodColumn?{periodColumn:knowledgeDerivation.periodColumn}:{})}};
+  }
+  if(knowledgeDerivation&&isUndetermined(knowledgeDerivation)) {
+    const candidates=(knowledgeDerivation.candidates||[]).map((value)=>TIME_ROLE_CONCEPTS.find((item)=>item.value===value)).filter(Boolean);
+    if(candidates.length>1)return {ambiguous:true,candidates,undetermined:{source:knowledgeDerivation.source,reason:knowledgeDerivation.reason}};
+  }
   const matches=TIME_ROLE_CONCEPTS.filter((item)=>item.pattern.test(text));
   const measureRoles=[...new Set((measures||[]).map((item)=>item.timeRole).filter(Boolean))];
   for(const value of measureRoles)if(!matches.some((item)=>item.value===value)) {const concept=TIME_ROLE_CONCEPTS.find((item)=>item.value===value);if(concept)matches.push(concept);}
@@ -1330,11 +1347,94 @@ function canonicalDecimalLexeme(value) {
 
 function reverseComparisonOperator(operator){return ({">=":"<=",">":"<","<":">","<=":">=","=":"=","!=":"!=","<>":"<>"})[operator]||operator;}
 
-function inferKnowledgeGrain(value) {
+// A derivation separates "this dimension does not apply" from "we could not work it
+// out". Status is declared | inferred | not_applicable | undetermined; only
+// undetermined may become a blocking ambiguity, and it never degrades to a bare null
+// that downstream reads as "unconstrained".
+function derivation(value,status,meta={}) { return {value,status,...meta}; }
+function isUndetermined(item) { return item?.status==="undetermined"; }
+
+const GRAIN_PROSE_TOKENS={线索:"clue",订单:"order",商机:"opportunity",客户:"customer",案件:"case",账号:"account",账户:"account"};
+const GRAIN_COLUMN_TOKENS=["clue","order","opportunity","customer","case","account"];
+
+// A page may carry a machine-readable contract. Prose stays for human readers;
+// anything the harness must enforce is read from here first.
+function declaredMetricContract(page) {
+  const contract=page?.contract;
+  if(!contract||typeof contract!=="object")return {};
+  const timeRole=String(contract.timeRole||"").trim().toLowerCase();
+  return {
+    timeRole:TIME_ROLE_CONCEPTS.some((item)=>item.value===timeRole)?timeRole:null,
+    periodColumn:String(contract.periodColumn||"").trim()||null,
+    grain:String(contract.grain||"").trim().toLowerCase()||null,
+  };
+}
+
+// Resolves a time column to its business event role. Returns null when the name
+// is claimed by more than one role, leaving the caller to report undetermined
+// rather than silently picking one.
+function timeRoleForColumn(columnName) {
+  const name=String(columnName||"").toLowerCase();
+  if(!name)return null;
+  const hits=TIME_ROLE_CONCEPTS.filter((role)=>role.terms.some((term)=>/^[a-z0-9_]+$/i.test(term)&&name.includes(term.toLowerCase())));
+  return hits.length===1?hits[0].value:null;
+}
+
+// A definition that names its own period column is stronger evidence than keyword
+// counting over the whole text: the column is a verifiable catalog reference.
+function namedPeriodColumn(definition,columnsByTable) {
+  const sentences=String(definition||"").split(/[。；;\n]/).filter((part)=>/统计周期|时间口径|周期绑定|周期固定|时间范围绑定/.test(part));
+  for(const sentence of sentences) {
+    for(const reference of sentence.match(/[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?/g)||[]) {
+      const [left,right]=reference.includes(".")?reference.split("."):[null,reference];
+      for(const [table,columns] of Object.entries(columnsByTable||{})) {
+        if(left&&String(table).toLowerCase()!==String(left).toLowerCase())continue;
+        const column=(columns||[]).find((item)=>String(item.columnName).toLowerCase()===String(right).toLowerCase());
+        if(column&&/date|time|timestamp/i.test(String(column.dataType||"")))return {table,column:column.columnName};
+      }
+    }
+  }
+  return null;
+}
+
+function inferKnowledgeTimeRole(page,definition,columnsByTable) {
+  const source=`${page?.pageType}:${page?.slug}`;
+  const declared=declaredMetricContract(page);
+  const period=namedPeriodColumn(definition,columnsByTable);
+  const declaredPeriod=declared.periodColumn||(period?`${period.table}.${period.column}`:null);
+  if(declared.timeRole)return derivation(declared.timeRole,"declared",{source,...(declaredPeriod?{periodColumn:declaredPeriod}:{})});
+  if(period) {
+    const role=timeRoleForColumn(period.column);
+    if(role)return derivation(role,"inferred",{source,periodColumn:`${period.table}.${period.column}`,reason:"period_column_named"});
+  }
+  const roles=TIME_ROLE_CONCEPTS.filter((item)=>item.pattern.test(definition));
+  if(roles.length===1)return derivation(roles[0].value,"inferred",{source,reason:"single_prose_match",...(declaredPeriod?{periodColumn:declaredPeriod}:{})});
+  if(roles.length>1)return derivation(null,"undetermined",{source,candidates:roles.map((item)=>item.value),reason:"multiple_prose_roles",...(declaredPeriod?{periodColumn:declaredPeriod}:{})});
+  return derivation(null,"not_applicable",{source});
+}
+
+// Returns a derivation: a grain that could not be determined is reported as
+// undetermined with its candidates, never as null. Callers must be able to tell
+// "this metric has no grain" apart from "we failed to work the grain out".
+function inferKnowledgeGrain(value,page=null) {
+  const declaredGrain=declaredMetricContract(page).grain;
+  if(declaredGrain)return derivation(declaredGrain,"declared",{source:`${page?.pageType}:${page?.slug}`});
   const text=String(value||"");
-  const match=text.match(/按(?:唯一)?(线索|订单|商机|客户|案件|账号|账户).{0,8}去重|COUNT\s*\(\s*DISTINCT\s+[^)]*?\b(clue|order|opportunity|customer|case|account)(?:_id|_no|\.id)\b[^)]*\)/i);
-  const raw=match?.[1]||match?.[2]||"";
-  return {线索:"clue",订单:"order",商机:"opportunity",客户:"customer",案件:"case",账号:"account",账户:"account"}[raw]||String(raw).toLowerCase()||null;
+  const candidates=new Set();
+  for(const [surface,grain] of Object.entries(GRAIN_PROSE_TOKENS)) {
+    if(new RegExp(`(?:按|以|粒度为|粒度是)(?:唯一)?${surface}`).test(text))candidates.add(grain);
+  }
+  // Underscore is a word character, so \b never fires between a table prefix and
+  // the token: `alpha_crm_clue.id` has to match through an explicit class.
+  for(const fragment of text.match(/COUNT\s*\(\s*DISTINCT\s+[^)]*\)/ig)||[]) {
+    for(const token of GRAIN_COLUMN_TOKENS) {
+      if(new RegExp(`(?:^|[^a-z0-9])${token}(?:_id|_no|\\.id)`,"i").test(fragment))candidates.add(token);
+    }
+  }
+  const values=[...candidates];
+  if(values.length===1)return derivation(values[0],"inferred");
+  if(values.length>1)return derivation(null,"undetermined",{candidates:values,reason:"multiple_grain_candidates"});
+  return derivation(null,"not_applicable");
 }
 
 function safeConceptId(value){const latin=String(value||"").toLowerCase().replace(/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"");if(latin)return latin.slice(0,64);let hash=2166136261;for(const char of String(value||"")){hash^=char.codePointAt(0);hash=Math.imul(hash,16777619);}return `c${(hash>>>0).toString(36)}`;}
