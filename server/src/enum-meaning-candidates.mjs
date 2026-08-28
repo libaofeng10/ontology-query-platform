@@ -28,9 +28,13 @@ export function parseCommentEnumCandidates(comment) {
 // never confirmed. Deliberately scoped to columns the probe actually registered
 // values for: a dictionary nobody queries is noise, and addQuestion dedupes by
 // (table, column, enumValue) so re-running discovery never double-asks.
+// Grade C and deactivated tables are excluded: the query layer refuses to read them,
+// so a confirmation there can never bind anything — it is pure reviewer cost. Their
+// ds_enum rows survive from earlier probes, which is exactly why the filter is needed
+// here and not left to the probe.
 export function generateEnumMeaningQuestions(store,sourceId) {
   let created=0;
-  for(const table of store.listTables(sourceId)) {
+  for(const table of store.listTables(sourceId).filter((item)=>item.grade!=="C"&&item.active)) {
     const commentByColumn=new Map(store.listColumns(sourceId,table.tableName).map((column)=>[column.columnName,column.comment]));
     const registered=new Map();
     for(const item of store.listEnums(sourceId,table.tableName)) {

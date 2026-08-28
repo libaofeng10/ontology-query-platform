@@ -118,6 +118,54 @@ test("model-discovered relations require exact human confirmation before joining
   store.close();
 });
 
+test("a manually excluded table is not probed again on the next discovery run",async()=>{
+  // information_schema carries no grading decision, so before the fix gradeTable() re-derived
+  // A from naming and row count on every run: the table was probed again, its enum values
+  // re-registered, and its disambiguation questions reseeded no matter how often a human
+  // marked it C.
+  const dir=await mkdtemp(join(tmpdir(),"ontoquery-grade-override-"));
+  const store=createStore(join(dir,"store.sqlite"));
+  const source=store.createSource({name:"real",kind:"mysql",host:"db",port:3306,dbName:"sales",userName:"ro",credential:"encrypted",isDemo:false});
+  // Both tables look healthy to the rules — recently plain-named, dictionary-sized enough for
+  // the probe to register enum values (estimatedRows must fit the sample window). Only a human
+  // knows the second one is an abandoned migration staging copy; naming heuristics alone would
+  // keep grading it B and probing it forever.
+  const tables=[{tableName:"crm_customer",rowEstimate:5000,comment:"客户"},{tableName:"crm_customer_migration",rowEstimate:4800,comment:"客户迁移中间表"}];
+  const columns=["crm_customer","crm_customer_migration"].flatMap((tableName)=>[
+    {tableName,columnName:"id",dataType:"bigint",nullable:"NO",comment:"主键",isPrimary:1,isUnique:1,isIndexed:1},
+    {tableName,columnName:"channel",dataType:"tinyint",nullable:"NO",comment:"来源渠道 1：百度 2：抖音",isPrimary:0,isUnique:0,isIndexed:0},
+  ]);
+  const probedTables=[];
+  const connector={query:async(_source,sql)=>{
+    if(sql.includes("information_schema.TABLES")) return [tables];
+    if(sql.includes("information_schema.COLUMNS")) return [columns];
+    if(sql.includes("information_schema.KEY_COLUMN_USAGE")) return [[]];
+    // Longest name first: crm_customer is a substring of crm_customer_migration.
+    const hit=[...tables].sort((a,b)=>b.tableName.length-a.tableName.length).find(({tableName})=>sql.includes(`\`${tableName}\``));
+    if(hit) { probedTables.push(hit.tableName);return [[{value:1,count:80},{value:2,count:20}]]; }
+    return [[]];
+  }};
+  const discovery=createDiscoveryService({store,connector,wikiDir:join(dir,"wiki"),config:{relationModel:{maxCandidates:20,minConfidence:0.55,sampleLimit:20}},relationModel:{judge:async()=>({status:"completed",modelName:"fake",error:null,decisions:[]})}});
+
+  await discovery.discover(source);
+  assert.ok(probedTables.includes("crm_customer_migration"),"首轮尚无人工判定，按规则探查");
+  const seeded=store.listQuestions(source.id).filter((item)=>item.tableName==="crm_customer_migration");
+  assert.ok(seeded.length>0,"首轮会为该表播下待确认项");
+
+  store.setTableGrade(source.id,"crm_customer_migration","C");
+  store.closeQuestionsOnExcludedTables(source.id);
+  probedTables.length=0;
+  await discovery.discover(source);
+
+  assert.equal(probedTables.includes("crm_customer_migration"),false,"人工标 C 后不得再对该表下探针");
+  assert.ok(probedTables.includes("crm_customer"),"其余表照常探查");
+  const excluded=store.listTables(source.id).find((item)=>item.tableName==="crm_customer_migration");
+  assert.equal(excluded.grade,"C");
+  assert.equal(excluded.active,0,"人工判定必须同时落到 active 上");
+  assert.equal(store.listQuestions(source.id).filter((item)=>item.tableName==="crm_customer_migration").length,0,"关掉的待确认项不得被重新播下");
+  store.close();
+});
+
 test("manual relation denial survives later model reruns but an explicit foreign key wins",async()=>{
   const dir=await mkdtemp(join(tmpdir(),"ontoquery-relation-status-"));
   const store=createStore(join(dir,"store.sqlite"));

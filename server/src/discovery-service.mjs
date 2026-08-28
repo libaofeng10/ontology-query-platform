@@ -38,10 +38,15 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     const columnsByTable=Object.groupBy(schema.columns,(column)=>column.tableName);
     const probeResults=new Map();
     let profiledTableCount=0;
+    // information_schema knows nothing about human grading decisions. Without carrying
+    // grade_override back in, gradeTable() re-derives every grade from naming rules and
+    // the manual C never reaches the "skip the probe" gate below — the table keeps getting
+    // probed, keeps registering enum values, and keeps seeding disambiguation questions.
+    const gradeOverrideByTable=new Map(store.listTables(source.id).map((table)=>[table.tableName,table.gradeOverride]));
 
     for(const [index,rawTable] of schema.tables.entries()) {
       emit(onProgress,10+Math.round((index/Math.max(1,schema.tables.length))*60),`探针 ${rawTable.tableName}（${index+1}/${schema.tables.length}）`);
-      const table={...rawTable,sourceId:source.id,inboundRelations:inbound.get(rawTable.tableName)||0,daysSinceWrite:null};
+      const table={...rawTable,sourceId:source.id,gradeOverride:gradeOverrideByTable.get(rawTable.tableName)??null,inboundRelations:inbound.get(rawTable.tableName)||0,daysSinceWrite:null};
       const initialGrade=gradeTable(table);
       if(initialGrade.grade!=="C") {
         const profileThisTable=Boolean(profilingConfig.enabled)&&profiledTableCount<profilingConfig.maxTablesPerRefresh;
@@ -121,6 +126,7 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     }
     store.finishSchemaRefresh(source.id,normalized,[...new Set(relationKeys)]);
     store.closeStaleRelationQuestions(source.id);
+    store.closeQuestionsOnExcludedTables(source.id);
     emit(onProgress,88,"从列注释生成枚举含义待确认项");
     generateEnumMeaningQuestions(store,source.id);
     const snapshot=saveSnapshot(source.id,normalized,schemaDiff);

@@ -59,6 +59,26 @@ test("questions are generated only for observed, meaning-less values and answers
   } finally { store.close(); }
 });
 
+test("tables the query layer refuses to read are not asked about",async()=>{
+  // ds_enum rows outlive the grading decision: the probe registered them while the table
+  // still counted, and nothing deletes them afterwards. So the filter has to live here —
+  // otherwise every re-probe reseeds questions for tables nobody can query.
+  const store=await fixture();
+  try {
+    store.upsertTable({sourceId:9,tableName:"clue",grade:"C",active:0});
+    assert.equal(generateEnumMeaningQuestions(store,9).created,0);
+    assert.equal(store.listQuestions(9).filter((item)=>item.kind==="枚举含义").length,0);
+
+    // Deactivated on its own is enough: the query layer gates on grade AND active.
+    store.upsertTable({sourceId:9,tableName:"clue",grade:"B",active:0});
+    assert.equal(generateEnumMeaningQuestions(store,9).created,0);
+
+    // Restored to a readable grade, the same dictionary becomes worth confirming again.
+    store.upsertTable({sourceId:9,tableName:"clue",grade:"B",active:1});
+    assert.equal(generateEnumMeaningQuestions(store,9).created,3);
+  } finally { store.close(); }
+});
+
 test("values named by the comment but absent from the dictionary are not asked about",async()=>{
   // The comment maps value 9 but the probe never observed it; asking would demand
   // a confirmation about data that may not exist.

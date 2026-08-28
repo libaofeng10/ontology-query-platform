@@ -15,6 +15,46 @@ test("store preserves manual table grade overrides across probe upserts", async 
   store.close();
 });
 
+test("manual grade overrides also pin the active flag against probe upserts", async () => {
+  // grade was already protected; active was not, so a table auto-graded A/B but manually
+  // marked C came back with grade='C' AND active=1 — readable by every consumer that
+  // gates on active alone.
+  const dir=await mkdtemp(join(tmpdir(),"ontoquery-store-"));
+  const store=createStore(join(dir,"test.sqlite"));
+  store.db.prepare(`INSERT INTO ds_table(source_id,table_name,grade,grade_override,active) VALUES(1,'noisy_table','B','C',0)`).run();
+  store.upsertTable({sourceId:1,tableName:"noisy_table",rowEstimate:5000,grade:"B",gradeOverride:null,active:1,comment:"",daysSinceWrite:1,inboundRelations:3});
+  assert.equal(store.listTables(1)[0].grade,"C");
+  assert.equal(store.listTables(1)[0].active,0,"人工标 C 的表不得被探查重新激活");
+
+  // The override cuts both ways: a table the rules call C stays usable when a human says so.
+  store.db.prepare(`INSERT INTO ds_table(source_id,table_name,grade,grade_override,active) VALUES(1,'user_copy1','C','A',1)`).run();
+  store.upsertTable({sourceId:1,tableName:"user_copy1",rowEstimate:0,grade:"C",gradeOverride:null,active:0,comment:"",daysSinceWrite:900,inboundRelations:0});
+  assert.equal(store.listTables(1).find((item)=>item.tableName==="user_copy1").active,1);
+  store.close();
+});
+
+test("pending questions on excluded tables are closed, global ones are left alone", async () => {
+  const dir=await mkdtemp(join(tmpdir(),"ontoquery-store-"));
+  const store=createStore(join(dir,"test.sqlite"));
+  store.upsertTable({sourceId:1,tableName:"live_table",grade:"A",active:1});
+  store.upsertTable({sourceId:1,tableName:"junk_table",grade:"C",active:0});
+  store.upsertTable({sourceId:1,tableName:"paused_table",grade:"B",active:0});
+  const live=store.addQuestion({sourceId:1,kind:"枚举含义",scope:"column",tableName:"live_table",columnName:"status",enumValue:"1",question:"状态 1？",evidence:"注释",options:["有效"]});
+  const junk=store.addQuestion({sourceId:1,kind:"枚举含义",scope:"column",tableName:"junk_table",columnName:"status",enumValue:"1",question:"状态 1？",evidence:"注释",options:["有效"]});
+  const paused=store.addQuestion({sourceId:1,kind:"枚举含义",scope:"column",tableName:"paused_table",columnName:"status",enumValue:"1",question:"状态 1？",evidence:"注释",options:["有效"]});
+  const global=store.addQuestion({sourceId:1,kind:"口径",scope:"global",question:"金额统一按分存储？",evidence:"多表同名字段",options:["全部"]});
+
+  assert.equal(store.closeQuestionsOnExcludedTables(1),2);
+  const pending=new Set(store.listQuestions(1).map((item)=>item.id));
+  assert.ok(pending.has(live),"A 表上的待确认项必须保留");
+  assert.ok(pending.has(global),"全局口径问题不挂表，不受影响");
+  assert.equal(pending.has(junk),false);
+  assert.equal(pending.has(paused),false,"停用表与 C 表同样无法被问数读取");
+  assert.equal(store.db.prepare("SELECT status FROM ds_question WHERE id=?").get(junk).status,"obsolete");
+  assert.equal(store.closeQuestionsOnExcludedTables(1),0,"幂等：没有新的可关闭项");
+  store.close();
+});
+
 test("question answers remain auditable", async () => {
   const dir=await mkdtemp(join(tmpdir(),"ontoquery-store-"));
   const store=createStore(join(dir,"test.sqlite"));
