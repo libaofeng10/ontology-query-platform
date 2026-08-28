@@ -1,11 +1,27 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { validateKnowledgeSemantics } from "./knowledge-semantics.mjs";
 
 const PAGE_TYPES = new Set(["term", "metric", "join", "rule"]);
 
 export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
   function rootFor(sourceId) { return join(wikiDir,`source-${Number(sourceId)}`); }
+
+  function catalogColumns(sourceId) {
+    const columns={};
+    for(const table of store.listTables(sourceId))columns[table.tableName]=store.listColumns(sourceId,table.tableName);
+    return columns;
+  }
+
+  // Save-time verdict shared with the machine-proposal path. Hard errors block a
+  // verified save — a page that can never bind must not become an authority; soft
+  // warnings mark the page degraded for the health board but let the save through.
+  function semanticVerdict(sourceId,page) {
+    const result=validateKnowledgeSemantics(page,{columnsByTable:catalogColumns(sourceId)});
+    if(!result.ok&&page.verified)throw httpError(400,`verified 指标页未通过语义校验：${result.errors.map((item)=>item.message).join("；")}`);
+    return result;
+  }
 
   function list(sourceId) {
     const custom=store.listKnowledge(sourceId);
@@ -30,6 +46,7 @@ export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
 
   async function save(sourceId,input) {
     const page=validatePage(sourceId,input);
+    const health=semanticVerdict(sourceId,page);
     const root=rootFor(sourceId);
     const file=join(root,`${page.pageType}s`,`${page.slug}.md`);
     const markdown=renderPage(page);
@@ -38,9 +55,9 @@ export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
     const temp=`${file}.tmp-${process.pid}-${Date.now()}`;
     await writeFile(temp,markdown,"utf8");
     await rename(temp,file);
-    const saved=store.upsertKnowledge({...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),contractJson:page.contract?JSON.stringify(page.contract):null,filePath:file,checksum});
+    const saved=store.upsertKnowledge({...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),contractJson:page.contract?JSON.stringify(page.contract):null,semanticHealth:health.semanticHealth,filePath:file,checksum});
     embeddingIndex?.ensurePageEmbedding(sourceId,saved).catch(()=>{});
-    return saved;
+    return {...saved,semanticWarnings:health.warnings};
   }
 
   async function remove(sourceId,pageType,slug) {
@@ -61,9 +78,9 @@ export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
           const markdown=await readFile(file,"utf8");const parsed=parseMarkdown(markdown,pageType,entry.name);
           if(!Object.hasOwn(parsed.meta,"owner")){result.skipped++;continue;}
           const input={...parsed,pageType,slug:entry.name.slice(0,-3),owner:parsed.meta.owner,verifiedAt:parsed.meta.verified_at};
-          const page=validatePage(sourceId,input);const checksum=createHash("sha256").update(markdown).digest("hex");const existing=store.getKnowledge(sourceId,pageType,page.slug);
+          const page=validatePage(sourceId,input);const health=semanticVerdict(sourceId,page);const checksum=createHash("sha256").update(markdown).digest("hex");const existing=store.getKnowledge(sourceId,pageType,page.slug);
           if(existing?.checksum===checksum){result.unchanged++;continue;}
-          store.upsertKnowledge({...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),contractJson:page.contract?JSON.stringify(page.contract):null,filePath:file,checksum});result.imported++;
+          store.upsertKnowledge({...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),contractJson:page.contract?JSON.stringify(page.contract):null,semanticHealth:health.semanticHealth,filePath:file,checksum});result.imported++;
         } catch(error) { result.errors.push({file:entry.name,error:String(error.message||error)}); }
       }
     }

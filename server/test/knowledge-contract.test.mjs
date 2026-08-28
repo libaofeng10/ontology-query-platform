@@ -12,6 +12,16 @@ const RATIO_SQL="COUNT(DISTINCT CASE WHEN rel.is_deleted = 0 THEN rel.clue_id EN
 async function fixture() {
   const dir=await mkdtemp(join(tmpdir(),"ontoquery-contract-"));
   const store=createStore(join(dir,"store.sqlite"));
+  // The save-time semantic validator binds formula predicates against the catalog,
+  // so the fixture must register the columns the reference SQL uses.
+  for(const sid of [3]) {
+    store.upsertTable({sourceId:sid,tableName:"clue",grade:"A",active:1});
+    store.upsertTable({sourceId:sid,tableName:"rel",grade:"A",active:1});
+    store.upsertColumn({sourceId:sid,tableName:"clue",columnName:"id",dataType:"bigint",isPrimary:1});
+    store.upsertColumn({sourceId:sid,tableName:"clue",columnName:"clue_create_time",dataType:"datetime"});
+    store.upsertColumn({sourceId:sid,tableName:"rel",columnName:"clue_id",dataType:"bigint"});
+    store.upsertColumn({sourceId:sid,tableName:"rel",columnName:"is_deleted",dataType:"tinyint"});
+  }
   return {store,service:createKnowledgeService({store,wikiDir:join(dir,"wiki")})};
 }
 
