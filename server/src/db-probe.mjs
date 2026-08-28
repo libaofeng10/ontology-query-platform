@@ -7,7 +7,13 @@ const DEFAULT_SAMPLE_ROWS = 10_000;
 const DEFAULT_ENUM_MAX_DISTINCT_RATIO = 0.05;
 // Identifier-shaped columns are never business dictionaries: a phone number column whose
 // sample happens to hold one value must not become an allow-list of one legal value.
-export const ENUM_NAME_BLACKLIST = /(_id|_no|_code|cell|phone|mobile|email|name|time|date|_at)$/i;
+export const ENUM_IDENTIFIER_BLACKLIST = /(_id|_no|_code|cell|phone|mobile|email|time|date|_at)$/i;
+// Label columns (…name) are different: in a dictionary-sized dimension table the name column
+// IS the business dictionary (alpha_crm_channel.channel_name → 抖音/百度/…), and there the
+// distinct ratio is expected to be ~1.0, so labels get their own judgment instead of the
+// ratio gate. Outside dictionary-sized tables a name column is treated like an identifier.
+export const ENUM_LABEL_SUFFIX = /name$/i;
+export const ENUM_LABEL_DICTIONARY_MAX_ROWS = 20;
 
 function quoteIdentifier(value) {
   const identifier=String(value??"");
@@ -48,12 +54,16 @@ export async function probeTable(connector, source, table, columns, { maxEnumVal
 }
 
 // A sampled distinct-value list is only a complete dictionary when the sample covered the whole
-// table, the values repeat often enough to be categories, and the column is not an identifier.
+// table, and either the values repeat often enough to be categories or the table itself is a
+// dictionary-sized dimension table whose label column enumerates the business vocabulary.
+// Identifier-shaped columns are rejected unconditionally.
 function isEnumDictionary(columnName,distinctCount,estimatedRows,sampleLimit,maxDistinctRatio) {
   if (!(estimatedRows > 0 && estimatedRows <= sampleLimit)) return false;
+  const name=String(columnName??"");
+  if (ENUM_IDENTIFIER_BLACKLIST.test(name)) return false;
+  if (ENUM_LABEL_SUFFIX.test(name)) return estimatedRows <= ENUM_LABEL_DICTIONARY_MAX_ROWS;
   const ratioBase = Math.min(estimatedRows,sampleLimit);
-  if (!(distinctCount / ratioBase < Number(maxDistinctRatio))) return false;
-  return !ENUM_NAME_BLACKLIST.test(String(columnName??""));
+  return distinctCount / ratioBase < Number(maxDistinctRatio);
 }
 
 async function attachProfiles(connector,source,table,columns,{sampleLimit,timeoutMs}={}) {

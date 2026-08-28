@@ -49,6 +49,41 @@ test("identifier-shaped columns never become dictionaries even with a single sam
   assert.equal(byName.biz_state.enums.length,1);
 });
 
+// T8: in a dictionary-sized dimension table the label column IS the business
+// dictionary, and its distinct ratio is expected to be ~1.0 — the ratio gate and
+// the old blanket name blacklist both got this wrong.
+test("a dictionary-sized dimension table registers its label column despite the ratio",async()=>{
+  const rows=Array.from({length:12},(_item,index)=>({value:`渠道${index}`,count:1}));
+  const connector={query:async()=>[rows]};
+  const dimension=await probeTable(connector,{},
+    {tableName:"alpha_crm_channel",rowEstimate:12},
+    [{columnName:"channel_name",dataType:"varchar(64)"}],
+  );
+  assert.equal(dimension.columns[0].enums.length,12);
+
+  // The same label column on a table above the dimension cap keeps the old refusal.
+  const large=await probeTable(connector,{},
+    {tableName:"clue",rowEstimate:5_000},
+    [{columnName:"channel_name",dataType:"varchar(64)"}],
+  );
+  assert.deepEqual(large.columns[0].enums,[]);
+
+  // Identifier suffixes stay rejected even inside a dictionary-sized table.
+  const identifier=await probeTable(connector,{},
+    {tableName:"alpha_crm_channel",rowEstimate:12},
+    [{columnName:"channel_code",dataType:"varchar(32)"}],
+  );
+  assert.deepEqual(identifier.columns[0].enums,[]);
+
+  // Person-name labels never get here: the sensitive gate runs before enum sampling.
+  const person=await probeTable(connector,{},
+    {tableName:"tiny_owner",rowEstimate:12},
+    [{columnName:"owner_name",dataType:"varchar(64)"}],
+  );
+  assert.equal(person.columns[0].isSensitive,1);
+  assert.deepEqual(person.columns[0].enums,[]);
+});
+
 test("distinct values above the cardinality ratio are not a dictionary",async()=>{
   const rows=Array.from({length:12},(_item,index)=>({value:`v${index}`,count:1}));
   const connector={query:async()=>[rows]};

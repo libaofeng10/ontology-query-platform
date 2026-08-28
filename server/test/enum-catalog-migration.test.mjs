@@ -66,3 +66,29 @@ test("enum catalog migration keeps compliant dictionaries and never uses cardina
     assert.equal(store.listEnums(source.id,"alpha").filter((item)=>item.columnName==="biz_state").length,12);
   } finally { store.close(); }
 });
+
+// T8: v2 deleted every …name column wholesale, including the label columns of small
+// dimension tables that are the business dictionary itself. v3 spares exactly that class
+// so a re-probe can re-register it without the next server start deleting it again.
+test("label columns survive on dictionary-sized dimension tables and nowhere else",async()=>{
+  const {store,source}=await createFixture();
+  try {
+    store.upsertTable({sourceId:source.id,tableName:"alpha_crm_channel",grade:"B",active:1,rowEstimate:12});
+    store.upsertEnum({sourceId:source.id,tableName:"alpha_crm_channel",columnName:"channel_name",value:"抖音",count:1,ratio:0.08});
+    store.upsertEnum({sourceId:source.id,tableName:"alpha_crm_channel",columnName:"channel_name",value:"百度",count:1,ratio:0.08});
+    // The same suffix on a large table, and on a table with no row estimate, stays doomed.
+    store.upsertTable({sourceId:source.id,tableName:"clue",grade:"A",active:1,rowEstimate:50_000});
+    store.upsertEnum({sourceId:source.id,tableName:"clue",columnName:"channel_name",value:"抖音",count:9,ratio:0.9});
+    store.upsertEnum({sourceId:source.id,tableName:"alpha",columnName:"channel_name",value:"抖音",count:9,ratio:0.9});
+
+    const result=applyEnumCatalogMigration(store);
+    assert.equal(result.removedColumns,4,"alp_cell、contract_no 与两个大表/无行数估计的 name 列");
+    assert.deepEqual(store.listEnums(source.id,"alpha_crm_channel").map((item)=>item.value).sort(),["抖音","百度"].sort());
+    assert.equal(store.listEnums(source.id,"clue").length,0);
+    assert.equal(store.listEnums(source.id,"alpha").some((item)=>item.columnName==="channel_name"),false);
+
+    const second=applyEnumCatalogMigration(store);
+    assert.equal(second.skipped,true);
+    assert.equal(store.listEnums(source.id,"alpha_crm_channel").length,2,"幂等：保留的维表字典不因重跑而消失");
+  } finally { store.close(); }
+});
