@@ -50,6 +50,11 @@ test("excluded tables are never probed and vanish from every downstream surface"
   const wikiTables=await readdir(join(dir,"wiki",`source-${source.id}`,"tables"));
   assert.ok(wikiTables.includes("crm_customer_backfill.md"),"首轮写出了本体页");
 
+  // The screenshot regression: a JOIN question hangs off the SURVIVING table while its
+  // relation's far end is the excluded one. table_name alone would never catch it.
+  const crossRel=store.upsertRelation({sourceId:source.id,fromTable:"crm_customer",fromCol:"backfill_id",toTable:"crm_customer_backfill",toCol:"id",cardinality:"N:1",confidence:0.8,overlapRatio:0.5,status:"review",inferenceSource:"model"});
+  const crossQuestion=store.addQuestion({sourceId:source.id,kind:"JOIN 路径",scope:"column",tableName:"crm_customer",columnName:"backfill_id",relationId:crossRel.id,question:"crm_customer.backfill_id 是否关联 crm_customer_backfill.id？",evidence:"模型判断",options:["确认该关联","不允许关联"]});
+
   // The user now excludes the staging copy. The next discovery must treat it as nonexistent
   // and purge what round 1 already registered.
   store.saveTableSelections(source.id,[{tableName:"crm_customer_backfill",included:false}],"data-editor");
@@ -60,9 +65,19 @@ test("excluded tables are never probed and vanish from every downstream surface"
   assert.ok(probedTables.includes("crm_customer"),"入选的表照常探查");
   assert.equal(store.listTables(source.id).some((table)=>table.tableName==="crm_customer_backfill"),false,"ds_table 中不再存在");
   assert.equal(store.listQuestions(source.id).some((item)=>item.tableName==="crm_customer_backfill"),false,"待确认项已随之关闭");
+  assert.equal(store.listQuestions(source.id).some((item)=>item.id===crossQuestion),false,"挂在存活表上、JOIN 对端被排除的问题同样关闭");
   assert.equal(store.db.prepare("SELECT COUNT(*) c FROM ds_enum WHERE source_id=? AND table_name='crm_customer_backfill'").get(source.id).c,0,"枚举登记已清除");
   const wikiAfter=await readdir(join(dir,"wiki",`source-${source.id}`,"tables"));
   assert.equal(wikiAfter.includes("crm_customer_backfill.md"),false,"本体页已删除");
+
+  // The production shape this bug shipped in: the table was already purged by an earlier
+  // call that predated the relation-end cleanup, leaving orphaned JOIN questions behind.
+  // Re-running the purge (what a selection re-save does) must heal them.
+  const orphanRel=store.upsertRelation({sourceId:source.id,fromTable:"crm_customer",fromCol:"legacy_id",toTable:"crm_customer_backfill",toCol:"id",cardinality:"N:1",confidence:0.7,overlapRatio:0.4,status:"review",inferenceSource:"model"});
+  store.db.prepare("UPDATE ds_relation SET present=0 WHERE id=?").run(orphanRel.id);
+  const orphanQuestion=store.addQuestion({sourceId:source.id,kind:"JOIN 路径",scope:"column",tableName:"crm_customer",columnName:"legacy_id",relationId:orphanRel.id,question:"crm_customer.legacy_id 是否关联 crm_customer_backfill.id？",evidence:"模型判断",options:["确认该关联","不允许关联"]});
+  assert.equal(store.purgeExcludedTables(source.id),0,"表已删过，本轮无新删除");
+  assert.equal(store.listQuestions(source.id).some((item)=>item.id===orphanQuestion),false,"重新保存选择即可补救历史遗留的孤儿 JOIN 问题");
 
   // Re-including brings it back through a normal probe on the following run.
   store.saveTableSelections(source.id,[{tableName:"crm_customer_backfill",included:true}],"data-editor");

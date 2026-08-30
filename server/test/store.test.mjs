@@ -44,12 +44,21 @@ test("pending questions on excluded tables are closed, global ones are left alon
   const paused=store.addQuestion({sourceId:1,kind:"枚举含义",scope:"column",tableName:"paused_table",columnName:"status",enumValue:"1",question:"状态 1？",evidence:"注释",options:["有效"]});
   const global=store.addQuestion({sourceId:1,kind:"口径",scope:"global",question:"金额统一按分存储？",evidence:"多表同名字段",options:["全部"]});
 
-  assert.equal(store.closeQuestionsOnExcludedTables(1),2);
+  // The screenshot case: the question hangs off the LIVE side of a JOIN whose far end is
+  // graded C. Its own table_name passes the filter — only the relation gives it away.
+  const farRel=store.upsertRelation({sourceId:1,fromTable:"live_table",fromCol:"junk_id",toTable:"junk_table",toCol:"id",cardinality:"N:1",confidence:0.8,overlapRatio:0.5,status:"review",inferenceSource:"model"});
+  const farEnd=store.addQuestion({sourceId:1,kind:"JOIN 路径",scope:"column",tableName:"live_table",columnName:"junk_id",relationId:farRel.id,question:"live_table.junk_id 是否关联 junk_table.id？",evidence:"模型判断",options:["确认该关联","不允许关联"]});
+  const liveRel=store.upsertRelation({sourceId:1,fromTable:"live_table",fromCol:"self_ref",toTable:"live_table",toCol:"id",cardinality:"N:1",confidence:0.8,overlapRatio:0.5,status:"review",inferenceSource:"model"});
+  const bothLive=store.addQuestion({sourceId:1,kind:"JOIN 路径",scope:"column",tableName:"live_table",columnName:"self_ref",relationId:liveRel.id,question:"live_table.self_ref 是否关联 live_table.id？",evidence:"模型判断",options:["确认该关联","不允许关联"]});
+
+  assert.equal(store.closeQuestionsOnExcludedTables(1),3);
   const pending=new Set(store.listQuestions(1).map((item)=>item.id));
   assert.ok(pending.has(live),"A 表上的待确认项必须保留");
   assert.ok(pending.has(global),"全局口径问题不挂表，不受影响");
+  assert.ok(pending.has(bothLive),"两端都存活的 JOIN 问题保留");
   assert.equal(pending.has(junk),false);
   assert.equal(pending.has(paused),false,"停用表与 C 表同样无法被问数读取");
+  assert.equal(pending.has(farEnd),false,"JOIN 对端是 C 表的问题同样关闭");
   assert.equal(store.db.prepare("SELECT status FROM ds_question WHERE id=?").get(junk).status,"obsolete");
   assert.equal(store.closeQuestionsOnExcludedTables(1),0,"幂等：没有新的可关闭项");
   store.close();
