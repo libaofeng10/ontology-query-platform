@@ -42,13 +42,14 @@ export async function probeTable(connector, source, table, columns, { maxEnumVal
     if (!sensitive.sensitive && LOW_CARDINALITY_TYPE.test(column.dataType)) {
       try {
         const col = quoteIdentifier(column.columnName);
-        const [rows] = await connector.query(source,`SELECT ${col} AS value, COUNT(*) AS count FROM (SELECT ${col} FROM ${tableName} WHERE ${col} IS NOT NULL LIMIT ${sampleLimit}) AS ontoquery_sample GROUP BY ${col} ORDER BY count DESC LIMIT ${Number(maxEnumValues)+1}`);
         // A label column that qualifies as a dictionary can legitimately hold up to
         // labelDictionaryMaxRows distinct labels, which may exceed the general 20-value
-        // sampler cap (a 54-row channel list has 56 distinct names). Without this, the
-        // `rows.length <= maxEnumValues` gate rejects the very dictionary we just admitted.
+        // sampler cap (a 54-row channel list has 56 distinct names). Enlarge the SQL LIMIT
+        // to match, not just the post-query guard — otherwise the dictionary's tail values
+        // (the ones a user might type) are truncated before they ever reach isEnumDictionary.
         const isLabelColumn = ENUM_LABEL_SUFFIX.test(String(column.columnName??""));
         const valuesCap = Math.max(Number(maxEnumValues), isLabelColumn ? Number(labelDictionaryMaxRows) : 0);
+        const [rows] = await connector.query(source,`SELECT ${col} AS value, COUNT(*) AS count FROM (SELECT ${col} FROM ${tableName} WHERE ${col} IS NOT NULL LIMIT ${sampleLimit}) AS ontoquery_sample GROUP BY ${col} ORDER BY count DESC LIMIT ${Number(valuesCap)+1}`);
         if (rows.length && rows.length <= valuesCap) {
           item.cardinality=rows.length;
           if (isEnumDictionary(column.columnName,rows.length,estimatedRows,sampleLimit,enumMaxDistinctRatio,labelDictionaryMaxRows)) {

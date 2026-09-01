@@ -72,17 +72,20 @@ test("a dictionary-sized dimension table registers its label column despite the 
   // registers when the source opts into a higher cap via discovery config. This is the
   // alpha_crm_channel.channel_name case — the label is the vocabulary, so it must enter the
   // dictionary even though estimatedRows(54) > DEFAULT(20).
+  // The connector honors the SQL LIMIT the way MySQL does: it returns only the requested
+  // number of rows. Without the fix the sampler LIMIT stays at 21, the 54-value dictionary
+  // is truncated to 21, and the tail values (the ones a user types) never register.
   const channelRows=Array.from({length:54},(_item,index)=>({value:index===0?"抖音":`渠道${index}`,count:1}));
-  const channelConnector={query:async()=>[channelRows]};
-  // The label cap itself must raise the sampler cap: a 54-value channel list exceeds the
-  // default 20-value sampler, and the valuesCap rule (label col ≤ labelDictionaryMaxRows)
-  // is what lets it through without a separate maxEnumValues override.
+  const channelConnector={query:async(_source,sql)=>{
+    const limit=Number(/LIMIT (\d+)/.exec(sql)?.[1]||0);
+    return [channelRows.slice(0,limit)];
+  }};
   const channel=await probeTable(channelConnector,{},
     {tableName:"alpha_crm_channel",rowEstimate:54},
     [{columnName:"channel_name",dataType:"varchar(64)"}],
     {labelDictionaryMaxRows:100},
   );
-  assert.equal(channel.columns[0].enums.length,54,"配置上调上限后标签列恢复登记");
+  assert.equal(channel.columns[0].enums.length,54,"配置上调上限后标签列恢复登记，L 采样 LIMIT 同步放大");
   assert.equal(channel.columns[0].enums[0].value,"抖音","文本标签值本身就是字典成员");
 
   // Without the config the same table stays refused (conservative default).
