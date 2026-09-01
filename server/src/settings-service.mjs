@@ -26,6 +26,7 @@ const GROUPS = {
   },
   discovery: {
     enumMaxDistinctRatio: { envVar: "ENUM_MAX_DISTINCT_RATIO", validate: ratio },
+    labelDictionaryMaxRows: { envVar: "ENUM_LABEL_DICTIONARY_MAX_ROWS", validate: intRange(1, 500) },
   },
   profiling: {
     enabled: { envVar: "COLUMN_PROFILING_ENABLED", validate: bool },
@@ -153,7 +154,7 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
   const llmView = viewOf(state.llm, ["baseUrl", "apiKey", "model"]);
   const embeddingView = viewOf(state.embedding, ["baseUrl", "apiKey", "model", "dimensions"]);
   const retrievalView = viewOf(state.retrieval, ["vectorEnabled", "topK", "vectorWeight", "minSimilarity", "semanticThreshold"]);
-  const discoveryView = viewOf(state.discovery, ["enumMaxDistinctRatio"]);
+  const discoveryView = viewOf(state.discovery, ["enumMaxDistinctRatio", "labelDictionaryMaxRows"]);
   const profilingView = viewOf(state.profiling, ["enabled", "sampleLimit", "maxTablesPerRefresh", "timeoutMs"]);
   const ontologyAiView = viewOf(state.ontologyAi, ["mode", "autoConfirmScore", "maxTables", "maxFields", "timeoutMs", "criticEnabled", "calibrationMinSamples", "calibrationMinPrecision", "maxManualObjectRate", "maxFailureRate", "maxP95LatencyMs", "maxAverageTokens"]);
   const promptsView = viewOf(state.prompts, Object.keys(QUERY_PROMPT_SPECS));

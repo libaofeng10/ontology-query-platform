@@ -11,6 +11,7 @@ const BASE_CONFIG={
   llm:{baseUrl:"https://env-llm.example/v1",apiKey:"env-llm-key",model:"env-model"},
   embedding:{baseUrl:"",apiKey:"",model:"",dimensions:null},
   retrieval:{vectorEnabled:true,topK:8,vectorWeight:0.4,minSimilarity:0.35,semanticThreshold:0.55},
+  discovery:{enumMaxDistinctRatio:0.05,labelDictionaryMaxRows:20},
   ontologyAi:{mode:"off",autoConfirmScore:80,maxTables:20,maxFields:600,timeoutMs:90_000},
   semanticQueryPlanMode:"off",queryAgentMode:"off",queryAgentTrafficPercent:100,queryAgentMaxIterations:8,queryAgentMaxSqlCalls:5,queryAgentMaxScannedRows:5_000_000,queryAgentPendingTtlMs:600_000,queryMaxRows:500,explainMaxRows:1_000_000,queryTimeoutMs:30_000,queryLlmTimeoutMs:90_000,
 };
@@ -117,5 +118,19 @@ test("keys locked by createApp overrides ignore db values and refuse updates",as
     assert.equal(settings.publicView().sources["llm.model"],"override");
     settings.update({llm:{baseUrl:"https://db-llm.example/v1"}});
     assert.equal(settings.config.llm.baseUrl,"https://db-llm.example/v1");
+  } finally { store.close(); }
+});
+
+test("label dictionary row cap is an online-editable discovery setting",async()=>{
+  const {store,settings}=await createFixture();
+  try {
+    assert.equal(settings.config.discovery.labelDictionaryMaxRows,20);
+    assert.equal(settings.publicView().discovery.labelDictionaryMaxRows,20);
+    settings.update({discovery:{labelDictionaryMaxRows:100}},"admin-user");
+    assert.equal(settings.config.discovery.labelDictionaryMaxRows,100);
+    assert.equal(settings.publicView().sources["discovery.labelDictionaryMaxRows"],"db");
+    assert.throws(()=>settings.update({discovery:{labelDictionaryMaxRows:0}},"admin-user"),/labelDictionaryMaxRows/);
+    settings.update({discovery:{labelDictionaryMaxRows:null}},"admin-user");
+    assert.equal(settings.config.discovery.labelDictionaryMaxRows,20);
   } finally { store.close(); }
 });
