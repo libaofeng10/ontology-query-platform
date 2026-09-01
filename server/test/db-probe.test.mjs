@@ -68,6 +68,27 @@ test("a dictionary-sized dimension table registers its label column despite the 
   );
   assert.deepEqual(large.columns[0].enums,[]);
 
+  // A bounded dictionary that outgrows the default cap (a 54-row channel list, say) still
+  // registers when the source opts into a higher cap via discovery config. This is the
+  // alpha_crm_channel.channel_name case — the label is the vocabulary, so it must enter the
+  // dictionary even though estimatedRows(54) > DEFAULT(20).
+  const channelRows=Array.from({length:54},(_item,index)=>({value:index===0?"抖音":`渠道${index}`,count:1}));
+  const channelConnector={query:async()=>[channelRows]};
+  const channel=await probeTable(channelConnector,{},
+    {tableName:"alpha_crm_channel",rowEstimate:54},
+    [{columnName:"channel_name",dataType:"varchar(64)"}],
+    {labelDictionaryMaxRows:100,maxEnumValues:100},
+  );
+  assert.equal(channel.columns[0].enums.length,54,"配置上调上限后标签列恢复登记");
+  assert.equal(channel.columns[0].enums[0].value,"抖音","文本标签值本身就是字典成员");
+
+  // Without the config the same table stays refused (conservative default).
+  const strict=await probeTable(channelConnector,{},
+    {tableName:"alpha_crm_channel",rowEstimate:54},
+    [{columnName:"channel_name",dataType:"varchar(64)"}],
+  );
+  assert.deepEqual(strict.columns[0].enums,[]);
+
   // Identifier suffixes stay rejected even inside a dictionary-sized table.
   const identifier=await probeTable(connector,{},
     {tableName:"alpha_crm_channel",rowEstimate:12},

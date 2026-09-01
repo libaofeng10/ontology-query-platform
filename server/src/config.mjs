@@ -65,6 +65,11 @@ export const config = {
   },
   discovery: {
     enumMaxDistinctRatio:numberRatioFromEnv("ENUM_MAX_DISTINCT_RATIO",0.05),
+    // A label column (…name) is a business dictionary only when its table is small enough.
+    // 20 is the conservative default; a source whose dimension tables run longer (channel
+    // name lists, product catalogs) raises this so their label columns register. The probe
+    // and the enum catalog migration both read the same default, so they cannot drift.
+    labelDictionaryMaxRows:integerRangeFromEnv("ENUM_LABEL_DICTIONARY_MAX_ROWS",1,500,20),
   },
   profiling: {
     enabled:String(process.env.COLUMN_PROFILING_ENABLED??"false").toLowerCase()==="true",

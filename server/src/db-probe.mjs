@@ -12,6 +12,11 @@ export const ENUM_IDENTIFIER_BLACKLIST = /(_id|_no|_code|cell|phone|mobile|email
 // IS the business dictionary (alpha_crm_channel.channel_name → 抖音/百度/…), and there the
 // distinct ratio is expected to be ~1.0, so labels get their own judgment instead of the
 // ratio gate. Outside dictionary-sized tables a name column is treated like an identifier.
+// The row cap is a judgment call, not a physics constant: a 20-row table is unambiguously a
+// dictionary, but so is a 54-row channel table whose label column enumerates the vocabulary.
+// Keep the default conservative (large tables' name columns must not become in-query
+// vocabularies) but let the source's discovery config raise it. The migration imports the
+// DEFAULT so a probe and its migration stay consistent unless a source opts into a higher cap.
 export const ENUM_LABEL_SUFFIX = /name$/i;
 export const ENUM_LABEL_DICTIONARY_MAX_ROWS = 20;
 
@@ -21,7 +26,7 @@ function quoteIdentifier(value) {
   return `\`${identifier.replaceAll("`","``")}\``;
 }
 
-export async function probeTable(connector, source, table, columns, { maxEnumValues=20, sampleRows=DEFAULT_SAMPLE_ROWS, enumMaxDistinctRatio=DEFAULT_ENUM_MAX_DISTINCT_RATIO, profiling={} } = {}) {
+export async function probeTable(connector, source, table, columns, { maxEnumValues=20, sampleRows=DEFAULT_SAMPLE_ROWS, enumMaxDistinctRatio=DEFAULT_ENUM_MAX_DISTINCT_RATIO, labelDictionaryMaxRows=ENUM_LABEL_DICTIONARY_MAX_ROWS, profiling={} } = {}) {
   const tableName = quoteIdentifier(table.tableName);
   const sampleLimit = Math.max(1,Math.floor(Number(sampleRows)||DEFAULT_SAMPLE_ROWS));
   const results = [];
@@ -40,7 +45,7 @@ export async function probeTable(connector, source, table, columns, { maxEnumVal
         const [rows] = await connector.query(source,`SELECT ${col} AS value, COUNT(*) AS count FROM (SELECT ${col} FROM ${tableName} WHERE ${col} IS NOT NULL LIMIT ${sampleLimit}) AS ontoquery_sample GROUP BY ${col} ORDER BY count DESC LIMIT ${Number(maxEnumValues)+1}`);
         if (rows.length && rows.length <= maxEnumValues) {
           item.cardinality=rows.length;
-          if (isEnumDictionary(column.columnName,rows.length,estimatedRows,sampleLimit,enumMaxDistinctRatio)) {
+          if (isEnumDictionary(column.columnName,rows.length,estimatedRows,sampleLimit,enumMaxDistinctRatio,labelDictionaryMaxRows)) {
             const total = rows.reduce((sum,row)=>sum+Number(row.count),0);
             item.enums=rows.map((row)=>({value:String(row.value),count:Number(row.count),ratio:total?Number(row.count)/total:0}));
           }
@@ -57,11 +62,11 @@ export async function probeTable(connector, source, table, columns, { maxEnumVal
 // table, and either the values repeat often enough to be categories or the table itself is a
 // dictionary-sized dimension table whose label column enumerates the business vocabulary.
 // Identifier-shaped columns are rejected unconditionally.
-function isEnumDictionary(columnName,distinctCount,estimatedRows,sampleLimit,maxDistinctRatio) {
+function isEnumDictionary(columnName,distinctCount,estimatedRows,sampleLimit,maxDistinctRatio,labelDictionaryMaxRows=ENUM_LABEL_DICTIONARY_MAX_ROWS) {
   if (!(estimatedRows > 0 && estimatedRows <= sampleLimit)) return false;
   const name=String(columnName??"");
   if (ENUM_IDENTIFIER_BLACKLIST.test(name)) return false;
-  if (ENUM_LABEL_SUFFIX.test(name)) return estimatedRows <= ENUM_LABEL_DICTIONARY_MAX_ROWS;
+  if (ENUM_LABEL_SUFFIX.test(name)) return estimatedRows <= labelDictionaryMaxRows;
   const ratioBase = Math.min(estimatedRows,sampleLimit);
   return distinctCount / ratioBase < Number(maxDistinctRatio);
 }
