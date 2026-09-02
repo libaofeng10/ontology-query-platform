@@ -31,7 +31,7 @@ export async function callLlmTools(llm,messages,tools,options={}) {
   const data=await requestChatCompletion(llm,requestMessages,{timeoutMs,fetchImpl,extraBody:{tools:nativeTools,tool_choice:"required",...extraBody},signal});
   const message=data.choices?.[0]?.message;
   let action;
-  try { action=normalizeToolAction(message); } catch(error) { throw protocolFormatError(error.message); }
+  try { action=normalizeToolAction(message); } catch(error) { throw protocolFormatError(error.message,clipText(String(message?.content??message?.tool_calls?.[0]?.function?.arguments??""),240)); }
   const usage=normalizeUsage(data.usage);
   // In the JSON-content mode message.content is the JSON action itself, so it cannot double
   // as the thought fallback; a missing thought there is a format violation. Native tool_calls
@@ -70,7 +70,8 @@ function llmHttpError(status) {
 }
 
 function abortError() { const error=new Error("LLM 请求已取消");error.name="AbortError";error.code="ABORT_ERR";return error; }
-function protocolFormatError(message) { const error=new Error(message);error.code="LLM_PROTOCOL_FORMAT";return error; }
+function protocolFormatError(message,extra) { const error=new Error(extra?`${message}（LLM 原文：${clipText(extra,240)}）`:message);error.code="LLM_PROTOCOL_FORMAT";return error; }
+function clipText(value,maxLength) { const text=String(value??"").replace(/\s+/g," ").trim();return text.length<=maxLength?text:`${text.slice(0,maxLength)}…`; }
 export function isProtocolFormatError(error) { return error?.code==="LLM_PROTOCOL_FORMAT"; }
 function traceError(message,rawContent,usage) { const error=new Error(message);error.rawContent=rawContent??null;error.usage=usage;return error; }
 function normalizeUsage(value) { if(!value||typeof value!=="object")return null;const promptTokens=Number(value.prompt_tokens??value.input_tokens??0);const completionTokens=Number(value.completion_tokens??value.output_tokens??0);const totalTokens=Number(value.total_tokens??promptTokens+completionTokens);return {promptTokens:Number.isFinite(promptTokens)?promptTokens:0,completionTokens:Number.isFinite(completionTokens)?completionTokens:0,totalTokens:Number.isFinite(totalTokens)?totalTokens:0}; }
@@ -149,8 +150,14 @@ function objectValue(value) { return value&&typeof value==="object"&&!Array.isAr
 // parsable object exists so callers keep the strict protocol error.
 function extractJsonObject(content) {
   const text=String(content||"");
-  const start=text.indexOf("{");
-  if(start<0)return null;
+  for(let start=text.indexOf("{");start>=0;start=text.indexOf("{",start+1)) {
+    const slice=extractBalancedJson(text,start);
+    if(slice!=null)return slice;
+  }
+  return null;
+}
+
+function extractBalancedJson(text,start) {
   let depth=0;let inString=false;let escaped=false;
   for(let index=start;index<text.length;index++) {
     const char=text[index];
@@ -160,7 +167,7 @@ function extractJsonObject(content) {
     if(inString)continue;
     if(char==="{")depth++;
     else if(char==="}"){depth--;if(depth===0){
-      try{const parsed=JSON.parse(text.slice(start,index+1));return parsed&&typeof parsed==="object"&&!Array.isArray(parsed)?parsed:null;}
+      try{const parsed=JSON.parse(text.slice(start,index+1));if(parsed&&typeof parsed==="object"&&!Array.isArray(parsed))return parsed;}
       catch{return null;}
     }}
   }
@@ -178,4 +185,4 @@ function normalizeToolDefinitions(tools) {
   });
 }
 
-export const _internal={isPlaceholder,isTimeout,llmHttpError,normalizeToolDefinitions,normalizeToolAction,parseToolArguments};
+export const _internal={isPlaceholder,isTimeout,llmHttpError,normalizeToolDefinitions,normalizeToolAction,parseToolArguments,extractJsonObject};

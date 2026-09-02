@@ -705,3 +705,40 @@ test("requesting an unauthorized tool terminates immediately without a protocol 
     assert.equal(audit.toolTrace.some((item)=>item.tool==="protocol_retry"),false);
   } finally { globalThis.fetch=originalFetch;store.close(); }
 });
+
+test("a second protocol slip surfaces the already-valid run instead of discarding it",async()=>{
+  const {store,source}=await createFixture();
+  const sql="SELECT customer_id FROM crm_customer";
+  let queries=0;
+  const connector={explain:async()=>[{rows:1}],query:async()=>{queries++;return [[{customer_id:7}],[{name:"customer_id"}]];}};
+  // The model first posts a compliant run, then two consecutive malformed
+  // actions, both raw prose that cannot be salvaged into JSON. The loop retries
+  // the first slip once; the second must not throw away the earlier good run —
+  // the budget fallback surfaces its contract-valid result instead of refusing.
+  const prose1='"我直接告诉您结果吧，查询到客户。"';
+  const prose2='"结果就是查询到一位客户，编号 7。"';
+  const actions=[
+    {thought:"执行已确认查询。",tool:"run_sql",args:{sql}},
+    prose1,
+    prose2,
+  ];
+  let modelCalls=0;
+  const originalFetch=globalThis.fetch;
+  globalThis.fetch=async()=>{
+    modelCalls++;
+    const next=actions.shift();
+    if(typeof next==="string")return new Response(JSON.stringify({choices:[{message:{content:next}}],usage:{prompt_tokens:11,completion_tokens:4,total_tokens:15}}),{status:200,headers:{"content-type":"application/json"}});
+    return llmResponse(next);
+  };
+  try {
+    const service=createQueryService({store,connector,config:config()});
+    const answer=await service.ask({sourceId:source.id,question:"查询有效客户",userName:"tester"});
+    assert.equal(answer.refused,undefined,"应带出已成功的查询结果而不是拒答");
+    assert.equal(answer.evidence.budgetFallback,true);
+    assert.equal(answer.rows.length,1);
+    assert.equal(queries,1);
+    const audit=store.listAudits(source.id,1)[0];
+    assert.equal(audit.toolTrace.filter((item)=>item.tool==="protocol_retry").length,1);
+    assert.ok(audit.toolTrace.some((item)=>item.tool==="run_sql"&&item.ok),"先前成功的 run_sql 不应被丢弃");
+  } finally { globalThis.fetch=originalFetch;store.close(); }
+});

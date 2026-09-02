@@ -256,6 +256,16 @@ export async function runQueryAgent({store,connector,config,source,question,cont
           index--; // A format slip must not burn a reasoning iteration; the wall-clock deadline still bounds the loop.
           continue;
         }
+        // A second consecutive protocol slip means the model can no longer produce a
+        // compliant action. Throwing discards every outcome already in hand — including
+        // a contract-valid run the loop is one submit away from answering. When such a
+        // run exists, fall through to the budget fallback so it can surface that answer
+        // instead of failing the whole query. Exhaust the last iteration here: the
+        // fallback decides whether an already-successful result is sufficient.
+        if(isProtocolFormatError(error)&&successfulRuns.some((run)=>run.contractValidation?.ok)) {
+          index=maxIterations;
+          continue;
+        }
         throw error;
       }
       consecutiveProtocolErrors=0;

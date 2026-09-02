@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { callLlmJsonWithTrace, callLlmTools } from "../src/llm-client.mjs";
+import { _internal } from "../src/llm-client.mjs";
 
 const llm={baseUrl:"https://model.test/v1",apiKey:"sk-valid-test-key",model:"tool-model"};
 const tools=[{
@@ -60,4 +61,16 @@ test("JSON calls can return raw output and normalized usage for generation audit
 test("invalid JSON errors retain raw output for restricted audit",async()=>{
   const fetchImpl=async()=>new Response(JSON.stringify({choices:[{message:{content:"not-json"}}],usage:{total_tokens:4}}),{status:200});
   await assert.rejects(()=>callLlmJsonWithTrace(llm,[],{fetchImpl}),error=>{assert.equal(error.rawContent,"not-json");assert.equal(error.usage.totalTokens,4);return /合法 JSON/.test(error.message);});
+});
+
+test("extractJsonObject salvages JSON after prose and a brace inside thought",()=>{
+  const text='好的，我来回答。{"thought":"正在分析，包含 { 不影响解析","tool":"submit_answer","args":{"conclusion":"..."}}';
+  const parsed=_internal.extractJsonObject(text);
+  assert.ok(parsed,"should parse the top-level object");
+  assert.equal(parsed.tool,"submit_answer");
+});
+
+test("extractJsonObject returns null when nothing parses",()=>{
+  assert.equal(_internal.extractJsonObject("这段文字只有 { 没有完整对象"),null);
+  assert.equal(_internal.extractJsonObject("完全没有对象"),null);
 });
