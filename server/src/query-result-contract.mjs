@@ -426,8 +426,8 @@ function validateClosedWorldRowDomain(contract,shape,slots,errors) {
   const filterMatches=new Map(filterSlots.map((slot)=>[slot.id,(shape.rowDomainAtoms||[]).filter((atom)=>matchesDeclaredFilter(atom,slot,shape))]));
   for(const slot of filterSlots)if((filterMatches.get(slot.id)||[]).length!==1)errors.push(issue(
     "INTENT_FILTER_MISMATCH",
-    `SQL 必须且只能有一个与“${slot.surfaceText||slot.value}”完全一致的筛选原子，不能遗漏、重复或绑定到其他字段`,
-    {requirementId:slot.id,expectedColumns:slot.columns||[],operator:slot.operator,value:slot.value,actualPredicates:(shape.rowDomainAtoms||[]).filter((atom)=>atom.kind==="predicate")},
+    `SQL 必须且只能有一个与“${slot.surfaceText||slot.value}”完全一致的筛选原子，不能遗漏、重复或绑定到其他字段${describeExpectedFilterAtoms(slot)}`,
+    {requirementId:slot.id,expectedColumns:slot.columns||[],operator:slot.operator,value:slot.value,expectedBindings:(slot.filterBindings||[]).map((item)=>({column:item.column,operator:item.operator,value:item.value,valueType:item.valueType})),actualPredicates:(shape.rowDomainAtoms||[]).filter((atom)=>atom.kind==="predicate")},
   ));
   const semanticMatches=new Map(semanticRowDomainSlots.map((slot)=>[slot.id,(shape.rowDomainAtoms||[]).filter((atom)=>matchesSemanticRowDomain(atom,slot,shape))]));
   for(const slot of semanticRowDomainSlots)if((semanticMatches.get(slot.id)||[]).length!==1)errors.push(issue(
@@ -495,6 +495,15 @@ function matchesSemanticRowDomain(atom,slot,shape) {
   const actual=operator==="="?[semanticLiteralKey({value:atom.value,valueType:atom.valueType})]:operator==="in"?(atom.values||[]).map(semanticLiteralKey).sort():[];
   if(operator==="="&&expected.length!==1||operator==="in"&&actual.length!==expected.length||!new Set(["=","in"]).has(operator))return false;
   return actual.length===expected.length&&actual.every((value,index)=>value===expected[index]);
+}
+
+// The planner LLM must reproduce the declared filter atom exactly. When the
+// binding layer has already proven the physical column and literal, spell them
+// out in the repair feedback: "抖音渠道" wants channel_name = '抖音', and without
+// this the model guesses sibling dictionary members such as 'MCN-抖音'.
+function describeExpectedFilterAtoms(slot) {
+  const bindings=(slot.filterBindings||[]).map((item)=>`${item.column} ${normalizeFilterOperator(item.operator)} '${item.value}'`);
+  return bindings.length?`；本筛选已绑定：${bindings.join(" 且 ")}，值必须逐字一致，不得替换为其他字典取值`:"";
 }
 
 function matchesDeclaredFilter(atom,slot,shape) {

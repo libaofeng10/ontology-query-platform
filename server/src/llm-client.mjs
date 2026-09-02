@@ -104,7 +104,13 @@ function normalizeToolAction(message) {
   if(!content) throw new Error("LLM 未返回工具动作");
   let parsed;
   try { parsed=JSON.parse(content); }
-  catch { throw new Error("LLM 工具动作不是合法 JSON"); }
+  catch {
+    // Content-mode models routinely wrap the action in markdown fences or lead
+    // with a sentence of prose. Salvage the first balanced JSON object before
+    // declaring a protocol violation — the retry costs a full LLM round-trip.
+    parsed=extractJsonObject(content);
+    if(parsed==null) throw new Error("LLM 工具动作不是合法 JSON");
+  }
   if(!parsed||typeof parsed!=="object"||Array.isArray(parsed)) throw new Error("LLM 工具动作必须是 JSON 对象");
   if(Array.isArray(parsed.tool_calls)) return {...normalizeToolAction({content:parsed.thought,tool_calls:parsed.tool_calls}),jsonProtocol:true};
   const wrapped=objectValue(parsed.tool_call)||objectValue(parsed.function_call)||objectValue(parsed.function)||objectValue(parsed.action)||objectValue(parsed.tool);
@@ -136,6 +142,30 @@ function parseToolArguments(value) {
 }
 
 function objectValue(value) { return value&&typeof value==="object"&&!Array.isArray(value)?value:null; }
+
+// Best-effort extraction of the first balanced top-level JSON object from
+// free-form model output (markdown fences, leading prose). Scans with a string
+// aware depth counter, then JSON.parses the exact slice; returns null when no
+// parsable object exists so callers keep the strict protocol error.
+function extractJsonObject(content) {
+  const text=String(content||"");
+  const start=text.indexOf("{");
+  if(start<0)return null;
+  let depth=0;let inString=false;let escaped=false;
+  for(let index=start;index<text.length;index++) {
+    const char=text[index];
+    if(escaped){escaped=false;continue;}
+    if(char==="\\"){if(inString)escaped=true;continue;}
+    if(char==='"'){inString=!inString;continue;}
+    if(inString)continue;
+    if(char==="{")depth++;
+    else if(char==="}"){depth--;if(depth===0){
+      try{const parsed=JSON.parse(text.slice(start,index+1));return parsed&&typeof parsed==="object"&&!Array.isArray(parsed)?parsed:null;}
+      catch{return null;}
+    }}
+  }
+  return null;
+}
 
 function normalizeToolDefinitions(tools) {
   if(!Array.isArray(tools)||!tools.length) throw new Error("工具定义不能为空");
