@@ -779,19 +779,29 @@ function anchorMeasureCandidates(facetEntries,{columnsByTable,tableByName}) {
   if(!identityColumn)return;
   for(const entry of facetEntries) {
     if(entry.facet.kind!=="measure"||entry.facet.allowMultiple)continue;
-    // Only the bare row count of the object itself ("数量") anchors to the
-    // subject root. "成单数"/"完成数" are count-distinct but bind an event time
-    // and must keep their own candidate ranking on the event table, so only the
-    // value "count" (timeRole=null, order_time-free) is anchored.
     if(String(entry.facet.value||"").toLowerCase()!=="count")continue;
     if(entry.facet.evidence?.level==="verified_knowledge")continue;
-    if(entry.candidates.some((candidate)=>candidate.table.tableName===rootName))continue;
-    entry.candidates.unshift({
-      table,
-      matchedColumns:[{name:identityColumn.columnName,score:1,label:false,identity:Boolean(identityColumn.isPrimary||identityColumn.isUnique),binding:false}],
-      score:Math.max(Number(rootCandidate.score||0),1),
-      subjectPriority:Number(rootCandidate.subjectPriority||0),
-    });
+    const existing=entry.candidates.find((candidate)=>candidate.table.tableName===rootName);
+    if(existing) {
+      // The root already ranks as a measure candidate but its count-vocabulary
+      // score may be low (its own columns don't match 数量/id/主键). Promote it to
+      // the top so the count executes on the requested object, not on an
+      // unrelated table that merely carries id-like columns.
+      existing.matchedColumns=[...(existing.matchedColumns||[]),{name:identityColumn.columnName,score:1,label:false,identity:Boolean(identityColumn.isPrimary||identityColumn.isUnique),binding:false}];
+      existing.score=Math.max(Number(existing.score||0),Number(rootCandidate.score||0));
+      entry.candidates=[existing,...entry.candidates.filter((candidate)=>candidate!==existing)];
+    } else {
+      entry.candidates.unshift({
+        table,
+        matchedColumns:[{name:identityColumn.columnName,score:1,label:false,identity:Boolean(identityColumn.isPrimary||identityColumn.isUnique),binding:false}],
+        score:Math.max(Number(rootCandidate.score||0),1),
+        subjectPriority:Number(rootCandidate.subjectPriority||0),
+      });
+    }
+    // An anchored count is complete on the subject root alone. Keeping the
+    // default quota of 2 would let a second, unrelated id-carrying table into
+    // the execution contract and force the SQL to cover it.
+    entry.facet.quota=1;
   }
 }
 
