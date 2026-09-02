@@ -272,6 +272,27 @@ function dictionaryMemberSurfaces(items=[]) {
 
 function conceptMemberValues(concept) {return Array.isArray(concept?.memberValues)?concept.memberValues:[];}
 
+// A shell business-field concept (“渠道”) has no dictionary of its own. When the
+// filter value is a member of some other catalog concept's closed set (the
+// channel_name dictionary), the filter may be satisfied across a confirmed join
+// to that dictionary table. Enrich the filter with those exact catalog columns
+// so the binding layer can rank the dictionary table as a candidate; the value
+// still resolves only if membership is real, so this never opens a generic
+// value-to-column guessing channel.
+function catalogColumnForMember(concepts=[],value) {
+  const literal=String(value??"");
+  if(!literal)return {columns:[],terms:[]};
+  const matched=[];
+  for(const concept of concepts||[]) {
+    if(concept.numeric===true)continue;
+    const members=conceptMemberValues(concept);
+    if(!members.some((member)=>String(member)===literal))continue;
+    for(const column of concept.physicalColumns||[])matched.push(String(column).toLowerCase());
+  }
+  const columns=[...new Set(matched)].sort();
+  return {columns,terms:[]};
+}
+
 function typedColumnKind(column={}) {
   const text=`${column.columnName||""} ${column.comment||""}`;
   if(/(?:mobile|phone|telephone|tel(?:ephone)?|cell|手机号|联系电话|手机号码|电话)/i.test(text))return "phone";
@@ -894,7 +915,8 @@ function detectBusinessFilters(value,{subjects=[],concepts=[],protectedTermAlias
     if(concept.numeric!==true&&new Set(["gt","gte","lt","lte"]).has(operator)) {reject("FILTER_OPERATOR_UNSUPPORTED",match[0],`筛选“${match[0]}”没有已证明的数值字段类型，不能使用范围操作符`,{field,start,end,concept,alias:match[1]});return;}
     if(concept.numeric===true&&operator==="contains") {reject("FILTER_OPERATOR_UNSUPPORTED",match[0],`数值筛选“${match[0]}”不能使用包含关系`,{field,start,end,concept,alias:match[1]});return;}
     if(operator==="contains"&&/[\\%_]/.test(String(literal))) {reject("FILTER_VALUE_ESCAPE_UNSUPPORTED",match[0],`筛选值“${literal}”含有 LIKE 通配或转义字符，当前无法证明包含语义与原文字面值一致`,{field,start,end,concept,alias:match[1]});return;}
-    filters.push({kind:"attribute",field,fieldSurface:match[1],fieldTerms:[...new Set([match[1],field,...(concept.terms||[])])],physicalColumns:[...(concept.physicalColumns||[])],operator,value:literal,valueType,attachesTo:filterSubjectForAlias(match[1],subjects),immutable:true,sourceText:match[0],span:{start,end},...(concept.provenance?{provenance:{kind:"catalog_property",sources:concept.provenance}}:{})});
+    const catalogColumn=(concept.physicalColumns||[]).length?{columns:[],terms:[]}:catalogColumnForMember(concepts,literal);
+    filters.push({kind:"attribute",field,fieldSurface:match[1],fieldTerms:[...new Set([match[1],field,...(concept.terms||[])])],physicalColumns:[...new Set([...(concept.physicalColumns||[]),...catalogColumn.columns])],operator,value:literal,valueType,attachesTo:filterSubjectForAlias(match[1],subjects),immutable:true,sourceText:match[0],span:{start,end},...(concept.provenance?{provenance:{kind:"catalog_property",sources:concept.provenance}}:{})});
     consume(start,end);
   };
 

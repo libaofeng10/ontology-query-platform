@@ -199,6 +199,12 @@ export function retrieveKnowledge({question,pages,tables,columnsByTable,relation
     const roots=targetRoots||filterSubjectRoots(entry);
     const closure=filterClosureSnapshot||new Set(selectedNames);
     const verifiedPhysical=verifiedPhysicalFilterFacet(entry.facet);
+    // Path B: a catalog dictionary filter may solve across a confirmed join to the
+    // dictionary table that actually carries the closed-set member. This is an
+    // additive, strictly-bounded channel — it requires an exact physical column on
+    // the candidate table whose registered enum contains the value, and a confirmed
+    // path from that table back to the business root.
+    const dictionaryColumn=filterDictionaryColumn(entry.facet);
     const options=[];
     for(const candidate of entry.candidates) {
       const table=candidate.table.tableName;
@@ -208,9 +214,17 @@ export function retrieveKnowledge({question,pages,tables,columnsByTable,relation
       // a related table, and that table/path must already belong to the first
       // retrieval closure. This prevents the filter itself from expanding its
       // own authorization surface.
-      if(!verifiedPhysical||!closure.has(table))continue;
+      const dictionaryCandidate=Boolean(dictionaryColumn&&(candidate.matchedColumns||[]).some((column)=>column.binding&&dictionaryColumn.columns.has(`${table}.${column.name}`)));
+      if(!verifiedPhysical||!closure.has(table)) {
+        if(!dictionaryCandidate||!confirmedRelationGraph.has(table))continue;
+      }
       const paths=[...roots].map((root)=>bestPathInsideClosure(table,root,confirmedRelationGraph,closure,blockedRoots)).filter(Boolean).sort((left,right)=>left.length-right.length||left.join("\u0000").localeCompare(right.join("\u0000")));
-      if(paths[0])options.push({candidate,path:paths[0]});
+      let selectedPath=paths[0];
+      if(!selectedPath&&dictionaryCandidate) {
+        const confirmedPaths=[...roots].map((root)=>bestPathToTarget(table,root,confirmedRelationGraph,blockedRoots)).filter(Boolean).sort((left,right)=>left.length-right.length||left.join("\u0000").localeCompare(right.join("\u0000")));
+        selectedPath=confirmedPaths[0];
+      }
+      if(selectedPath)options.push({candidate,path:selectedPath});
     }
     return options;
   }
@@ -991,6 +1005,20 @@ function mergePredicates(...groups) {
 
 function verifiedPhysicalFilterFacet(facet) {
   return facet?.kind==="filter"&&facet.valueBinding==="verified_knowledge"&&Array.isArray(facet.physicalColumns)&&facet.physicalColumns.length>0;
+}
+
+// Path B: identify the exact physical columns on dictionary tables that carry
+// this catalog filter's closed-set member. The binding layer's root-disambiguation
+// (filterCandidateOptions) keeps only the column on a table reachable by a
+// confirmed path back to the business root; the parser never guesses a value, so
+// membership in a registered enum is the only license to surface these columns.
+function filterDictionaryColumn(facet) {
+  if(facet?.kind!=="filter"||facet.valueBinding==="verified_knowledge"||!(facet.physicalColumns||[]).length)return null;
+  const source=String(facet.value??"");
+  if(!source)return null;
+  const columns=[...new Set((facet.physicalColumns||[]).map((item)=>String(item||"").toLowerCase()).filter((item)=>item.includes(".")))];
+  if(!columns.length)return null;
+  return {columns:new Set(columns)};
 }
 
 function structureContains(table,columns,terms) {

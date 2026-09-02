@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyIntentClarification, knowledgeIntentConcepts, knowledgeIntentRowDomains, mergeContextualQueryIntent, parseQueryIntent } from "../src/query-intent.mjs";
+import { applyIntentClarification, catalogFilterConcepts, knowledgeIntentConcepts, knowledgeIntentRowDomains, mergeContextualQueryIntent, parseQueryIntent } from "../src/query-intent.mjs";
 import { retrieveKnowledge } from "../src/knowledge-retrieval.mjs";
 import { queryResultContractValidation } from "../src/query-scope-coverage.mjs";
 import { buildQueryResultContract, validateQueryRunSet } from "../src/query-result-contract.mjs";
@@ -893,4 +893,74 @@ FROM`);
 FROM deal_event e JOIN lead_entity l ON l.id=e.lead_id
 WHERE e.completed_at >= '2025-08-01' AND e.completed_at < '2026-09-01' AND l.is_deleted=0`;
   assert.ok(check(mixed).errors.some((item)=>item.code==="INTENT_COMPARISON_OUTPUT_PERIOD_MISMATCH"));
+});
+
+// T-cross: an operator-less dictionary filter whose closed-set member lives on a
+// related dictionary table must bind across a confirmed JOIN, not just on the
+// business root. The real production shape is clue.channel_id -> channel.id with
+// channel_name carrying the value — a dictionary column the clue table does not
+// itself hold. This is the filter cross-table binding (path B).
+const DICT_TABLES=[
+  {tableName:"alpha_crm_clue",comment:"线索主表"},
+  {tableName:"alpha_crm_channel",comment:"渠道"},
+];
+const DICT_COLUMNS={
+  alpha_crm_clue:[
+    {columnName:"id",dataType:"bigint",comment:"线索主键",isPrimary:1},
+    {columnName:"channel_id",dataType:"bigint",comment:"渠道ID"},
+    {columnName:"created_at",dataType:"datetime",comment:"线索创建时间"},
+    {columnName:"is_deleted",dataType:"tinyint",comment:"逻辑删除"},
+  ],
+  alpha_crm_channel:[
+    {columnName:"id",dataType:"bigint",comment:"渠道ID",isPrimary:1},
+    {columnName:"channel_name",dataType:"varchar",comment:"渠道名称"},
+    {columnName:"is_deleted",dataType:"tinyint",comment:"逻辑删除"},
+  ],
+};
+const DICT_RELATIONS=[{id:3494,fromTable:"alpha_crm_clue",fromCol:"channel_id",toTable:"alpha_crm_channel",toCol:"id",status:"confirmed",confidence:1}];
+const DICT_ENUMS={"alpha_crm_channel.channel_name":[
+  {value:"抖音",meaning:null,meaningSource:null},
+  {value:"百度",meaning:null,meaningSource:null},
+]};
+const DICT_POLICY={allowedTables:DICT_TABLES.map((item)=>item.tableName),allowedColumns:Object.fromEntries(Object.entries(DICT_COLUMNS).map(([table,columns])=>[table,columns.map((item)=>item.columnName)])),allowedRelations:DICT_RELATIONS,maxRows:100};
+
+test("a dictionary member on a confirmed JOIN table binds the filter across that join",()=>{
+  const filterConcepts=catalogFilterConcepts(DICT_TABLES,DICT_COLUMNS,null,[],DICT_ENUMS);
+  let intent=parseQueryIntent("本月抖音渠道的线索数量",{now:new Date(2026,8,1),filterConcepts});
+  // Resolve the time role so the fixture isolates the filter binding; production
+  // questions already carry an explicit/derived role. The filter is the target.
+  intent=applyIntentClarification(intent,"创建或进入时间");
+
+  // The filter must carry the dictionary column as proof of which physical
+  // dictionary column holds the closed-set member.
+  const filter=intent.filters.find((item)=>item.field==="channel");
+  assert.equal(filter?.value,"抖音");
+  assert.ok((filter.physicalColumns||[]).includes("alpha_crm_channel.channel_name"),"catalog member must supply its dictionary column");
+
+  const retrieval=retrieveKnowledge({question:intent.rawQuestion,pages:[],tables:DICT_TABLES,columnsByTable:DICT_COLUMNS,relations:DICT_RELATIONS,intent,enumItemsByColumn:DICT_ENUMS,maxTables:12});
+  assert.ok(!retrieval.coverageContract.missing.includes("filter:channel:0"),"cross-table dictionary filter must be covered, not a schema_gap");
+  const facet=retrieval.diagnostics.facets.find((item)=>item.key==="filter:channel:0");
+  assert.equal(facet?.covered,true,"filter facet must be covered");
+  assert.ok((facet?.filterBindings||[]).length>0,"filter facet must carry at least one binding");
+  assert.deepEqual(facet?.filterBindings.map((binding)=>[binding.column,binding.value,binding.evidence?.kind]),[["alpha_crm_channel.channel_name","抖音","observed_enum_value"]]);
+
+  const check=(sql)=>{const verdict=guardSql(sql,DICT_POLICY);assert.equal(verdict.ok,true,verdict.reason);return queryResultContractValidation(intent,verdict.sql,{usedTables:verdict.tables,retrieval,verdict,columnsByTable:DICT_COLUMNS});};
+  const correct=`SELECT COUNT(DISTINCT c.id) AS clue_count
+FROM alpha_crm_clue c JOIN alpha_crm_channel ch ON ch.id=c.channel_id
+WHERE c.created_at >= '2026-09-01' AND c.created_at < '2026-10-01'
+  AND ch.channel_name='抖音' AND c.is_deleted=0 AND ch.is_deleted=0`;
+  assert.equal(check(correct).ok,true,JSON.stringify(check(correct).errors));
+  // The value must bind on the dictionary column; it cannot drift to another column.
+  const wrongColumn=correct.replace("ch.channel_name='抖音'","c.channel_id=1");
+  assert.ok(check(wrongColumn).errors.some((item)=>item.code==="INTENT_FILTER_MISMATCH"));
+});
+
+test("a closed-set member that belongs to zero confirmed dictionary tables still fails closed",()=>{
+  // Drop the confirmed relation: the dictionary table is no longer reachable, so
+  // the filter must remain a schema_gap rather than guess a column.
+  const filterConcepts=catalogFilterConcepts(DICT_TABLES,DICT_COLUMNS,null,[],DICT_ENUMS);
+  let intent=parseQueryIntent("本月抖音渠道的线索数量",{now:new Date(2026,8,1),filterConcepts});
+  intent=applyIntentClarification(intent,"创建或进入时间");
+  const retrieval=retrieveKnowledge({question:intent.rawQuestion,pages:[],tables:DICT_TABLES,columnsByTable:DICT_COLUMNS,relations:[],intent,enumItemsByColumn:DICT_ENUMS,maxTables:12});
+  assert.ok(retrieval.coverageContract.missing.includes("filter:channel:0"),"without a confirmed path the dictionary filter must stay a schema_gap");
 });
