@@ -76,6 +76,7 @@ export function retrieveKnowledge({question,pages,tables,columnsByTable,relation
     const ontologyCandidates=ontologyIndex?rankOntologyFacetTables(facet,ontologyIndex,tableByName):[];
     return {facet,authoritativeNames,authoritativePageKeys:authoritativePages.map(knowledgePageKey),candidates:mergeFacetCandidates(structuralCandidates,ontologyCandidates),selected:[],paths:[],productPaths:new Map(),attributionBinding:null,attributionSubjectTable:null};
   });
+  anchorMeasureCandidates(facetEntries,{columnsByTable,tableByName});
   const connectSubjectFacets=new Set(["aggregate","ranking","trend","comparison"]).has(intent?.shape?.kind)
     &&facetEntries.filter((entry)=>entry.facet.kind==="subject"&&entry.facet.required).length>1;
   const selectFacetCandidate=(facetEntry,candidate,{requirePath=false,path:boundPath=null,attributionBinding=null,productScopeId=null}={})=>{
@@ -754,6 +755,44 @@ const SEMANTIC_CONCEPT_PATTERNS={
 function orderedFacets(facets) {
   const priority={subject:0,measure:1,dimension:2,time:3,filter:4,entity:5,product:6,scope:7};
   return [...facets].sort((left,right)=>(priority[left.kind]??9)-(priority[right.kind]??9)||left.key.localeCompare(right.key));
+}
+
+// A bare count over a business object ("线索数量") counts rows of the subject
+// root table itself. The count vocabulary (数量/count/id/主键) scores weakly on
+// that root's own columns, so without an anchor the measure's candidates become
+// whichever unrelated tables happen to carry id-like columns (account seats,
+// deduction methods), and the execution contract then demands those tables in
+// the SQL. Anchor only a count/count_distinct measure to its subject's top-ranked
+// root: counting the requested object is always executable on the object's own
+// table. Other measures (won, revenue, average) aggregate across an event table
+// and must keep their own candidate ranking.
+function anchorMeasureCandidates(facetEntries,{columnsByTable,tableByName}) {
+  const subjectEntries=facetEntries.filter((entry)=>entry.facet.kind==="subject"&&entry.facet.required);
+  if(subjectEntries.length!==1)return;
+  const rootCandidate=subjectEntries[0].candidates[0];
+  const rootName=rootCandidate?.table?.tableName;
+  if(!rootName)return;
+  const table=tableByName.get(rootName);
+  if(!table)return;
+  const columns=columnsByTable[rootName]||[];
+  const identityColumn=columns.find((column)=>column.isPrimary||column.isUnique)||columns[0];
+  if(!identityColumn)return;
+  for(const entry of facetEntries) {
+    if(entry.facet.kind!=="measure"||entry.facet.allowMultiple)continue;
+    // Only the bare row count of the object itself ("数量") anchors to the
+    // subject root. "成单数"/"完成数" are count-distinct but bind an event time
+    // and must keep their own candidate ranking on the event table, so only the
+    // value "count" (timeRole=null, order_time-free) is anchored.
+    if(String(entry.facet.value||"").toLowerCase()!=="count")continue;
+    if(entry.facet.evidence?.level==="verified_knowledge")continue;
+    if(entry.candidates.some((candidate)=>candidate.table.tableName===rootName))continue;
+    entry.candidates.unshift({
+      table,
+      matchedColumns:[{name:identityColumn.columnName,score:1,label:false,identity:Boolean(identityColumn.isPrimary||identityColumn.isUnique),binding:false}],
+      score:Math.max(Number(rootCandidate.score||0),1),
+      subjectPriority:Number(rootCandidate.subjectPriority||0),
+    });
+  }
 }
 
 function facetQuota(facet) { return Number.isInteger(facet.quota)&&facet.quota>0?facet.quota:facet.kind==="subject"||facet.kind==="product"?2:1; }

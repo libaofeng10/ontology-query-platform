@@ -964,3 +964,32 @@ test("a closed-set member that belongs to zero confirmed dictionary tables still
   const retrieval=retrieveKnowledge({question:intent.rawQuestion,pages:[],tables:DICT_TABLES,columnsByTable:DICT_COLUMNS,relations:[],intent,enumItemsByColumn:DICT_ENUMS,maxTables:12});
   assert.ok(retrieval.coverageContract.missing.includes("filter:channel:0"),"without a confirmed path the dictionary filter must stay a schema_gap");
 });
+
+// T-count: a bare "数量" measure must count the subject root table, not drift to
+// unrelated account tables that merely share id-like columns. The count facet
+// anchors to alpha_crm_clue even when account tables score higher on the generic
+// count vocabulary (id/主键), so the execution contract never demands the SQL to
+// cover account tables for a clue-count question.
+const COUNT_TABLES=DICT_TABLES.concat([
+  {tableName:"alpha_account_seat",comment:"律所加账号席位表"},
+  {tableName:"alpha_account_user",comment:""},
+]);
+const COUNT_COLUMNS={
+  ...DICT_COLUMNS,
+  alpha_account_seat:[{columnName:"id",dataType:"bigint",comment:"主键",isPrimary:1},{columnName:"alpha_user_id",dataType:"bigint",comment:"用户ID"},{columnName:"is_valid",dataType:"tinyint",comment:"有效"}],
+  alpha_account_user:[{columnName:"account_no",dataType:"varchar",comment:"账号"},{columnName:"id",dataType:"bigint",comment:"主键",isPrimary:1}],
+};
+
+test("a bare count measure anchors to the subject root instead of drifting to account tables",()=>{
+  const filterConcepts=catalogFilterConcepts(COUNT_TABLES,COUNT_COLUMNS,null,[],DICT_ENUMS);
+  let intent=parseQueryIntent("本月抖音渠道的线索数量",{now:new Date(2026,8,1),filterConcepts});
+  intent=applyIntentClarification(intent,"创建或进入时间");
+  const retrieval=retrieveKnowledge({question:intent.rawQuestion,pages:[],tables:COUNT_TABLES,columnsByTable:COUNT_COLUMNS,relations:DICT_RELATIONS,intent,enumItemsByColumn:DICT_ENUMS,maxTables:12});
+  assert.ok(!retrieval.coverageContract.missing.includes("measure:count"),"measure:count must be covered");
+  const measure=retrieval.diagnostics.facets.find((item)=>item.key==="measure:count");
+  assert.equal(measure?.covered,true);
+  // The count executes on the subject root, not on account seats/users.
+  assert.ok((measure?.executionTables||[]).includes("alpha_crm_clue"),"count must execute on the subject root table");
+  assert.ok(!(measure?.executionTables||[]).includes("alpha_account_seat"),"count must not drift to an account seat table");
+  assert.ok(!(measure?.executionTables||[]).includes("alpha_account_user"),"count must not drift to an account user table");
+});
