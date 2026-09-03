@@ -107,7 +107,7 @@ test("kernel caps connector over-return and marks the receipt incomplete", async
   assert.deepEqual(kernel.getRun(result.executionId).rows, [{ id: 1 }, { id: 2 }]);
 });
 
-test("sensitive columns can be used as typed filters but cannot be selected when output policy is enabled", async () => {
+test("sensitive columns can be used as typed filters and are selectable unless a policy explicitly forbids output", async () => {
   const calls = [];
   const connector = { explain: async () => [{ rows: 1 }], query: async (_source, sql) => { calls.push(sql); return [[{ id: 1 }], [{ name: "id" }]]; } };
   const catalog = {
@@ -117,16 +117,29 @@ test("sensitive columns can be used as typed filters but cannot be selected when
   };
   const guardPolicy = { ...catalog.policy, forbiddenOutputColumns: ["demo_table.mobile"] };
   assert.equal(guardSql("SELECT id FROM demo_table WHERE mobile = '13800138000'", guardPolicy).ok, true);
+  // 2026-09-04 敏感列逻辑已移除：forbidSensitiveOutput 仍被接受但不再从 catalog
+  // 的 isSensitive 派生 forbiddenOutputColumns。没有显式传入 policy 时，
+  // 敏感列可以正常被 SELECT。
   const kernel = createQueryExecutionKernel({ source: { id: 1 }, connector, catalog, question: "查询手机号 13800138000 对应的客户编号", disclosedTables: ["demo_table"], forbidSensitiveOutput: true, config: { queryMaxRows: 10 } });
   const allowed = await kernel.execute({ sql: "SELECT id FROM demo_table" });
   assert.equal(allowed.ok, true, allowed.error);
-  const forbidden = await kernel.execute({ sql: "SELECT mobile FROM demo_table" });
+  const noLongerForbidden = await kernel.execute({ sql: "SELECT mobile FROM demo_table" });
+  assert.equal(noLongerForbidden.ok, true, noLongerForbidden.error);
+  assert.equal(calls.length, 2);
+
+  // sql-guard 的 SENSITIVE_OUTPUT_FORBIDDEN 机制本身仍在：调用方显式传入
+  // policy.forbiddenOutputColumns 时依然生效。
+  const kernelWithExplicitPolicy = createQueryExecutionKernel({
+    source: { id: 1 }, connector, disclosedTables: ["demo_table"],
+    catalog: { ...catalog, policy: guardPolicy },
+    config: { queryMaxRows: 10 },
+  });
+  const forbidden = await kernelWithExplicitPolicy.execute({ sql: "SELECT mobile FROM demo_table" });
   assert.equal(forbidden.ok, false);
   assert.equal(forbidden.code, "SENSITIVE_OUTPUT_FORBIDDEN");
-  assert.equal(calls.length, 1);
 });
 
-test("snapshot-style sensitive flag is enforced by the shared kernel", async () => {
+test("snapshot-style sensitive flag no longer drives kernel output denial without an explicit policy", async () => {
   const connector = { explain: async () => [{ rows: 1 }], query: async () => [[{ phone: "hidden" }], [{ name: "phone" }]] };
   const kernel = createQueryExecutionKernel({
     source: { id: 1 }, connector, disclosedTables: ["demo_table"], forbidSensitiveOutput: true,
@@ -136,9 +149,10 @@ test("snapshot-style sensitive flag is enforced by the shared kernel", async () 
     },
     config: { queryMaxRows: 10 },
   });
+  // 2026-09-04 敏感列逻辑已移除：catalog 上的 sensitive:true 不再自动生成
+  // forbiddenOutputColumns，因此没有显式 policy 时该列可以正常被查询。
   const result = await kernel.execute({ sql: "SELECT phone FROM demo_table" });
-  assert.equal(result.ok, false);
-  assert.equal(result.code, "SENSITIVE_OUTPUT_FORBIDDEN");
+  assert.equal(result.ok, true, result.error);
 });
 
 test("policy overrides can only narrow catalog tables, columns, relations, and output denies", async () => {

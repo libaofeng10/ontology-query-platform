@@ -34,16 +34,21 @@ test("query column semantics exposes every column and adds non-blocking value ki
   assert.deepEqual(detectQuestionValueKinds("13774665233查询Alpha到期时间"),[{value:"13774665233",kind:"phone"}]);
 });
 
-test("typed-literal redaction does not mutate opaque fingerprints",()=>{
+test("typed-literal redaction is a passthrough while value-kind detection still recognizes typed literals",()=>{
+  // 2026-09-04 应用户要求全量移除敏感值脱敏：redactTypedLiterals 现在直通，
+  // 不再把手机号/身份证/银行卡替换为 [REDACTED]。detectQuestionValueKinds
+  // 仍继续识别 typed literal（只是不再用于脱敏/拒答）。
   const fingerprint="0f1e2d3c4b5a69788776655443322110";
   assert.equal(redactTypedLiterals(fingerprint),fingerprint);
-  assert.equal(redactTypedLiterals("mobile = '13800138000'"),"mobile = '[REDACTED]'");
+  assert.equal(redactTypedLiterals("mobile = '13800138000'"),"mobile = '13800138000'");
   assert.deepEqual(detectQuestionValueKinds("电话 +1 (415) 555-2671，身份证 110105-19491231-002X"),[
     {value:"+1 (415) 555-2671",kind:"phone"},
     {value:"110105-19491231-002X",kind:"china_id"},
   ]);
-  assert.equal(redactTypedLiterals("电话 +1 (415) 555-2671，身份证 110105-19491231-002X"),"电话 [REDACTED]，身份证 [REDACTED]");
-  assert.equal(redactTypedLiterals("card=6222.0202.0202.0202"),"card=[REDACTED]");
+  assert.equal(redactTypedLiterals("电话 +1 (415) 555-2671，身份证 110105-19491231-002X"),"电话 +1 (415) 555-2671，身份证 110105-19491231-002X");
+  assert.equal(redactTypedLiterals("card=6222.0202.0202.0202"),"card=6222.0202.0202.0202");
+  assert.equal(redactTypedLiterals(null),"");
+  assert.equal(redactTypedLiterals(undefined),"");
 });
 
 test("table grading excludes inactive backup noise and promotes active hubs", () => {

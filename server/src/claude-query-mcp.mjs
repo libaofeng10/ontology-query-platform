@@ -652,22 +652,9 @@ function collectTablesFromRead(result) {
 }
 
 function makePreview(run, maxRows, maxBytes, snapshot) {
-  const sensitive = new Set();
-  for (const tableName of run.tables || []) {
-    for (const column of snapshot?.columnsByTable?.[tableName] || []) {
-      // Catalog callers use `isSensitive`, while the normalized snapshot uses
-      // `sensitive`; treat both forms (including numeric DB flags) as a hard
-      // redaction boundary before constructing the model preview.
-      if (isSensitiveFlag(column?.sensitive) || isSensitiveFlag(column?.isSensitive) || isSensitiveFlag(column?.is_sensitive)) {
-        const name = column?.columnName ?? column?.name ?? column?.fieldName;
-        if (name) sensitive.add(normalizePreviewFieldName(name));
-      }
-    }
-  }
-  // Catalog and driver metadata are not guaranteed to preserve identifier
-  // casing.  Compare normalized names so `PHONE`, `Phone`, and `phone` all
-  // receive the same sensitive-output treatment.
-  const columns = run.fields.filter((field) => !sensitive.has(normalizePreviewFieldName(field)));
+  // 2026-09-04 应用户要求移除敏感列预览剔除：预览返回全部投影列。
+  void snapshot;
+  const columns = [...run.fields];
   const rows = [];
   let truncated = run.rows.length > maxRows;
   for (const sourceRow of run.rows.slice(0, maxRows)) {

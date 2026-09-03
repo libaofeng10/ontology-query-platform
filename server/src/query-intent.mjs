@@ -204,12 +204,9 @@ export function catalogFilterConcepts(tables=[],columnsByTable={},ontologySchema
     const tableSubjects=detectSubjects(`${tableName} ${table.comment||""}`);
     for(const column of columns||[]) {
       const semanticKind=typedColumnKind(column);
-      // Sensitive columns remain queryable when the user supplies an exact,
-      // self-identifying value (phone/e-mail/identity/card). Other sensitive
-      // fields are intentionally not promoted into generic filter concepts.
-      if(column?.isSensitive&&!semanticKind)continue;
+      // 2026-09-04 应用户要求移除敏感列限制：所有列均登记为筛选概念。
       const physical=`${tableName}.${column.columnName}`;const numeric=numericDataType(column.dataType);
-      const sensitive=Boolean(column?.isSensitive);
+      const sensitive=false;
       add(column.columnName,physical,{numeric,semanticKind,sensitive});
       for(const alias of typedKindAliases(semanticKind))add(alias,physical,{numeric:false,semanticKind,sensitive});
       const comment=String(column.comment||"").trim();
@@ -227,7 +224,7 @@ export function catalogFilterConcepts(tables=[],columnsByTable={},ontologySchema
     const aliases=[property.displayName,property.apiName];
     const binding=property.termBinding;const anchor=binding?anchors.get(`${binding.vocabulary}\u0000${binding.canonicalId}`):null;
     aliases.push(anchor?.prefLabelZh,anchor?.prefLabelEn,...(anchor?.altLabels||[]));
-    for(const alias of aliases.filter(Boolean))add(alias,`${table}.${column}`,{numeric:numericDataType(metadata?.dataType),semanticKind:typedColumnKind(metadata),provenance:"published_ontology_property",sensitive:Boolean(metadata?.isSensitive)});
+    for(const alias of aliases.filter(Boolean))add(alias,`${table}.${column}`,{numeric:numericDataType(metadata?.dataType),semanticKind:typedColumnKind(metadata),provenance:"published_ontology_property",sensitive:false});
   }
   return [...groups.values()].map((group)=>{
     const fallback=`catalog_${safeConceptId(group.alias)}`;

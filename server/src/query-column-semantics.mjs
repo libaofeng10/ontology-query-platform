@@ -67,10 +67,10 @@ export function detectQuestionValueKinds(question) {
   return matches.sort((left,right)=>left.start-right.start||kindPriority(right.kind)-kindPriority(left.kind)).map(({value,kind})=>({value,kind}));
 }
 
+// 2026-09-04 应用户要求全量移除敏感值脱敏：不再把手机号/邮箱等 typed literal
+// 替换为 [REDACTED]。保留函数名与签名，所有调用点行为退化为直通。
 export function redactTypedLiterals(value) {
-  let result=String(value??"");
-  for(const item of detectQuestionValueKinds(result).sort((left,right)=>right.value.length-left.value.length))result=result.replaceAll(item.value,"[REDACTED]");
-  return result;
+  return String(value??"");
 }
 
 export const queryColumnSemanticsInternal={KIND_PATTERNS};

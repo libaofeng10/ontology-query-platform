@@ -30,8 +30,9 @@ test("MCP tools use the snapshot/kernel boundary and keep full rows private", as
     const result = await session.callTool("db_query", { name: "customers", sql: "SELECT id, phone FROM customer" });
     assert.equal(result.ok, true);
     assert.equal(result.rowCount, 1);
-    assert.deepEqual(result.previewRows, [{ id: 1 }]);
-    assert.equal(result.columns.includes("phone"), false);
+    // 2026-09-04 敏感列剔除逻辑已移除：预览包含全部投影列，值原样保留。
+    assert.deepEqual(result.previewRows, [{ id: 1, phone: "13800138000" }]);
+    assert.equal(result.columns.includes("phone"), true);
     assert.equal(calls.length, 1);
     const full = session.registry.get(result.executionId);
     assert.deepEqual(full.rows, [{ id: 1, phone: "13800138000" }]);
@@ -133,7 +134,7 @@ test("MCP handles multiple and recursive CTE aliases without widening physical t
   } finally { await session.close(); }
 });
 
-test("MCP preview redacts catalog columns marked with isSensitive", async () => {
+test("MCP preview keeps columns marked with isSensitive in the catalog", async () => {
   const columns = [
     { columnName: "id", isSensitive: 0 },
     { columnName: "phone", isSensitive: 1 },
@@ -155,12 +156,12 @@ test("MCP preview redacts catalog columns marked with isSensitive", async () => 
   try {
     const result = await session.callTool("db_query", { sql: "SELECT id, phone FROM customer" });
     assert.equal(result.ok, true, result.error);
-    assert.deepEqual(result.previewRows, [{ id: 1 }]);
-    assert.deepEqual(result.columns, ["id"]);
+    assert.deepEqual(result.previewRows, [{ id: 1, phone: "13800138000" }]);
+    assert.deepEqual(result.columns, ["id", "phone"]);
   } finally { await session.close(); }
 });
 
-test("MCP preview redacts sensitive columns without depending on driver casing", async () => {
+test("MCP preview keeps sensitive-marked columns regardless of driver casing", async () => {
   const columns = [
     { columnName: "id", isSensitive: 0 },
     { columnName: "phone", isSensitive: 1 },
@@ -180,12 +181,12 @@ test("MCP preview redacts sensitive columns without depending on driver casing",
   try {
     const result = await session.callTool("db_query", { sql: "SELECT id, phone FROM customer" });
     assert.equal(result.ok, true, result.error);
-    assert.deepEqual(result.previewRows, [{ id: 1 }]);
-    assert.deepEqual(result.columns, ["id"]);
+    assert.deepEqual(result.previewRows, [{ id: 1, PHONE: "13800138000" }]);
+    assert.deepEqual(result.columns, ["id", "PHONE"]);
   } finally { await session.close(); }
 });
 
-test("MCP preview redacts qualified and quoted sensitive field labels", async () => {
+test("MCP preview keeps qualified and quoted sensitive-marked field labels", async () => {
   const columns = [
     { columnName: "id", isSensitive: 0 },
     { columnName: "phone", isSensitive: 1 },
@@ -205,12 +206,12 @@ test("MCP preview redacts qualified and quoted sensitive field labels", async ()
   try {
     const result = await session.callTool("db_query", { sql: "SELECT id, phone FROM customer" });
     assert.equal(result.ok, true, result.error);
-    assert.deepEqual(result.previewRows, [{ id: 1 }]);
-    assert.deepEqual(result.columns, ["id"]);
+    assert.deepEqual(result.previewRows, [{ id: 1, "`customer`.`phone`": "13800138000" }]);
+    assert.deepEqual(result.columns, ["id", "`customer`.`phone`"]);
   } finally { await session.close(); }
 });
 
-test("MCP redacts typed literals echoed by executor and JSON-RPC errors", async () => {
+test("MCP surfaces typed literals verbatim in executor failures and JSON-RPC errors", async () => {
   const session = await createClaudeQueryMcpSession({
     snapshot: snapshot(),
     listen: false,
@@ -224,8 +225,9 @@ test("MCP redacts typed literals echoed by executor and JSON-RPC errors", async 
       sql: "SELECT id FROM customer WHERE phone = '13800138000'",
     });
     assert.equal(toolResult.ok, false);
-    assert.doesNotMatch(toolResult.error, /13800138000|person@example\.com/);
-    assert.match(toolResult.error, /\[REDACTED\]/);
+    assert.match(toolResult.error, /13800138000/);
+    assert.match(toolResult.error, /person@example\.com/);
+    assert.doesNotMatch(toolResult.error, /\[REDACTED\]/);
 
     const rpcResult = await session.handleRequest({
       jsonrpc: "2.0",
@@ -235,11 +237,12 @@ test("MCP redacts typed literals echoed by executor and JSON-RPC errors", async 
     });
     const payload = rpcResult.result?.structuredContent || {};
     assert.equal(payload.ok, false);
-    assert.doesNotMatch(JSON.stringify(rpcResult), /13800138000|person@example\.com/);
+    assert.match(JSON.stringify(rpcResult), /13800138000/);
+    assert.match(JSON.stringify(rpcResult), /person@example\.com/);
   } finally { await session.close(); }
 });
 
-test("MCP preview applies value-level redaction as a defense in depth", async () => {
+test("MCP preview leaves typed-literal-shaped values unmodified", async () => {
   const columns = [
     { columnName: "id", isSensitive: 0 },
     { columnName: "note", isSensitive: 0 },
@@ -262,8 +265,8 @@ test("MCP preview applies value-level redaction as a defense in depth", async ()
   try {
     const result = await session.callTool("db_query", { sql: "SELECT id, note, payload FROM customer" });
     assert.equal(result.ok, true, result.error);
-    assert.equal(result.previewRows[0].note, "联系 [REDACTED]");
-    assert.doesNotMatch(result.previewRows[0].payload, /person@example\.com/);
+    assert.equal(result.previewRows[0].note, "联系 13800138000");
+    assert.match(JSON.stringify(result.previewRows[0].payload), /person@example\.com/);
   } finally { await session.close(); }
 });
 

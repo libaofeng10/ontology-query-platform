@@ -48,10 +48,7 @@ test("query service routes a required Claude attempt through snapshot, MCP, kern
       return {
         status: "answered",
         executionIds: [receipt.executionId],
-        // Defense-in-depth regression: even if an adapter accidentally
-        // appends a driver-only sensitive field, normalization/finalization
-        // must not expose it in the public answer.
-        runs: [{ ...trustedRun, rows: trustedRun.rows.map((row) => ({ ...row, mobile: "13800138000" })), fields: [...trustedRun.fields, "mobile"], sensitiveColumns: ["mobile"] }],
+        runs: [trustedRun],
         conclusion: "查询到客户编号 7。",
         iterations: 2,
         promptVersion: "claude-query-test-v1",
@@ -78,7 +75,8 @@ test("query service routes a required Claude attempt through snapshot, MCP, kern
     });
     const answer = await service.ask({ sourceId: source.id, question: "查询客户", userName: "tester" });
     assert.equal(answer.evidence.planningMode, "claude");
-    assert.deepEqual(answer.rows, [{ customer_id: 7 }], "敏感列不能从 Claude SQL 投影进入答案");
+    // 2026-09-04 敏感列逻辑已移除：驱动返回的 mobile 列原样保留在答案中。
+    assert.deepEqual(answer.rows, [{ customer_id: 7, mobile: "13800138000" }]);
     assert.equal(answer.evidence.ontologySchemaVersion, 1);
     assert.equal(answer.evidence.sql, "SELECT `customer_id` FROM `crm_customer` LIMIT 100");
     assert.equal(calls.filter((item) => item.kind === "query").length, 1);
@@ -92,7 +90,7 @@ test("query service routes a required Claude attempt through snapshot, MCP, kern
   }
 });
 
-test("Claude public responses and audits redact typed literals from model text, rows, and traces", async () => {
+test("Claude public responses and audits keep typed literals verbatim in model text, rows, and traces", async () => {
   const { store, source } = await fixture();
   const bridge = {
     async run({ mcp }) {
@@ -124,14 +122,15 @@ test("Claude public responses and audits redact typed literals from model text, 
     const answer = await service.ask({ sourceId: source.id, question: "查询客户", userName: "tester" });
     const audit = store.listAudits(source.id, 1)[0];
     const serialized = JSON.stringify({ answer, audit });
-    assert.doesNotMatch(serialized, /13800138000|alice@example\.com/);
-    assert.match(serialized, /\[REDACTED\]/);
+    assert.match(serialized, /13800138000/);
+    assert.match(serialized, /alice@example\.com/);
+    assert.doesNotMatch(serialized, /\[REDACTED\]/);
   } finally {
     store.close();
   }
 });
 
-test("Claude sensitive typed-literal requests fail closed before provider or legacy fallback", async () => {
+test("Claude questions containing typed literals proceed into the bridge instead of failing closed", async () => {
   const { store, source } = await fixture();
   let bridgeCalls = 0;
   let providerCalls = 0;
@@ -152,14 +151,17 @@ test("Claude sensitive typed-literal requests fail closed before provider or leg
       },
     });
     const result = await service.ask({ sourceId: source.id, question: "查询手机号 13800138000 对应客户", userName: "tester" });
-    assert.equal(result.refused, true);
-    assert.equal(result.errorCode, "SENSITIVE_BINDING_UNAVAILABLE");
-    assert.equal(result.failureClass, "sensitive_binding_unavailable");
-    assert.equal(result.planningMode, "claude");
-    assert.equal(bridgeCalls, 0);
+    // 2026-09-04 敏感值 fail-closed 已移除：问题命中手机号等 typed literal
+    // 不再在调用 bridge 前被拒绝，而是正常进入 bridge，随后按 bridge
+    // 返回值的常规协议校验处理（这里因缺少 execution ID 而协议报错）。
+    assert.equal(bridgeCalls, 1);
     assert.equal(providerCalls, 0);
+    assert.equal(result.refused, true);
+    assert.equal(result.errorCode, "EXECUTION_IDS_REQUIRED");
+    assert.equal(result.failureClass, "protocol_error");
+    assert.equal(result.planningMode, "claude");
     const audit = store.listAudits(source.id, 1)[0];
-    assert.doesNotMatch(JSON.stringify(audit), /13800138000/);
+    assert.match(JSON.stringify(audit), /13800138000/);
   } finally {
     globalThis.fetch = originalFetch;
     store.close();
@@ -367,7 +369,7 @@ test("query service preserves the original bridge failure when an adapter throws
   }
 });
 
-test("query service applies snake-case sensitive metadata while normalizing registry runs", async () => {
+test("query service normalizes registry runs regardless of snake-case sensitive metadata on the snapshot", async () => {
   const { store, source } = await fixture();
   const snapshotBuilder = async (input) => {
     const snapshot = await createClaudeQuerySnapshot(input);
@@ -415,8 +417,10 @@ test("query service applies snake-case sensitive metadata while normalizing regi
       },
     });
     const answer = await service.ask({ sourceId: source.id, question: "查询客户", userName: "tester" });
-    assert.deepEqual(answer.rows, [{ customer_id: 7 }]);
-    assert.equal(answer.columns.some((column) => column.name === "mobile"), false);
+    // 2026-09-04 敏感列剔除逻辑已移除：无论快照上的 sensitive/is_sensitive
+    // 元数据如何标注，注册表返回的列都原样保留在答案中。
+    assert.deepEqual(answer.rows, [{ customer_id: 7, mobile: "13800138000" }]);
+    assert.equal(answer.columns.some((column) => column.name === "mobile" || column.key === "mobile"), true);
   } finally {
     store.close();
   }

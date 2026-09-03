@@ -2,7 +2,6 @@ import { introspectSchema } from "./db-introspect.mjs";
 import { probeTable } from "./db-probe.mjs";
 import { generateRelationCandidates } from "./relation-candidates.mjs";
 import { createRelationModelService } from "./relation-model-service.mjs";
-import { detectSensitiveField } from "./sensitive-fields.mjs";
 import { generateEnumMeaningQuestions } from "./enum-meaning-candidates.mjs";
 import { gradeTable } from "./table-grading.mjs";
 import { removeTablePage, writeJoinPage, writeRulePage, writeTablePage } from "./ontology-writer.mjs";
@@ -69,7 +68,8 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
       store.upsertTable({...table,grade:graded.grade,active:graded.grade==="C"?0:1});
       const probedColumns=probeResults.get(table.tableName)?.columns || columnsByTable[table.tableName] || [];
       for(const column of probedColumns) {
-        const sensitive=column.isSensitive != null ? Boolean(column.isSensitive) : detectSensitiveField(column.columnName,[],column.comment).sensitive;
+        // 2026-09-04 应用户要求移除敏感列逻辑：发现阶段不再自动推断 isSensitive。
+        const sensitive=column.isSensitive != null ? Boolean(column.isSensitive) : false;
         store.upsertColumn({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,dataType:column.dataType,nullable:column.nullable==="YES"?1:Number(column.nullable??1),nullRate:column.nullRate??null,cardinality:column.cardinality??null,isSensitive:sensitive?1:0,comment:column.comment||null,isPrimary:Number(column.isPrimary||0),isUnique:Number(column.isUnique||0),isIndexed:Number(column.isIndexed||0)});
         if(column.profile&&!sensitive)store.upsertColumnProfile({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,...column.profile,sampledAt:new Date().toISOString()});
         for(const value of column.enums||[]) store.upsertEnum({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,...value});

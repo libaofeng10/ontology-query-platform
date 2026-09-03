@@ -216,7 +216,7 @@ test("bridge keeps the canonical prompt contract when request supplies a custom 
   assert.match(received.prompt, /safe/);
 });
 
-test("bridge redacts typed literals from the model prompt and nested context", async () => {
+test("bridge passes typed literals through to the model prompt and nested context verbatim", async () => {
   let received;
   const bridge = createClaudeQueryBridge({
     transport: async (input) => {
@@ -233,8 +233,9 @@ test("bridge redacts typed literals from the model prompt and nested context", a
     },
   });
   assert.equal(outcome.status, "clarification");
-  assert.doesNotMatch(received.prompt, /13800138000|person@example\.com/);
-  assert.match(received.prompt, /\[REDACTED\]/);
+  assert.match(received.prompt, /13800138000/);
+  assert.match(received.prompt, /person@example\.com/);
+  assert.doesNotMatch(received.prompt, /\[REDACTED\]/);
 });
 
 test("bridge escalates and resolves when a child ignores close and exit events", async () => {
@@ -336,7 +337,7 @@ test("bridge caps stdout before resolving an output-limit failure", async () => 
   assert.equal(signals[0], "SIGINT");
 });
 
-test("bridge redacts typed literals in adapter failures and traces", async () => {
+test("bridge preserves typed literals in adapter failures and traces", async () => {
   const mcp = session();
   const bridge = createClaudeQueryBridge({
     transport: async () => ({
@@ -348,8 +349,9 @@ test("bridge redacts typed literals in adapter failures and traces", async () =>
   const outcome = await bridge.run({ question: "查询", mcp });
   assert.equal(outcome.status, "failed");
   const serialized = JSON.stringify(outcome);
-  assert.doesNotMatch(serialized, /13800138000|person@example\.com/);
-  assert.match(serialized, /\[REDACTED\]/);
+  assert.match(serialized, /13800138000/);
+  assert.match(serialized, /person@example\.com/);
+  assert.doesNotMatch(serialized, /\[REDACTED\]/);
 });
 
 test("bridge close aborts active runs, waits for cleanup, and rejects later runs", async () => {

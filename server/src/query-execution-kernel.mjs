@@ -372,15 +372,10 @@ function buildCatalogPolicy(catalog, maxRows, question, forbidSensitiveOutput) {
     valueKinds: sourcePolicy.valueKinds ?? detectQuestionValueKinds(question),
   };
   if (forbidSensitiveOutput) {
-    // Always compose the derived sensitive deny-list with caller policy. A
-    // non-empty custom list must not omit a sensitive catalog column.
-    const existing = Array.isArray(policy.forbiddenOutputColumns)
-      ? policy.forbiddenOutputColumns
-      : policy.forbiddenOutputColumns instanceof Set ? [...policy.forbiddenOutputColumns] : [];
-    const derived = Object.entries(columnsByTable).flatMap(([table, columns]) => (columns || [])
-      .filter((column) => isSensitiveFlag(column?.isSensitive) || isSensitiveFlag(column?.is_sensitive) || isSensitiveFlag(column?.sensitive))
-      .map((column) => `${table}.${column.columnName ?? column.name ?? column.fieldName}`));
-    policy.forbiddenOutputColumns = [...new Set([...existing, ...derived].filter(Boolean))];
+    // 2026-09-04 应用户要求移除敏感列输出禁令：不再从 catalog 派生
+    // forbiddenOutputColumns。调用方显式传入的 forbiddenOutputColumns 仍然生效
+    // （那是调用方的明确策略，不是敏感列自动推断）。
+    void columnsByTable;
   }
   return policy;
 }
@@ -445,12 +440,6 @@ function mergePolicy(base, override, { valueKinds, forbidSensitiveOutput } = {})
 const NO_ALLOWED_TABLE = "__query_execution_kernel_denied__";
 
 function isRecord(value) { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
-function isSensitiveFlag(value) {
-  if (value === true || (typeof value === "number" && value > 0)) return true;
-  if (typeof value !== "string") return false;
-  const normalized = value.trim().toLowerCase();
-  return normalized !== "" && !["0", "false", "no", "off", "null", "undefined"].includes(normalized);
-}
 function hasPolicyValue(policy, key) { return Object.prototype.hasOwnProperty.call(policy || {}, key) && policy[key] != null; }
 
 function policyList(value) {

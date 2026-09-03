@@ -53,16 +53,18 @@ function fixture(overrides = {}) {
   });
 }
 
-test("snapshot only exposes published mapped tables/columns and marks sensitive output", () => {
+test("snapshot only exposes published mapped tables/columns; sensitive metadata is always false", () => {
   const snapshot = fixture();
   assert.deepEqual(snapshot.allowedTableNames, ["crm_customer"]);
   assert.deepEqual(snapshot.allowedColumnsByTable.crm_customer.sort(), ["customer_id", "is_deleted", "mobile", "name"]);
   const phone = snapshot.columnsByTable.crm_customer.find((item) => item.columnName === "mobile");
-  assert.equal(phone.sensitive, true);
+  // 2026-09-04 敏感列逻辑已移除：所有列 sensitive 恒为 false、selectable 恒为 true。
+  assert.equal(phone.sensitive, false);
   assert.equal(phone.filterable, true);
-  assert.equal(phone.selectable, false);
+  assert.equal(phone.selectable, true);
   assert.equal(snapshot.columnsByTable.crm_customer.some((item) => item.columnName === "internal_note"), false);
-  assert.equal(snapshot.enumValues["crm_customer.mobile"], undefined);
+  // 枚举不再因敏感列被排除。
+  assert.deepEqual(snapshot.enumValues["crm_customer.mobile"], [{ value: "13800138000", meaning: null, meaningSource: null }]);
   assert.deepEqual(snapshot.enumValues["crm_customer.is_deleted"], [{ value: "0", meaning: "有效", meaningSource: null }]);
   assert.equal(JSON.stringify(snapshot), JSON.stringify(snapshot.toJSON()));
   assert.doesNotMatch(JSON.stringify(snapshot), /ignore|不要传给模型的原句/);
@@ -132,7 +134,7 @@ test("snapshot checksum is deterministic and rejects missing/unpublished schemas
   }), /只有已发布/);
 });
 
-test("snapshot redacts typed literals in model-visible catalog and knowledge text", () => {
+test("snapshot leaves typed literals in model-visible catalog and knowledge text unmodified", () => {
   const built = createClaudeQuerySnapshot({
     sourceId: 1,
     published: {
@@ -175,11 +177,12 @@ test("snapshot redacts typed literals in model-visible catalog and knowledge tex
     objects: built.objects,
     knowledge: built.read({ operation: "get_knowledge" }),
   });
-  assert.doesNotMatch(serialized, /13800138000|person@example\.com/);
-  assert.match(serialized, /\[REDACTED\]/);
+  assert.match(serialized, /13800138000/);
+  assert.match(serialized, /person@example\.com/);
+  assert.doesNotMatch(serialized, /\[REDACTED\]/);
 });
 
-test("snapshot redacts typed literals represented as numeric intent values", () => {
+test("snapshot leaves typed literals represented as numeric intent values unmodified", () => {
   const built = fixture({
     queryIntent: {
       version: "2.0",
@@ -190,6 +193,6 @@ test("snapshot redacts typed literals represented as numeric intent values", () 
     },
   });
   const serialized = JSON.stringify(built.queryIntent);
-  assert.doesNotMatch(serialized, /13800138000/);
-  assert.match(serialized, /\[REDACTED\]/);
+  assert.match(serialized, /13800138000/);
+  assert.doesNotMatch(serialized, /\[REDACTED\]/);
 });

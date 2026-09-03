@@ -102,13 +102,14 @@ test("a dictionary-sized dimension table registers its label column despite the 
   );
   assert.deepEqual(identifier.columns[0].enums,[]);
 
-  // Person-name labels never get here: the sensitive gate runs before enum sampling.
+  // 2026-09-04 敏感列逻辑已移除：探测阶段不再推断 isSensitive，label 列（owner_name）
+  // 在字典规模的表里正常登记枚举，不再因为"敏感"被跳过。
   const person=await probeTable(connector,{},
     {tableName:"tiny_owner",rowEstimate:12},
     [{columnName:"owner_name",dataType:"varchar(64)"}],
   );
-  assert.equal(person.columns[0].isSensitive,1);
-  assert.deepEqual(person.columns[0].enums,[]);
+  assert.equal(person.columns[0].isSensitive,0);
+  assert.equal(person.columns[0].enums.length,12);
 });
 
 test("distinct values above the cardinality ratio are not a dictionary",async()=>{
@@ -172,26 +173,28 @@ test("schema-derived identifiers with hyphens are safely quoted",async()=>{
   assert.match(queries[0],/SELECT `invite-status` FROM `invitation--20190218` WHERE `invite-status` IS NOT NULL LIMIT 10000/);
 });
 
-test("email and name-comment fields are marked sensitive before enum sampling",async()=>{
+test("db-probe no longer infers isSensitive for email/name-comment columns",async()=>{
   const queries=[];const connector={query:async(_source,sql)=>{queries.push(sql);return [[]];}};
   const result=await probeTable(connector,{},
     {tableName:"crm_contact",rowEstimate:20_000},
     [{columnName:"email",dataType:"varchar(255)",comment:"联系邮箱"},{columnName:"name",dataType:"varchar(50)",comment:"客户姓名"},{columnName:"level",dataType:"varchar(20)",comment:"客户等级"}],
   );
-  assert.deepEqual(result.columns.map((column)=>column.isSensitive),[1,1,0]);
-  assert.equal(queries.length,1);assert.match(queries[0],/SELECT `level`/);assert.doesNotMatch(queries[0],/`email`|`name`/);
+  // 2026-09-04 敏感列逻辑已移除：isSensitive 恒为 0，所有列都参与常规枚举采样查询。
+  assert.deepEqual(result.columns.map((column)=>column.isSensitive),[0,0,0]);
+  assert.equal(queries.length,3);
 });
 
-test("profiling samples a table once and never profiles sensitive columns",async()=>{
-  const queries=[];const connector={query:async(_source,sql)=>{queries.push(sql);if(sql.includes("GROUP BY"))return [[{value:"active",count:2}]];return [[{id:2,status:"active",customer_code:"CUS-000002"},{id:1,status:"active",customer_code:"CUS-000001"}]];}};
+test("profiling samples a table once and now also profiles previously-sensitive columns",async()=>{
+  const queries=[];const connector={query:async(_source,sql)=>{queries.push(sql);if(sql.includes("GROUP BY"))return [[{value:"active",count:2}]];return [[{id:2,status:"active",customer_code:"CUS-000002",email:null},{id:1,status:"active",customer_code:"CUS-000001",email:null}]];}};
   const result=await probeTable(connector,{},
     {tableName:"customer",rowEstimate:500},
     [{columnName:"id",dataType:"bigint",isPrimary:1},{columnName:"status",dataType:"varchar(20)"},{columnName:"customer_code",dataType:"text"},{columnName:"email",dataType:"varchar(255)"}],
     {profiling:{enabled:true,sampleLimit:100,timeoutMs:1000}},
   );
-  assert.equal(result.columns.find((column)=>column.columnName==="email").profile,null);
+  // 2026-09-04 敏感列逻辑已移除：email 不再被跳过，正常参与采样和画像
+  // （连接器桩返回的 email 值全部为 null，因此 profile 的 nullRatio 为 1）。
+  assert.equal(result.columns.find((column)=>column.columnName==="email").profile.profile.nullRatio,1);
   assert.deepEqual(result.columns.find((column)=>column.columnName==="status").profile.profile.sampleValues,["active"]);
   assert.deepEqual(result.columns.find((column)=>column.columnName==="customer_code").profile.profile.sampleValues,["CUS-000001","CUS-000002"]);
-  assert.ok(queries.some((sql)=>/SELECT `id`, `customer_code` FROM `customer` ORDER BY `id` DESC LIMIT 100/.test(sql)));
-  assert.ok(queries.every((sql)=>!sql.includes("`email`")));
+  assert.ok(queries.some((sql)=>/SELECT `id`, `customer_code`, `email` FROM `customer` ORDER BY `id` DESC LIMIT 100/.test(sql)));
 });

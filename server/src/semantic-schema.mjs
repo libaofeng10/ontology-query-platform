@@ -231,7 +231,7 @@ function validatePhysicalMapping(property,path,tableByName,columnsByTable,errors
   if(tableInfo.active===0||tableInfo.grade==="C") add(errors,"ONTOLOGY_MAPPING_TABLE_UNAVAILABLE",`${path}.mapping.table`,`映射表 ${table} 当前不可用于查询`);
   const columnInfo=(columnsByTable[table]||[]).find((item)=>item.columnName===column);
   if(!columnInfo) { add(errors,"ONTOLOGY_MAPPING_COLUMN_NOT_FOUND",`${path}.mapping.column`,`映射字段 ${table}.${column} 不存在或已失效`);return; }
-  if(columnInfo.isSensitive) warnings.push(issue("ONTOLOGY_MAPPING_SENSITIVE_COLUMN",`${path}.mapping.column`,`映射字段 ${table}.${column} 是敏感字段，后续查询仍会被安全护栏阻止`));
+  // 2026-09-04 应用户要求移除敏感列逻辑：敏感映射警告不再产生。
   if(property.required&&columnInfo.nullable) warnings.push(issue("ONTOLOGY_REQUIRED_MAPPING_NULLABLE",`${path}.required`,`必填属性映射到可空字段 ${table}.${column}`));
   if(PROPERTY_TYPES.has(property.type)&&!compatibleType(property.type,columnInfo.dataType)) add(errors,"ONTOLOGY_MAPPING_TYPE_MISMATCH",`${path}.type`,`语义类型 ${property.type} 与物理类型 ${columnInfo.dataType} 不兼容`);
 }

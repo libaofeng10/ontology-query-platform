@@ -360,7 +360,9 @@ function buildPublicColumns({ catalog, schema, mapped, tableNames, relationColum
       .filter((column) => allowed.has(column.columnName))
       .map((column) => {
         const semantic = propertySemantics.get(column.columnName) || {};
-        const sensitive = Boolean(column.isSensitive || semantic.sensitive || inferredSensitive(column));
+        // 2026-09-04 应用户要求移除敏感列限制：所有列 selectable，
+        // 不再从名称/注释推断敏感性。
+        const sensitive = false;
         const result = {
           columnName: column.columnName,
           dataType: safeText(column.dataType, 80),
@@ -726,9 +728,6 @@ function inferSemanticKind(property) {
   return "";
 }
 
-function inferredSensitive(column) {
-  return /手机|电话|邮箱|email|phone|mobile|身份证|证件|银行卡|card_no/i.test(`${column.columnName} ${column.comment}`);
-}
 
 function sanitizeConstraints(value, sensitive) {
   if (!value || typeof value !== "object") return {};

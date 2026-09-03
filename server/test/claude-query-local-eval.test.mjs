@@ -6,7 +6,7 @@ import {
   validateFixture,
 } from "../src/claude-query-local-eval.mjs";
 
-test("local Claude pairwise harness compares outcomes and redacts typed literals", async () => {
+test("local Claude pairwise harness compares outcomes and keeps typed literals verbatim", async () => {
   const fixture = {
     version: "test-v1",
     setName: "local",
@@ -50,7 +50,8 @@ test("local Claude pairwise harness compares outcomes and redacts typed literals
   assert.deepEqual(report.delta.improvements, ["phone-case"]);
   assert.equal(report.safety.localOnly, true);
   assert.equal(report.safety.paidApiCalls, 0);
-  assert.doesNotMatch(JSON.stringify(report), /13800138000/);
+  assert.match(JSON.stringify(report), /13800138000/);
+  assert.doesNotMatch(JSON.stringify(report), /\[REDACTED\]/);
 });
 
 test("deterministic fake bridge uses only request MCP and advertises no paid call", async () => {

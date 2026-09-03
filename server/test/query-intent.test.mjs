@@ -484,9 +484,11 @@ test("a confirmed enum meaning becomes parser vocabulary, and only a confirmed o
   const concept=channelConcepts().find((item)=>item.aliases[0]==="数据来源");
   assert.deepEqual(concept.memberValues,["抖音","百度"],"未确认含义的取值 3 不得进入词表");
 
-  // A sensitive column contributes its field surface but never its values.
-  const sensitive=channelConcepts({"clue.owner_cell":[{value:"老王的客户",meaning:null,meaningSource:null}]}).find((item)=>item.aliases[0]==="负责人手机号");
-  assert.deepEqual(sensitive.memberValues,[],"敏感列的取值不得成为解析词表");
+  // 2026-09-04 敏感列逻辑已移除：isSensitive 恒为 false，之前被标记为
+  // 敏感的列（负责人手机号）现在正常参与词表构建，其原始文本取值直接
+  // 成为可解析的词面（数字型取值仍需确认含义才会进入词表，规则不变）。
+  const formerlySensitive=channelConcepts({"clue.owner_cell":[{value:"老王的客户",meaning:null,meaningSource:null}]}).find((item)=>item.aliases[0]==="负责人手机号");
+  assert.deepEqual(formerlySensitive.memberValues,["老王的客户"],"敏感标记移除后原始文本取值可进入解析词表");
 });
 
 test("an operator-less member value parses into a declared filter instead of a rejection",()=>{

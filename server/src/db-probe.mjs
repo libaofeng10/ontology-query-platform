@@ -1,4 +1,3 @@
-import { detectSensitiveField } from "./sensitive-fields.mjs";
 import { buildColumnProfile } from "./column-profile.mjs";
 
 const TIME_TYPE = /date|time|timestamp/i;
@@ -37,9 +36,10 @@ export async function probeTable(connector, source, table, columns, { maxEnumVal
     try { const [rows] = await connector.query(source,`SELECT MAX(${quoteIdentifier(timeColumn.columnName)}) AS lastWrite FROM ${tableName}`); lastWrite=rows[0]?.lastWrite??null; } catch { /* Degrade to schema only. */ }
   }
   for (const column of columns) {
-    const sensitive = detectSensitiveField(column.columnName,[],column.comment);
-    const item = { ...column, isSensitive:sensitive.sensitive?1:0, sensitiveReason:sensitive.reason, nullRate:null, cardinality:null, enums:[] };
-    if (!sensitive.sensitive && LOW_CARDINALITY_TYPE.test(column.dataType)) {
+    // 2026-09-04 应用户要求移除敏感列逻辑：探测阶段不再推断 isSensitive，
+    // 所有列均可采样枚举与画像。
+    const item = { ...column, isSensitive:0, sensitiveReason:null, nullRate:null, cardinality:null, enums:[] };
+    if (LOW_CARDINALITY_TYPE.test(column.dataType)) {
       try {
         const col = quoteIdentifier(column.columnName);
         // A label column that qualifies as a dictionary can legitimately hold up to

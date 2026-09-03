@@ -941,17 +941,12 @@ async function runClaudeQueryBranch({store,connector,config,source,question,cont
   const sourceId=source.id;
   const claudeConfig=config.claudeQuery||{};
   const refusal=(reason,failureClass,errorCode)=>({status:"refused",reason,failureClass,errorCode,iterations:0,toolTrace:[],durationMs:Date.now()-started});
-  // 这三个门禁必须先于 snapshot/MCP/bridge 构造运行：它们都是「不应该发起一次
-  // 昂贵或会外泄原值的调用」的判断，付费调用一旦发出就无法撤回。
+  // 这两个门禁必须先于 snapshot/MCP/bridge 构造运行：它们都是「不应该发起一次
+  // 昂贵调用」的判断，付费调用一旦发出就无法撤回。
   if(claudeBudgetDisabled(claudeConfig.maxBudgetUsd)) return refusal("Claude 单请求预算为 0，已拒绝启动 Claude 查询","budget_disabled","BUDGET_DISABLED");
   if(!String(claudeConfig.model??"").trim()) return refusal("Claude 问数已启用，但未配置精确模型 ID，已拒绝启动","model_missing","MODEL_REQUIRED");
-  // db_query 目前只接受完整 SQL 文本，没有请求级参数绑定，因此无法把手机号/邮箱等
-  // 原值安全地交给 Claude；也不允许静默换到另一个 provider 重查。
-  const typedLiterals=detectQuestionValueKinds(question);
-  if(typedLiterals.length) {
-    const kinds=[...new Set(typedLiterals.map((item)=>CLAUDE_TYPED_LITERAL_LABELS[item.kind]||"敏感"))].join("、");
-    return refusal(`问题包含${kinds}等敏感值，当前 Claude 链路没有安全的参数化绑定，系统没有把原值发送给模型`,"sensitive_binding_unavailable","SENSITIVE_BINDING_UNAVAILABLE");
-  }
+  // 2026-09-04 应用户要求移除敏感 typed literal fail-closed：手机号/邮箱等原值
+  // 现在允许随问题进入 Claude prompt 与 SQL。
   const bridge=deps.claudeBridge;
   const runner=bridge&&(bridge.run||bridge.execute||bridge.invoke);
   if(typeof runner!=="function") return {status:"failed",reason:"Claude bridge 不可用",failureClass:"cli_unavailable",iterations:0,toolTrace:[],durationMs:Date.now()-started};
@@ -959,7 +954,7 @@ async function runClaudeQueryBranch({store,connector,config,source,question,cont
   const snapshot=await deps.claudeSnapshotBuilder({...context,sourceId,source:snapshotSource(source),store});
   if(!snapshot||typeof snapshot.read!=="function") throw new Error("Claude ontology snapshot 构造失败");
   const kernelCatalog=buildKernelCatalog(context,config);
-  const kernel=createQueryExecutionKernel({connector,source,config,question,catalog:kernelCatalog,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),getDisclosedTables:()=>snapshot.disclosedTables||new Set(),signal,maxSqlCalls:claudeConfig.maxSqlCalls??config.queryAgentMaxSqlCalls,maxScannedRows:claudeConfig.maxScannedRows??config.queryAgentMaxScannedRows,forbidSensitiveOutput:true,preview:{maxRows:20,maxBytes:24*1024,maxCellChars:200}});
+  const kernel=createQueryExecutionKernel({connector,source,config,question,catalog:kernelCatalog,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),getDisclosedTables:()=>snapshot.disclosedTables||new Set(),signal,maxSqlCalls:claudeConfig.maxSqlCalls??config.queryAgentMaxSqlCalls,maxScannedRows:claudeConfig.maxScannedRows??config.queryAgentMaxScannedRows,preview:{maxRows:20,maxBytes:24*1024,maxCellChars:200}});
   const produced=await deps.claudeMcpFactory({snapshot,kernel,source,sourceId,requestId,signal,listen:true,previewRows:20,previewBytes:24*1024,initialDisclosedTables:[]});
   const mcpSession=produced?.session||produced;
   if(!mcpSession) throw new Error("Claude MCP session 构造失败");
@@ -975,7 +970,6 @@ async function runClaudeQueryBranch({store,connector,config,source,question,cont
   }
 }
 
-const CLAUDE_TYPED_LITERAL_LABELS={phone:"手机号",email:"邮箱",china_id:"身份证号",bank_card:"银行卡号"};
 function claudeBudgetDisabled(value) { return value!==null&&value!==undefined&&value!==""&&Number(value)===0; }
 
 /**
@@ -1009,51 +1003,24 @@ async function resolveClaudeExecutions(mcpSession,ids) {
   return {ok:true,runs};
 }
 
-// 已发布快照是敏感列的权威来源。驱动/adapter 可能追加一个未投影的敏感列，
-// 因此在结果进入公开答案前按快照元数据再剔一次（三种历史拼写都按启用处理）。
+// 2026-09-04 应用户要求移除敏感列剔除：registry run 只做字段归一化，
+// 不再按快照 sensitive 元数据过滤投影列。
 function normalizeClaudeRun(run,snapshot) {
+  void snapshot;
   const tables=(Array.isArray(run?.tables)&&run.tables.length?run.tables:run?.verdict?.tables)||[];
-  const sensitive=claudeSensitiveColumnNames(snapshot,tables,run?.sensitiveColumns);
-  const fields=claudeRunFields(run,sensitive);
+  const fields=claudeRunFields(run);
   const allowed=new Set(fields.map((field)=>field.name));
   const rows=(Array.isArray(run?.rows)?run.rows:[]).map((row)=>Object.fromEntries(Object.entries(row||{}).filter(([name])=>allowed.has(name))));
   const verdict=run?.verdict&&typeof run.verdict==="object"?{...run.verdict,tables:run.verdict.tables||tables}:{tables};
-  return {...run,tables,verdict,fields,columns:fields,rows,sensitiveColumns:[...sensitive]};
+  return {...run,tables,verdict,fields,columns:fields,rows};
 }
 
-function claudeRunFields(run,sensitive) {
+function claudeRunFields(run) {
   const raw=Array.isArray(run?.fields)&&run.fields.length?run.fields
     :Array.isArray(run?.columns)&&run.columns.length?run.columns
     :Object.keys((Array.isArray(run?.rows)?run.rows:[])[0]||{});
   const names=raw.map((item)=>typeof item==="string"?item:item?.name??item?.columnName).filter(Boolean).map((item)=>String(item));
-  return [...new Set(names)].filter((name)=>!sensitive.has(normalizeClaudeFieldName(name))).map((name)=>({name}));
-}
-
-function claudeSensitiveColumnNames(snapshot,tables,extra) {
-  const names=new Set();
-  const add=(value)=>{const name=normalizeClaudeFieldName(value);if(name)names.add(name);};
-  for(const value of Array.isArray(extra)?extra:[]) add(value);
-  const columnsByTable=snapshot?.columnsByTable||{};
-  const scope=Array.isArray(tables)&&tables.length?tables:Object.keys(columnsByTable);
-  for(const table of scope) {
-    const key=Object.keys(columnsByTable).find((item)=>normalizeClaudeFieldName(item)===normalizeClaudeFieldName(table));
-    for(const column of columnsByTable[key]||[]) {
-      if(claudeSensitiveFlag(column?.sensitive)||claudeSensitiveFlag(column?.isSensitive)||claudeSensitiveFlag(column?.is_sensitive)) add(column?.columnName??column?.name??column?.fieldName);
-    }
-  }
-  return names;
-}
-
-function claudeSensitiveFlag(value) {
-  if(value===true||(typeof value==="number"&&value>0))return true;
-  if(typeof value!=="string")return false;
-  const normalized=value.trim().toLowerCase();
-  // 未知的非空文本标记按敏感处理：表示法不一致不应让敏感列意外可见。
-  return normalized!==""&&!["0","false","no","off","null","undefined"].includes(normalized);
-}
-
-function normalizeClaudeFieldName(value) {
-  return String(value??"").replaceAll("`","").replaceAll('"',"").replaceAll("[","").replaceAll("]","").split(".").at(-1).trim().toLowerCase();
+  return [...new Set(names)].map((name)=>({name}));
 }
 
 function safeError(error) { return String(error?.message||error).replace(/(password|token|api[_-]?key|authorization)\s*[=:]\s*[^\s,;]+/gi,"$1=[REDACTED]").slice(0,1_000); }

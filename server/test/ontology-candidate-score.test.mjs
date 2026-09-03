@@ -69,14 +69,15 @@ test("manual disjoint groups force review when a candidate shares an undifferent
   assert.ok(result.forcedReviewReasons.includes("EVIDENCE_CONFLICT"));assert.equal(result.status,"review_required");
 });
 
-test("sensitive mappings force review and invalid physical mappings are blocked",()=>{
+test("catalog isSensitive metadata no longer forces review, but invalid physical mappings are still blocked",()=>{
   const catalog=physicalCatalog();
   catalog.columnsByTable.crm_customer[1].isSensitive=1;
+  // 2026-09-04 敏感列逻辑已移除：semantic-schema 不再产生
+  // ONTOLOGY_MAPPING_SENSITIVE_COLUMN 警告，所以 catalog 上的 isSensitive
+  // 标记不再触发 SENSITIVE_FIELD_MAPPING 强制复核或降分。
   const sensitive=scoreOntologyCandidate(objectCandidate(),{sourceId:1,catalog,semanticSimilarity:.9});
-  assert.equal(sensitive.score,79);
-  assert.equal(sensitive.status,"review_required");
-  assert.deepEqual(sensitive.forcedReviewReasons,["SENSITIVE_FIELD_MAPPING"]);
-  assert.equal(sensitive.scoreBreakdown.riskAdjustment.score,-6);
+  assert.equal(sensitive.forcedReviewReasons.includes("SENSITIVE_FIELD_MAPPING"),false);
+  assert.equal(sensitive.scoreBreakdown.riskAdjustment.score,0);
 
   const invalid=objectCandidate();
   invalid.payload.properties[1].mapping.column="invented_column";
