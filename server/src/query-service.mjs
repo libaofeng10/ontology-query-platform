@@ -25,6 +25,16 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
   // arrive via setDependencies backfill instead of the constructor — never reorder there.
   const deps={knowledge:knowledge||null,evaluation:evaluation||null,proposalService:proposalService||null,claudeBridge:claudeBridge||null,claudeSnapshotBuilder:claudeSnapshotBuilder||createClaudeQuerySnapshot,claudeMcpFactory:claudeMcpFactory||createClaudeQueryMcpSession};
   function setDependencies(next={}){if(next.knowledge)deps.knowledge=next.knowledge;if(next.evaluation)deps.evaluation=next.evaluation;if(next.proposalService)deps.proposalService=next.proposalService;}
+  // legacy 与 semantic 规划都依赖 LLM provider。Claude 分支自带规划能力，所以这个
+  // 门禁只在真正要走 provider 之前生效（入口处、以及 Claude 失败要回退时）。
+  function llmUnconfiguredRefusal({userName,sourceId,question,started,sessionId}) {
+    const issues=llmConfigurationIssues(config.llm);
+    const reason=`真实数据源已连接，但 LLM 配置不可用：${issues.join("；")}。为避免猜测或伪造结果，系统拒绝生成 SQL。`;
+    // buildContext has not run yet, so there is no intent to persist — failureClass alone
+    // lets the gap board bucket these rows without the degraded fingerprint path.
+    store.addAudit({userName,sourceId,question,verdict:"refused",failReason:reason,durationMs:Date.now()-started,rowCount:0,failureClass:"llm_unconfigured"});
+    return {refused:true,reason,missingConfiguration:issues,failureClass:"llm_unconfigured",sessionId};
+  }
 
   async function ask({sourceId,question,userName="local-user",userRole="viewer",sessionId,pendingId,semanticQueryPlanMode,queryAgentMode,claudeQueryMode,ontologySchemaVersionId,signal,onEvent,_skipMetricProposal=false}) {
     if(!pendingId)sweepExpiredPending();
@@ -47,21 +57,16 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
       store.addAudit({userName,sourceId,question,retrievedPages:JSON.stringify(answer.evidence?.pages||[]),sql:answer.evidence?.sql||null,verdict:answer.refused?"refused":"passed",failReason:answer.reason||null,durationMs:Date.now()-started,rowCount:answer.rows?.length||0,planningMode:"demo",planningAttempts:0});
       return {...answer,sessionId:session.id};
     }
-    if(!isLlmConfigured(config.llm)) {
-      const issues=llmConfigurationIssues(config.llm);
-      const reason=`真实数据源已连接，但 LLM 配置不可用：${issues.join("；")}。为避免猜测或伪造结果，系统拒绝生成 SQL。`;
-      // buildContext has not run yet, so there is no intent to persist — failureClass alone
-      // lets the gap board bucket these rows without the degraded fingerprint path.
-      store.addAudit({userName,sourceId,question,verdict:"refused",failReason:reason,durationMs:Date.now()-started,rowCount:0,failureClass:"llm_unconfigured"});
-      return {refused:true,reason,missingConfiguration:issues,failureClass:"llm_unconfigured",sessionId:session.id};
-    }
+    const configuredClaudeMode=normalizeClaudeMode(claudeQueryMode??config.claudeQuery?.mode);
+    const claudeRollout=selectClaudeQueryRollout({mode:configuredClaudeMode,trafficPercent:config.claudeQuery?.trafficPercent??0,cohortKey:`${sourceId}:${session.id}`,explicit:claudeQueryMode!=null});
+    // Claude 自带规划能力，不依赖 legacy/semantic 的 LLM provider。启用 Claude 时
+    // 不能用 LLM 门禁提前拒答；Claude 失败并需要回退到 legacy 时再检查（见下）。
+    if(!isLlmConfigured(config.llm)&&claudeRollout.effectiveMode==="off") return llmUnconfiguredRefusal({userName,sourceId,question,started,sessionId:session.id});
 
     const context=await buildContext(store,sourceId,question,session.context,{embeddingIndex,retrieval:config.retrieval,conversationHistory,ontologySchemaVersionId});
     const configuredAgentMode=normalizeAgentMode(queryAgentMode??config.queryAgentMode);
     const agentRollout=selectQueryAgentRollout({mode:configuredAgentMode,trafficPercent:config.queryAgentTrafficPercent,cohortKey:`${sourceId}:${session.id}`,explicit:queryAgentMode!=null});
     const agentMode=agentRollout.effectiveMode;
-    const configuredClaudeMode=normalizeClaudeMode(claudeQueryMode??config.claudeQuery?.mode);
-    const claudeRollout=selectClaudeQueryRollout({mode:configuredClaudeMode,trafficPercent:config.claudeQuery?.trafficPercent??0,cohortKey:`${sourceId}:${session.id}`,explicit:claudeQueryMode!=null});
     const auditContext=auditContextFields(context,agentRollout);
     throwIfAborted(signal);
     const rankingLimitFailure=rankingLimitPreflight(context.queryIntent,config.queryMaxRows||500);
@@ -112,24 +117,31 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
       claudeTried=true;
       let outcome;
       try {
-        outcome=await runClaudeQueryBranch({store,connector,config,source,session,userName,question,context,conversationHistory,deps,claudeRollout,started,requestId:session.id,signal,onEvent});
+        outcome=await runClaudeQueryBranch({store,connector,config,source,question,context,conversationHistory,deps,started,requestId:session.id,signal,onEvent});
       } catch(error) {
         if(signal?.aborted) throw error;
-        outcome={status:"failed",reason:safeError(error),failureClass:"protocol_error",iterations:0,toolTrace:[],durationMs:Date.now()-started};
+        const errorCode=error?.code?String(error.code):null;
+        // bridge 关闭意味着进程正在停机，不是「这次 Claude 不可用、换个规划器重试」。
+        // 在停机窗口里启动 legacy 会新开一次查询，所以这类失败不允许回退。
+        outcome={status:"failed",reason:safeError(error),failureClass:errorCode==="BRIDGE_CLOSED"?"bridge_closed":"protocol_error",...(errorCode?{errorCode}:{}),iterations:0,toolTrace:[],durationMs:Date.now()-started};
       }
       const terminal=finalizeClaudeOutcome({outcome,source,session,userName,question,context,started,claudeRollout});if(terminal)return terminal;
       claudeFallbackReason=outcome?.reason||"Claude 查询未在预算内收敛";
       claudeToolTrace=outcome?.toolTrace||[];
+      // 失败无论是否回退都要留痕：回退后审计里只剩 legacy 一行的话，灰度期就看不到
+      // Claude 的真实失败率。
+      const auditId=store.addAudit({userName,sourceId:source.id,question:redactTypedLiterals(question),verdict:"failed",failReason:redactTypedLiterals(claudeFallbackReason),durationMs:outcome.durationMs??Date.now()-started,rowCount:0,planningMode:"claude",planningAttempts:outcome.iterations||0,iterations:outcome.iterations||0,clarificationCount:0,toolTraceJson:JSON.stringify(redactClaudeBoundaryValue(claudeToolTrace)),failureClass:outcome.failureClass||"execution_error",promptVersion:outcome.promptVersion||null,ontologySchemaVersion:outcome.ontologySchemaVersion??null,...auditContextFields({...context,queryIntent:outcome.queryIntent||context.queryIntent},claudeRollout,{})});
       if(claudeRollout.effectiveMode==="required"||!claudeFailureCanFallback(outcome)) {
-        const auditId=store.addAudit({userName,sourceId:source.id,question,verdict:"failed",failReason:claudeFallbackReason,durationMs:outcome.durationMs??Date.now()-started,rowCount:0,planningMode:"claude",planningAttempts:outcome.iterations||0,iterations:outcome.iterations||0,clarificationCount:0,toolTraceJson:JSON.stringify(redactClaudeBoundaryValue(claudeToolTrace)),failureClass:outcome.failureClass||"execution_error",...auditContextFields({...context,queryIntent:outcome.queryIntent||context.queryIntent},claudeRollout,{})});
-        return {refused:true,reason:`系统没有执行不可靠的 Claude 查询：${claudeFallbackReason}`,...(outcome?.errorCode?{errorCode:String(outcome.errorCode)}:{}),failureClass:outcome.failureClass||"execution_error",sessionId:session.id,planningMode:"claude",planningAttempts:outcome.iterations||0,toolTrace:redactClaudeBoundaryValue(claudeToolTrace),_auditId:auditId,_sessionQuestion:question};
+        return {refused:true,reason:`系统没有执行不可靠的 Claude 查询：${redactTypedLiterals(claudeFallbackReason)}`,...(outcome?.errorCode?{errorCode:String(outcome.errorCode)}:{}),failureClass:outcome.failureClass||"execution_error",sessionId:session.id,planningMode:"claude",planningAttempts:outcome.iterations||0,toolTrace:redactClaudeBoundaryValue(claudeToolTrace),_auditId:auditId,_sessionQuestion:question};
       }
       return null;
     }
     if(claudeRollout.effectiveMode!=="off"&&!claudeTried) {
       const terminal=await tryClaudeQuery();
       if(terminal)return terminal;
-      if(claudeRollout.effectiveMode==="required") return {refused:true,reason:`系统没有执行不可靠的 Claude 查询：${claudeFallbackReason}`,failureClass:"execution_error",sessionId:session.id,planningMode:"claude",planningAttempts:0,toolTrace:redactClaudeBoundaryValue(claudeToolTrace||[])};
+      // 走到这里表示 Claude 基础设施失败且允许回退，接下来是 legacy/semantic：
+      // 那条链路真的需要 LLM provider，所以门禁在这里才生效。
+      if(!isLlmConfigured(config.llm)) return llmUnconfiguredRefusal({userName,sourceId,question,started,sessionId:session.id});
     }
     if(agentMode==="required"||(agentMode==="prefer"&&(context.queryIntent?.ambiguities||[]).some((item)=>item.blocking))) { const terminal=await tryAgent();if(terminal)return terminal; }
     async function tryAgent() {
@@ -366,13 +378,17 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
       const runs=Array.isArray(outcome.runs)&&outcome.runs.length?outcome.runs:[outcome.run].filter(Boolean);
       const combined=combineQueryRuns(runs);
       const analyticalConclusion=deterministicAnalyticalConclusion(context.queryIntent,combined.rows.length,combined.resultSets.length);
-      const answer={id:`query-${Date.now()}`,sessionId:session.id,question,conclusion:analyticalConclusion||outcome.conclusion||'查询已完成。',delta:analyticalConclusion?undefined:outcome.delta||undefined,columns:combined.columns,rows:combined.rows,resultSets:combined.resultSets,chart:runs.length===1?inferChart(runs[0].rows,runs[0].fields):null,evidence:{pages:(context.knowledge||[]).map((page)=>page.title),rules:(context.rules||[]).map((rule)=>rule.name),tables:combined.tables,joins:combined.joins,sql:combined.sql,sqls:combined.sqls,durationMs:outcome.durationMs??Date.now()-started,scannedRows:combined.scannedRows,coverage:retrievalSnapshot(context).coverage||'none',retrievalMode:retrievalSnapshot(context).retrievalMode||'lexical',planningMode:'claude',planningAttempts:outcome.iterations,iterations:outcome.iterations,toolTrace:redactClaudeBoundaryValue(outcome.toolTrace||[]),stateTransitions:outcome.stateTransitions,budgetFallback:outcome.budgetFallback||undefined,resultDelivery:runs.some((run)=>run.resultDelivery==='direct')?'direct':'preview',clarifications:outcome.clarifications||[],tokenUsage:outcome.tokenUsage,queryIntent:context.queryIntent,resultContract:outcome.resultContract||buildQueryResultContract(context.queryIntent,[context.retrieval].filter(Boolean),null),resultContractFingerprint:outcome.resultContractFingerprint||hash(JSON.stringify(outcome.resultContract||{})),claudeRollout,resultCompleteness:combined.completeness}};
-      const auditId=store.addAudit({userName,sourceId:source.id,question,retrievedPages:JSON.stringify(answer.evidence.pages),sql:combined.sql,verdict:"passed",durationMs:answer.evidence.durationMs,rowCount:combined.rows.length,planningMode:"claude",planningAttempts:outcome.iterations,iterations:outcome.iterations,clarificationCount,toolTraceJson:JSON.stringify(answer.evidence.toolTrace)});
+      // 结论与增量是模型自由文本，可能把它在预览里看到的值原样带出来；出库前统一脱敏。
+      const conclusion=redactTypedLiterals(analyticalConclusion||outcome.conclusion||'查询已完成。');
+      const delta=analyticalConclusion?undefined:outcome.delta?redactTypedLiterals(outcome.delta):undefined;
+      const answer={id:`query-${Date.now()}`,sessionId:session.id,question,conclusion,delta,columns:combined.columns,rows:combined.rows,resultSets:combined.resultSets,chart:runs.length===1?inferChart(runs[0].rows,runs[0].fields):null,evidence:{pages:(context.knowledge||[]).map((page)=>page.title),rules:(context.rules||[]).map((rule)=>rule.name),tables:combined.tables,joins:combined.joins,sql:combined.sql,sqls:combined.sqls,durationMs:outcome.durationMs??Date.now()-started,scannedRows:combined.scannedRows,coverage:retrievalSnapshot(context).coverage||'none',retrievalMode:retrievalSnapshot(context).retrievalMode||'lexical',planningMode:'claude',planningAttempts:outcome.iterations,iterations:outcome.iterations,ontologySchemaVersion:outcome.ontologySchemaVersion??undefined,promptVersion:outcome.promptVersion||undefined,toolTrace:redactClaudeBoundaryValue(outcome.toolTrace||[]),stateTransitions:outcome.stateTransitions,budgetFallback:outcome.budgetFallback||undefined,resultDelivery:runs.some((run)=>run.resultDelivery==='direct')?'direct':'preview',clarifications:outcome.clarifications||[],tokenUsage:outcome.tokenUsage,queryIntent:context.queryIntent,resultContract:outcome.resultContract||buildQueryResultContract(context.queryIntent,[context.retrieval].filter(Boolean),null),resultContractFingerprint:outcome.resultContractFingerprint||hash(JSON.stringify(outcome.resultContract||{})),claudeRollout,resultCompleteness:combined.completeness}};
+      const auditId=store.addAudit({userName,sourceId:source.id,question:redactTypedLiterals(question),retrievedPages:JSON.stringify(answer.evidence.pages),sql:combined.sql,verdict:"passed",durationMs:answer.evidence.durationMs,rowCount:combined.rows.length,planningMode:"claude",planningAttempts:outcome.iterations,iterations:outcome.iterations,clarificationCount,toolTraceJson:JSON.stringify(answer.evidence.toolTrace),...auditContextFields({...context,queryIntent:outcome.queryIntent||context.queryIntent},claudeRollout,{}),promptVersion:outcome.promptVersion||null,ontologySchemaVersion:outcome.ontologySchemaVersion??null});
       store.updateSession(session.id,nextSessionContext(session.context,combined.tables,[...new Set(answer.evidence.pages)],context.queryIntent));return {...answer,_auditId:auditId,_sessionQuestion:question};
     }
     if(outcome.status==="refused") {
-      const auditId=store.addAudit({userName,sourceId:source.id,question,verdict:"refused",failReason:outcome.reason,durationMs:outcome.durationMs??Date.now()-started,rowCount:0,planningMode:"claude",planningAttempts:outcome.iterations,iterations:outcome.iterations,clarificationCount,toolTraceJson:JSON.stringify(redactClaudeBoundaryValue(outcome.toolTrace||[])),failureClass:outcome.failureClass||"policy_block"});
-      return {refused:true,reason:outcome.reason,failureClass:outcome.failureClass||"policy_block",...(outcome.errorCode?{errorCode:outcome.errorCode}:{}),sessionId:session.id,planningMode:"claude",planningAttempts:outcome.iterations,toolTrace:redactClaudeBoundaryValue(outcome.toolTrace||[]),clarifications:outcome.clarifications||[],_auditId:auditId,_sessionQuestion:question};
+      const reason=redactTypedLiterals(outcome.reason);
+      const auditId=store.addAudit({userName,sourceId:source.id,question:redactTypedLiterals(question),verdict:"refused",failReason:reason,durationMs:outcome.durationMs??Date.now()-started,rowCount:0,planningMode:"claude",planningAttempts:outcome.iterations,iterations:outcome.iterations,clarificationCount,promptVersion:outcome.promptVersion||null,ontologySchemaVersion:outcome.ontologySchemaVersion??null,toolTraceJson:JSON.stringify(redactClaudeBoundaryValue(outcome.toolTrace||[])),failureClass:outcome.failureClass||"policy_block"});
+      return {refused:true,reason,failureClass:outcome.failureClass||"policy_block",...(outcome.errorCode?{errorCode:outcome.errorCode}:{}),sessionId:session.id,planningMode:"claude",planningAttempts:outcome.iterations,toolTrace:redactClaudeBoundaryValue(outcome.toolTrace||[]),clarifications:outcome.clarifications||[],_auditId:auditId,_sessionQuestion:question};
     }
     return null;
   }
@@ -915,25 +931,132 @@ function selectClaudeQueryRollout({mode,trafficPercent=0,cohortKey="",explicit=f
   const bucket=createHash("sha256").update(String(cohortKey)).digest().readUInt32BE(0)%100;
   return {configuredMode,effectiveMode:bucket<percent?"prefer":"off",trafficPercent:percent,bucket,reason:bucket<percent?"in_cohort":"out_of_cohort"};
 }
-function claudeFailureCanFallback(outcome) { return outcome?.status!=="refused"&&outcome?.failureClass!=="policy_block"&&outcome?.failureClass!=="protocol_error"&&outcome?.failureClass!=="auth_error"&&outcome?.failureClass!=="model_missing"&&outcome?.failureClass!=="budget_disabled"; }
+// 回退只覆盖「Claude 这条链路不可用」。已经执行过 SQL、被策略拒绝、协议被破坏、
+// 配置错误，或进程正在停机（bridge_closed）时换一个规划器重查，都会造成重复执行
+// 或语义漂移。
+const CLAUDE_NO_FALLBACK_FAILURES=new Set(["policy_block","protocol_error","auth_error","model_missing","budget_disabled","bridge_closed","sensitive_binding_unavailable","result_incomplete"]);
+function claudeFailureCanFallback(outcome) { return outcome?.status!=="refused"&&!CLAUDE_NO_FALLBACK_FAILURES.has(outcome?.failureClass); }
 
-async function runClaudeQueryBranch({store,connector,config,source,session,userName,question,context,conversationHistory,deps,claudeRollout,started,requestId,signal,onEvent}) {
+async function runClaudeQueryBranch({store,connector,config,source,question,context,conversationHistory,deps,started,requestId,signal,onEvent}) {
   const sourceId=source.id;
-  const snapshot=deps.claudeSnapshotBuilder({...context,sourceId,source:snapshotSource(source),store});
+  const claudeConfig=config.claudeQuery||{};
+  const refusal=(reason,failureClass,errorCode)=>({status:"refused",reason,failureClass,errorCode,iterations:0,toolTrace:[],durationMs:Date.now()-started});
+  // 这三个门禁必须先于 snapshot/MCP/bridge 构造运行：它们都是「不应该发起一次
+  // 昂贵或会外泄原值的调用」的判断，付费调用一旦发出就无法撤回。
+  if(claudeBudgetDisabled(claudeConfig.maxBudgetUsd)) return refusal("Claude 单请求预算为 0，已拒绝启动 Claude 查询","budget_disabled","BUDGET_DISABLED");
+  if(!String(claudeConfig.model??"").trim()) return refusal("Claude 问数已启用，但未配置精确模型 ID，已拒绝启动","model_missing","MODEL_REQUIRED");
+  // db_query 目前只接受完整 SQL 文本，没有请求级参数绑定，因此无法把手机号/邮箱等
+  // 原值安全地交给 Claude；也不允许静默换到另一个 provider 重查。
+  const typedLiterals=detectQuestionValueKinds(question);
+  if(typedLiterals.length) {
+    const kinds=[...new Set(typedLiterals.map((item)=>CLAUDE_TYPED_LITERAL_LABELS[item.kind]||"敏感"))].join("、");
+    return refusal(`问题包含${kinds}等敏感值，当前 Claude 链路没有安全的参数化绑定，系统没有把原值发送给模型`,"sensitive_binding_unavailable","SENSITIVE_BINDING_UNAVAILABLE");
+  }
+  const bridge=deps.claudeBridge;
+  const runner=bridge&&(bridge.run||bridge.execute||bridge.invoke);
+  if(typeof runner!=="function") return {status:"failed",reason:"Claude bridge 不可用",failureClass:"cli_unavailable",iterations:0,toolTrace:[],durationMs:Date.now()-started};
+
+  const snapshot=await deps.claudeSnapshotBuilder({...context,sourceId,source:snapshotSource(source),store});
   if(!snapshot||typeof snapshot.read!=="function") throw new Error("Claude ontology snapshot 构造失败");
   const kernelCatalog=buildKernelCatalog(context,config);
-  const kernel=createQueryExecutionKernel({connector,source,config,question,catalog:kernelCatalog,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),getDisclosedTables:()=>snapshot.disclosedTables||new Set(),signal,maxSqlCalls:config.claudeQuery?.maxSqlCalls??config.queryAgentMaxSqlCalls,maxScannedRows:config.claudeQuery?.maxScannedRows??config.queryAgentMaxScannedRows,forbidSensitiveOutput:true,preview:{maxRows:20,maxBytes:24*1024,maxCellChars:200}});
+  const kernel=createQueryExecutionKernel({connector,source,config,question,catalog:kernelCatalog,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),getDisclosedTables:()=>snapshot.disclosedTables||new Set(),signal,maxSqlCalls:claudeConfig.maxSqlCalls??config.queryAgentMaxSqlCalls,maxScannedRows:claudeConfig.maxScannedRows??config.queryAgentMaxScannedRows,forbidSensitiveOutput:true,preview:{maxRows:20,maxBytes:24*1024,maxCellChars:200}});
   const produced=await deps.claudeMcpFactory({snapshot,kernel,source,sourceId,requestId,signal,listen:true,previewRows:20,previewBytes:24*1024,initialDisclosedTables:[]});
   const mcpSession=produced?.session||produced;
   if(!mcpSession) throw new Error("Claude MCP session 构造失败");
-  const bridge=typeof deps.claudeBridge==="function"?deps.claudeBridge:deps.claudeBridge;
-  const runner=bridge&&(bridge.run||bridge.execute||bridge.invoke);
-  if(typeof runner!=="function") throw new Error("Claude bridge 不可用");
-  const claudeConfig=config.claudeQuery||{};
-  return await runner.call(bridge,{
-    requestId,question:question,context,conversationHistory,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),snapshot,kernel,mcp:mcpSession,mcpSession,signal,onEvent,closeMcp:false,requireApiKey:claudeConfig.requireApiKey??true,requireModel:claudeConfig.requireModel??false,binary:claudeConfig.binary,promptVersion:claudeConfig.promptVersion,timeoutMs:claudeConfig.timeoutMs,maxTurns:claudeConfig.maxTurns,maxBudgetUsd:claudeConfig.maxBudgetUsd,model:claudeConfig.model,mcpFactory:null,
-  });
+  try {
+    const outcome=await runner.call(bridge,{
+      requestId,question:question,context,conversationHistory,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),snapshot,kernel,mcp:mcpSession,mcpSession,signal,onEvent,closeMcp:false,requireApiKey:claudeConfig.requireApiKey??true,requireModel:claudeConfig.requireModel??false,binary:claudeConfig.binary,promptVersion:claudeConfig.promptVersion,timeoutMs:claudeConfig.timeoutMs,maxTurns:claudeConfig.maxTurns,maxBudgetUsd:claudeConfig.maxBudgetUsd,model:claudeConfig.model,mcpFactory:null,
+    });
+    return await settleClaudeBridgeOutcome({outcome,mcpSession,snapshot,claudeConfig,started});
+  } finally {
+    // 请求级 listener 持有一个临时端口和 bearer token；无论成败都必须收口，
+    // 否则一次失败的问数会把端口和凭据留到进程退出。
+    try { await mcpSession.close?.(); } catch { /* best effort */ }
+  }
 }
+
+const CLAUDE_TYPED_LITERAL_LABELS={phone:"手机号",email:"邮箱",china_id:"身份证号",bank_card:"银行卡号"};
+function claudeBudgetDisabled(value) { return value!==null&&value!==undefined&&value!==""&&Number(value)===0; }
+
+/**
+ * Claude 返回的 answered 只是一个「引用」：executionIds 必须能在本次请求的执行
+ * 注册表里逐一兑现。adapter 自带的 runs 一律丢弃，否则模型（或一个被攻破的
+ * adapter）就能伪造业务结果。
+ */
+async function settleClaudeBridgeOutcome({outcome,mcpSession,snapshot,claudeConfig,started}) {
+  const settled={...(outcome||{})};
+  if(settled.ontologySchemaVersion==null) settled.ontologySchemaVersion=snapshot?.schemaVersion??null;
+  if(!settled.promptVersion) settled.promptVersion=outcome?.metadata?.promptVersion||outcome?.promptVersion||claudeConfig.promptVersion||null;
+  if(settled.status!=="answered") return settled;
+  const protocolRefusal=(reason,errorCode)=>({...settled,status:"refused",reason,failureClass:"protocol_error",errorCode,durationMs:settled.durationMs??Date.now()-started});
+  const ids=Array.isArray(outcome.executionIds)?outcome.executionIds:[];
+  if(!ids.length) return protocolRefusal("Claude 返回 answered 但没有提供任何 execution ID","EXECUTION_IDS_REQUIRED");
+  let resolved;
+  try { resolved=await resolveClaudeExecutions(mcpSession,ids); }
+  catch(error) { resolved={ok:false,error:safeError(error),errorCode:"EXECUTION_RESOLVE_FAILED"}; }
+  if(!resolved?.ok) return protocolRefusal(String(resolved?.error||"无法校验 Claude 返回的 execution ID"),resolved?.errorCode||"UNKNOWN_EXECUTION_ID");
+  return {...settled,run:undefined,runs:resolved.runs.map((run)=>normalizeClaudeRun(run,snapshot))};
+}
+
+async function resolveClaudeExecutions(mcpSession,ids) {
+  const resolve=mcpSession?.resolveExecutions||mcpSession?.resolveExecutionIds||mcpSession?.registry?.resolve;
+  if(typeof resolve!=="function") return {ok:false,error:"无法校验 execution ID：请求级执行注册表不可用",errorCode:"EXECUTION_REGISTRY_UNAVAILABLE"};
+  const result=await resolve.call(mcpSession,ids);
+  if(Array.isArray(result)) return {ok:true,runs:result};
+  if(result?.ok===false) return {ok:false,error:result.error||result.reason,errorCode:result.errorCode};
+  const runs=Array.isArray(result?.runs)?result.runs:[];
+  if(runs.length!==ids.length) return {ok:false,error:"execution ID 与已执行结果数量不一致",errorCode:"EXECUTION_COUNT_MISMATCH"};
+  return {ok:true,runs};
+}
+
+// 已发布快照是敏感列的权威来源。驱动/adapter 可能追加一个未投影的敏感列，
+// 因此在结果进入公开答案前按快照元数据再剔一次（三种历史拼写都按启用处理）。
+function normalizeClaudeRun(run,snapshot) {
+  const tables=(Array.isArray(run?.tables)&&run.tables.length?run.tables:run?.verdict?.tables)||[];
+  const sensitive=claudeSensitiveColumnNames(snapshot,tables,run?.sensitiveColumns);
+  const fields=claudeRunFields(run,sensitive);
+  const allowed=new Set(fields.map((field)=>field.name));
+  const rows=(Array.isArray(run?.rows)?run.rows:[]).map((row)=>Object.fromEntries(Object.entries(row||{}).filter(([name])=>allowed.has(name))));
+  const verdict=run?.verdict&&typeof run.verdict==="object"?{...run.verdict,tables:run.verdict.tables||tables}:{tables};
+  return {...run,tables,verdict,fields,columns:fields,rows,sensitiveColumns:[...sensitive]};
+}
+
+function claudeRunFields(run,sensitive) {
+  const raw=Array.isArray(run?.fields)&&run.fields.length?run.fields
+    :Array.isArray(run?.columns)&&run.columns.length?run.columns
+    :Object.keys((Array.isArray(run?.rows)?run.rows:[])[0]||{});
+  const names=raw.map((item)=>typeof item==="string"?item:item?.name??item?.columnName).filter(Boolean).map((item)=>String(item));
+  return [...new Set(names)].filter((name)=>!sensitive.has(normalizeClaudeFieldName(name))).map((name)=>({name}));
+}
+
+function claudeSensitiveColumnNames(snapshot,tables,extra) {
+  const names=new Set();
+  const add=(value)=>{const name=normalizeClaudeFieldName(value);if(name)names.add(name);};
+  for(const value of Array.isArray(extra)?extra:[]) add(value);
+  const columnsByTable=snapshot?.columnsByTable||{};
+  const scope=Array.isArray(tables)&&tables.length?tables:Object.keys(columnsByTable);
+  for(const table of scope) {
+    const key=Object.keys(columnsByTable).find((item)=>normalizeClaudeFieldName(item)===normalizeClaudeFieldName(table));
+    for(const column of columnsByTable[key]||[]) {
+      if(claudeSensitiveFlag(column?.sensitive)||claudeSensitiveFlag(column?.isSensitive)||claudeSensitiveFlag(column?.is_sensitive)) add(column?.columnName??column?.name??column?.fieldName);
+    }
+  }
+  return names;
+}
+
+function claudeSensitiveFlag(value) {
+  if(value===true||(typeof value==="number"&&value>0))return true;
+  if(typeof value!=="string")return false;
+  const normalized=value.trim().toLowerCase();
+  // 未知的非空文本标记按敏感处理：表示法不一致不应让敏感列意外可见。
+  return normalized!==""&&!["0","false","no","off","null","undefined"].includes(normalized);
+}
+
+function normalizeClaudeFieldName(value) {
+  return String(value??"").replaceAll("`","").replaceAll('"',"").replaceAll("[","").replaceAll("]","").split(".").at(-1).trim().toLowerCase();
+}
+
+function safeError(error) { return String(error?.message||error).replace(/(password|token|api[_-]?key|authorization)\s*[=:]\s*[^\s,;]+/gi,"$1=[REDACTED]").slice(0,1_000); }
 
 function snapshotSource(source) { return {id:source.id}; }
 function buildKernelCatalog(context,config) {
@@ -942,10 +1065,14 @@ function buildKernelCatalog(context,config) {
 }
 function retrievalSnapshot(context) { return {coverage:context.retrieval?.coverage,retrievalMode:context.retrieval?.retrievalMode}; }
 function redactClaudeBoundaryValue(value,depth=0,seen=new WeakSet()) {
-  if(value==null||typeof value!=="object")return value;
+  if(value==null)return value;
+  // 边界函数的目标是「Claude/工具产出的自由文本不得携带 typed literal 出库」。
+  // 少数键位白名单容易漏掉 conclusion/delta/summary 等新字段，直接对字符串统一脱敏。
+  if(typeof value==="string")return redactTypedLiterals(value);
+  if(typeof value!=="object")return value;
   if(seen.has(value))return "[Circular]";seen.add(value);
   if(Array.isArray(value))return value.slice(0,200).map((item)=>redactClaudeBoundaryValue(item,depth+1,seen));
-  const result={};for(const [key,item] of Object.entries(value)){if(['sql','error','reason','query','prompt'].includes(key)&&typeof item==="string")result[key]=redactTypedLiterals(item);else result[key]=redactClaudeBoundaryValue(item,depth+1,seen);}return result;
+  const result={};for(const [key,item] of Object.entries(value)){result[key]=redactClaudeBoundaryValue(item,depth+1,seen);}return result;
 }
 
 export const _internal={buildContext,buildSemanticRuntime,planSql,planSemanticQuery,summarize,llmOptions,ensureSummaryConsistency,deterministicAnalyticalConclusion,inferChart,semanticQuestionMatches,normalizeAgentMode,rankingLimitPreflight,selectQueryAgentRollout,contextualRetrievalQuestion,isContextualFollowUp,nextSessionContext,sessionSafeIntent,plannedQuerySpecs,combineQueryRuns,missingExhaustiveAccountTables,scopedKnowledgeOntologyConflicts,refusalMissingAssets,normalizeClaudeMode,selectClaudeQueryRollout,claudeFailureCanFallback,runClaudeQueryBranch};

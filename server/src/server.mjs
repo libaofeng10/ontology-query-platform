@@ -33,6 +33,9 @@ import { createOntologyDomainPlanner } from "./ontology-domain-plan.mjs";
 import { createOntologyDomainModelingService } from "./ontology-domain-modeling-service.mjs";
 import { createOntologyDomainDraftService } from "./ontology-domain-draft-service.mjs";
 import { detectSensitiveValue } from "./column-profile.mjs";
+import { createClaudeQueryBridge } from "./claude-query-bridge.mjs";
+import { dirname, join as joinPath } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export function createApp(overrides={}) {
   const runtime={...config,...overrides,rateLimits:{...config.rateLimits,...overrides.rateLimits},ontologyAi:{...config.ontologyAi,...overrides.ontologyAi}};
@@ -57,7 +60,15 @@ export function createApp(overrides={}) {
   const ontologyGenerationAudits=createOntologyGenerationAuditService({auditDir:runtime.ontologyAi.auditDir});
   const graph=createOntologyGraphService({store,knowledge});
   const capabilityGaps=createCapabilityGapService({store});
-  const queries=createQueryService({store,connector,config:settingsConfig,embeddingIndex});
+  // Claude bridge 是部署边界：可执行文件、模型、prompt 契约在构造时冻结成 factory
+  // policy，请求无法替换。mode/trafficPercent 走 settingsConfig 热更新，由
+  // query-service 在每次请求时读取，因此这里只固化安全与资源上限。
+  const claudeBridge=overrides.claudeBridge!==undefined?overrides.claudeBridge:createClaudeQueryBridge({
+    ...settingsConfig.claudeQuery,
+    requireApiKey:runtime.nodeEnv!=="test",
+    systemPromptFile:joinPath(dirname(fileURLToPath(import.meta.url)),"..","claude","ontology-query","SKILL.md"),
+  });
+  const queries=createQueryService({store,connector,config:settingsConfig,embeddingIndex,claudeBridge});
   const evaluation=createEvaluationService({store,connector,queries,config:settingsConfig});
   // evaluation depends on queries, so the proposal wiring is backfilled after both exist.
   const knowledgeProposals=overrides.knowledgeProposalService||createKnowledgeProposalService({store,config:settingsConfig,knowledge,fetchImpl:overrides.llmFetchImpl});
@@ -183,7 +194,9 @@ export function createApp(overrides={}) {
     } finally { req.off?.("aborted",abort); }
   }
 
-  async function close(){await tasks.close();await connector.close();store.close();}
+  // 停机先关 bridge：取消活动 Claude、拒绝排队请求（BRIDGE_CLOSED 不回退 legacy），
+  // 再关任务/连接池。顺序反了会在停机窗口里放行新的 Claude 子进程或 legacy 查询。
+  async function close(){try{await claudeBridge?.close?.();}catch{/* best effort */}await tasks.close();await connector.close();store.close();}
   return {handler,close,store,ontologyCandidates,ontologyCalibration,relationDocuments,sensitiveCatalogMigration,enumCatalogMigration};
 }
 
