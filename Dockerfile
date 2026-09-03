@@ -18,6 +18,10 @@ RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g; s|http://securi
  && apt-get purge -y --auto-remove python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
 COPY . .
+# Claude CLI 的 native binary 由 postinstall 下载；若被 --ignore-scripts 或
+# allowScripts 策略跳过，运行期 preflight 才会暴露。在 build 阶段探测版本，
+# 让缺失在镜像构建时直接失败（容器运行期 read_only，无法补装）。
+RUN /app/node_modules/.bin/claude --version
 RUN npm run build \
  && mkdir -p /var/lib/ontoquery/data /var/lib/ontoquery/wiki \
  && chown -R node:node /app /var/lib/ontoquery
