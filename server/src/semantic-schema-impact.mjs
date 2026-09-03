@@ -1,10 +1,39 @@
 import { diffSemanticSchemas } from "./semantic-schema-diff.mjs";
 
-export function analyzeSemanticSchemaImpact(currentSchema,baseSchema,{cases=[],relations=[]}={}) {
+export function analyzeSemanticSchemaImpact(currentSchema,baseSchema,{cases=[],relations=[],availableTables=null}={}) {
   const diff=diffSemanticSchemas(currentSchema,baseSchema);
   const current=model(currentSchema),base=model(baseSchema);
   const relationById=new Map(relations.map((item)=>[Number(item.id),item]));
-  const relevant=diff.changes.filter((change)=>change.impact!=="compatible");
+  // A removal whose every physical mapping points at a table that is no longer
+  // in the catalog (dropped or excluded from the data source) cannot have any
+  // still-working behaviour to protect: no eval case could execute against it.
+  // Demanding evaluation coverage for those removals would deadlock publishing,
+  // so they stay in the diff but are exempt from the coverage gate.
+  const tableSet=availableTables instanceof Set?availableTables:availableTables?new Set(availableTables):null;
+  const staleRemoval=(change)=>{
+    if(!tableSet||change.change!=="removed")return false;
+    if(change.kind==="object"||change.kind==="property"){
+      const [,objectName]=change.path.split(".");
+      const object=base.objects.get(objectName);
+      if(!object)return false;
+      const mappedTables=[...object.properties.values()].map((property)=>property.mapping?.table).filter(Boolean);
+      return mappedTables.length>0&&mappedTables.every((table)=>!tableSet.has(table));
+    }
+    if(change.kind==="link"){
+      const link=base.links.get(change.path.split(".").at(-1));
+      if(!link)return false;
+      // A link is stale when either endpoint object no longer exists in the
+      // current schema because its tables were dropped from the catalog.
+      return [link.source,link.target].some((name)=>{
+        const object=base.objects.get(name);
+        if(!object||current.objects.has(name))return false;
+        const mappedTables=[...object.properties.values()].map((property)=>property.mapping?.table).filter(Boolean);
+        return mappedTables.length>0&&mappedTables.every((table)=>!tableSet.has(table));
+      });
+    }
+    return false;
+  };
+  const relevant=diff.changes.filter((change)=>change.impact!=="compatible"&&!staleRemoval(change));
   const dependencies=relevant.map((change)=>dependencyForChange(change,current,base,relationById));
   const affectedCases=[];
   const matchedPaths=new Set();

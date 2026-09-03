@@ -5,6 +5,10 @@ import { analyzeSemanticSchemaImpact } from "./semantic-schema-impact.mjs";
 import { hasSemanticHierarchyChanges, semanticSubtypeNames } from "./semantic-schema-diff.mjs";
 
 export function createSemanticSchemaService({store}) {
+  function selectedTableNames(sourceId) {
+    const excluded=store.excludedTableNames(sourceId);
+    return new Set(store.listTables(sourceId).map((table)=>table.tableName).filter((name)=>!excluded.has(name)));
+  }
   function catalog(sourceId) {
     const tables=store.listTables(sourceId);
     const columnsByTable=Object.fromEntries(tables.map((table)=>[table.tableName,store.listColumns(sourceId,table.tableName)]));
@@ -46,7 +50,7 @@ export function createSemanticSchemaService({store}) {
     const current=store.getPublishedOntologySchema(record.sourceId);
     if(current) {
       const cases=store.listEvalCasesForImpact(record.sourceId);
-      const impact=analyzeSemanticSchemaImpact(record.schema,current.schema,{cases,relations:catalog(record.sourceId).relations});
+      const impact=analyzeSemanticSchemaImpact(record.schema,current.schema,{cases,relations:catalog(record.sourceId).relations,availableTables:selectedTableNames(record.sourceId)});
       if(impact.summary.requiresEvaluation) {
         const validGates=[];
         const missingSets=impact.affectedSets.filter((setName)=>{

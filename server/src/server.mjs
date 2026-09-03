@@ -1,5 +1,6 @@
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { config } from "./config.mjs";
 import { authenticate, authorize, canAccessSource, createRateLimiter } from "./auth.mjs";
 import { encryptCredential } from "./crypto.mjs";
@@ -33,9 +34,11 @@ import { createOntologyDomainPlanner } from "./ontology-domain-plan.mjs";
 import { createOntologyDomainModelingService } from "./ontology-domain-modeling-service.mjs";
 import { createOntologyDomainDraftService } from "./ontology-domain-draft-service.mjs";
 import { detectSensitiveValue } from "./column-profile.mjs";
+import { inspectClaudeQueryReadiness } from "./claude-query-readiness.mjs";
+import { createClaudeQueryBridge } from "./claude-query-bridge.mjs";
 
 export function createApp(overrides={}) {
-  const runtime={...config,...overrides,rateLimits:{...config.rateLimits,...overrides.rateLimits},ontologyAi:{...config.ontologyAi,...overrides.ontologyAi}};
+  const runtime={...config,...overrides,rateLimits:{...config.rateLimits,...overrides.rateLimits},ontologyAi:{...config.ontologyAi,...overrides.ontologyAi},claudeQuery:{...config.claudeQuery,...overrides.claudeQuery}};
   const store=overrides.store||createStore(runtime.dbPath);seedDemo(store,runtime.appSecret);
   const sensitiveCatalogMigration=applySensitiveCatalogMigration(store);
   const enumCatalogMigration=applyEnumCatalogMigration(store);
@@ -57,7 +60,15 @@ export function createApp(overrides={}) {
   const ontologyGenerationAudits=createOntologyGenerationAuditService({auditDir:runtime.ontologyAi.auditDir});
   const graph=createOntologyGraphService({store,knowledge});
   const capabilityGaps=createCapabilityGapService({store});
-  const queries=createQueryService({store,connector,config:settingsConfig,embeddingIndex});
+  const claudeBridge=overrides.claudeBridge||createClaudeQueryBridge({
+    config:settingsConfig,
+    systemPromptFile:fileURLToPath(new URL("../claude/ontology-query/SKILL.md",import.meta.url)),
+    // A production app must never silently fall back to an interactive
+    // `claude login`; credentials are deployment-owned and passed only via
+    // the bridge's allow-listed child environment.
+    requireApiKey:true,
+  });
+  const queries=createQueryService({store,connector,config:settingsConfig,embeddingIndex,claudeBridge});
   const evaluation=createEvaluationService({store,connector,queries,config:settingsConfig});
   // evaluation depends on queries, so the proposal wiring is backfilled after both exist.
   const knowledgeProposals=overrides.knowledgeProposalService||createKnowledgeProposalService({store,config:settingsConfig,knowledge,fetchImpl:overrides.llmFetchImpl});
@@ -71,7 +82,12 @@ export function createApp(overrides={}) {
     const url=new URL(req.url,"http://localhost");
     try {
       if(req.method==="GET"&&url.pathname==="/api/health")return send(res,200,{ok:true,service:"ontology-query-api",time:new Date().toISOString(),requestId});
-      if(req.method==="GET"&&url.pathname==="/api/ready"){store.db.prepare("SELECT 1").get();return send(res,200,{ok:true,store:"ready",sensitiveFieldRules:{version:sensitiveCatalogMigration.version,promotedColumns:sensitiveCatalogMigration.promotedColumns,skipped:sensitiveCatalogMigration.skipped},enumDictionaryRules:{version:enumCatalogMigration.version,removedColumns:enumCatalogMigration.removedColumns,removedHumanMeanings:enumCatalogMigration.removedHumanMeanings,skipped:enumCatalogMigration.skipped},requestId});}
+      if(req.method==="GET"&&url.pathname==="/api/ready"){
+        store.db.prepare("SELECT 1").get();
+        const claudeReadiness=inspectClaudeQueryReadiness({config:settingsConfig});
+        const ready=claudeReadiness.ok||!claudeReadiness.enabled;
+        return send(res,ready?200:503,{ok:ready,store:"ready",claudeQuery:claudeReadiness,sensitiveFieldRules:{version:sensitiveCatalogMigration.version,promotedColumns:sensitiveCatalogMigration.promotedColumns,skipped:sensitiveCatalogMigration.skipped},enumDictionaryRules:{version:enumCatalogMigration.version,removedColumns:enumCatalogMigration.removedColumns,removedHumanMeanings:enumCatalogMigration.removedHumanMeanings,skipped:enumCatalogMigration.skipped},requestId});
+      }
       const identity=authenticate(req,runtime);applyRateLimit(req,res,url,identity,runtime,limiter);
 
       if(req.method==="GET"&&url.pathname==="/api/bootstrap"){
@@ -135,7 +151,7 @@ export function createApp(overrides={}) {
       if(req.method==="POST"&&url.pathname==="/api/ontology/validate"){const body=await readJson(req);const sourceId=requiredSourceId(store,identity,body.sourceId,"editor");return send(res,200,semanticSchemas.validate(sourceId,body.schema));}
       if(req.method==="POST"&&url.pathname==="/api/ontology/schemas"){const body=await readJson(req);const sourceId=requiredSourceId(store,identity,body.sourceId,"editor");return send(res,201,semanticSchemas.saveDraft(sourceId,body.schema,identity.name));}
       const ontologySchemaMatch=url.pathname.match(/^\/api\/ontology\/schemas\/(\d+)$/);if(req.method==="GET"&&ontologySchemaMatch){const record=semanticSchemas.get(Number(ontologySchemaMatch[1]));if(!record)throw notFound("业务本体 Schema 版本不存在");authorize(identity,"viewer",record.sourceId);return send(res,200,record);}
-      const ontologyDiffMatch=url.pathname.match(/^\/api\/ontology\/schemas\/(\d+)\/diff$/);if(req.method==="GET"&&ontologyDiffMatch){const record=semanticSchemas.get(Number(ontologyDiffMatch[1]));const base=semanticSchemas.get(Number(url.searchParams.get("against")));if(!record||!base)throw notFound("用于比较的业务本体 Schema 版本不存在");authorize(identity,"viewer",record.sourceId);authorize(identity,"viewer",base.sourceId);if(record.sourceId!==base.sourceId)throw badRequest("只能比较同一数据源的 Schema 版本");const cases=store.listEvalCasesForImpact(record.sourceId);const impact=analyzeSemanticSchemaImpact(record.schema,base.schema,{cases,relations:store.listRelations(record.sourceId,false,true)});const subtypeNames=new Set(semanticSubtypeNames(record.schema));const gateEvidence=impact.affectedSets.map((setName)=>{const setCases=cases.filter((item)=>item.setName===setName);const gate=store.findPassedEvalGate(record.sourceId,setName,record.version,evalSetChecksum(setCases));const subtypeRootObjects=(gate?.candidate?.subtypeRootObjects||[]).filter((name)=>subtypeNames.has(name));return {setName,passed:Boolean(gate),gateId:gate?.id||null,createdAt:gate?.createdAt||null,subtypeRootObjects};});const hierarchyChanged=hasSemanticHierarchyChanges(record.schema,base.schema);const subtypeRootCoverage=[...new Set(gateEvidence.flatMap((item)=>item.subtypeRootObjects))];const subtypeRootCoverageMissing=hierarchyChanged&&!subtypeRootCoverage.length;const readyToPublish=impact.summary.requiresEvaluation&&!impact.uncoveredChanges.length&&gateEvidence.every((item)=>item.passed)&&!subtypeRootCoverageMissing;return send(res,200,{sourceId:record.sourceId,currentVersion:record.version,baseVersion:base.version,...impact.diff,evaluationImpact:{summary:{...impact.summary,hierarchyChanged,subtypeRootCoverageMissing,readyToPublish},affectedCases:impact.affectedCases,affectedSets:impact.affectedSets,uncoveredChanges:impact.uncoveredChanges,gateEvidence,subtypeRootCoverage}});}
+      const ontologyDiffMatch=url.pathname.match(/^\/api\/ontology\/schemas\/(\d+)\/diff$/);if(req.method==="GET"&&ontologyDiffMatch){const record=semanticSchemas.get(Number(ontologyDiffMatch[1]));const base=semanticSchemas.get(Number(url.searchParams.get("against")));if(!record||!base)throw notFound("用于比较的业务本体 Schema 版本不存在");authorize(identity,"viewer",record.sourceId);authorize(identity,"viewer",base.sourceId);if(record.sourceId!==base.sourceId)throw badRequest("只能比较同一数据源的 Schema 版本");const cases=store.listEvalCasesForImpact(record.sourceId);const diffExcludedTables=store.excludedTableNames(record.sourceId);const impact=analyzeSemanticSchemaImpact(record.schema,base.schema,{cases,relations:store.listRelations(record.sourceId,false,true),availableTables:new Set(store.listTables(record.sourceId).map((table)=>table.tableName).filter((name)=>!diffExcludedTables.has(name)))});const subtypeNames=new Set(semanticSubtypeNames(record.schema));const gateEvidence=impact.affectedSets.map((setName)=>{const setCases=cases.filter((item)=>item.setName===setName);const gate=store.findPassedEvalGate(record.sourceId,setName,record.version,evalSetChecksum(setCases));const subtypeRootObjects=(gate?.candidate?.subtypeRootObjects||[]).filter((name)=>subtypeNames.has(name));return {setName,passed:Boolean(gate),gateId:gate?.id||null,createdAt:gate?.createdAt||null,subtypeRootObjects};});const hierarchyChanged=hasSemanticHierarchyChanges(record.schema,base.schema);const subtypeRootCoverage=[...new Set(gateEvidence.flatMap((item)=>item.subtypeRootObjects))];const subtypeRootCoverageMissing=hierarchyChanged&&!subtypeRootCoverage.length;const readyToPublish=impact.summary.requiresEvaluation&&!impact.uncoveredChanges.length&&gateEvidence.every((item)=>item.passed)&&!subtypeRootCoverageMissing;return send(res,200,{sourceId:record.sourceId,currentVersion:record.version,baseVersion:base.version,...impact.diff,evaluationImpact:{summary:{...impact.summary,hierarchyChanged,subtypeRootCoverageMissing,readyToPublish},affectedCases:impact.affectedCases,affectedSets:impact.affectedSets,uncoveredChanges:impact.uncoveredChanges,gateEvidence,subtypeRootCoverage}});}
       const ontologyPublishMatch=url.pathname.match(/^\/api\/ontology\/schemas\/(\d+)\/publish$/);if(req.method==="POST"&&ontologyPublishMatch){const record=semanticSchemas.get(Number(ontologyPublishMatch[1]));if(!record)throw notFound("业务本体 Schema 版本不存在");authorize(identity,"editor",record.sourceId);const result=semanticSchemas.publish(record.id,identity.name);const status=result.ok?200:result.gateRequired?409:422;return send(res,status,result.ok?result:{error:result.gateRequired?"发布前评测门禁尚未满足":"业务本体 Schema 校验失败",...result});}
       const ontologyRollbackMatch=url.pathname.match(/^\/api\/ontology\/schemas\/(\d+)\/rollback$/);if(req.method==="POST"&&ontologyRollbackMatch){const record=semanticSchemas.get(Number(ontologyRollbackMatch[1]));if(!record)throw notFound("业务本体 Schema 版本不存在");authorize(identity,"editor",record.sourceId);const result=semanticSchemas.rollback(record.id,identity.name);return send(res,result.ok?200:422,result.ok?result:{error:"历史版本已不兼容当前物理结构，无法回滚",...result});}
 
@@ -183,14 +199,24 @@ export function createApp(overrides={}) {
     } finally { req.off?.("aborted",abort); }
   }
 
-  async function close(){await tasks.close();await connector.close();store.close();}
-  return {handler,close,store,ontologyCandidates,ontologyCalibration,relationDocuments,sensitiveCatalogMigration,enumCatalogMigration};
+  let closePromise=null;
+  async function closeClaude(){await claudeBridge?.close?.();}
+  async function close(){
+    if(closePromise)return closePromise;
+    // Stop request-scoped Claude children before waiting for background tasks.
+    // Otherwise an evaluation/discovery task that is currently inside a
+    // Claude bridge can hold shutdown open for the full request timeout and
+    // may race connector/store teardown.
+    closePromise=(async()=>{await closeClaude();await tasks.close();await connector.close();store.close();})();
+    return closePromise;
+  }
+  return {handler,close,closeClaude,store,ontologyCandidates,ontologyCalibration,relationDocuments,sensitiveCatalogMigration,enumCatalogMigration};
 }
 
 function setSecurityHeaders(req,res,runtime,requestId){const origin=req.headers.origin;if(origin&&runtime.allowedOrigins.includes(origin)){res.setHeader("access-control-allow-origin",origin);res.setHeader("vary","Origin");}res.setHeader("access-control-allow-methods","GET,POST,PUT,DELETE,OPTIONS");res.setHeader("access-control-allow-headers","authorization,content-type,x-request-id,x-ontoquery-token");res.setHeader("access-control-max-age","86400");res.setHeader("cache-control","no-store");res.setHeader("x-content-type-options","nosniff");res.setHeader("referrer-policy","no-referrer");res.setHeader("x-request-id",requestId);}
 function applyRateLimit(req,res,url,identity,runtime,limiter){const kind=["/api/query","/api/eval/run","/api/eval/gate"].includes(url.pathname)?"query":req.method==="GET"?"read":"write";const limit=kind==="query"?runtime.rateLimits.queryPerMinute:kind==="read"?runtime.rateLimits.readPerMinute:runtime.rateLimits.writePerMinute;const ip=String(req.socket?.remoteAddress||"local");const state=limiter.check(`${identity.key}:${ip}:${kind}`,limit);res.setHeader("x-ratelimit-limit",String(limit));res.setHeader("x-ratelimit-remaining",String(state.remaining));}
 function evalSetChecksum(cases){return createHash("sha256").update(JSON.stringify(cases.map((item)=>[item.id,item.question,item.goldSql,item.category,item.heldOut]))).digest("hex");}
-function lockedSettingKeys(overrides){const keys=[];for(const group of ["llm","embedding","retrieval","discovery","profiling","ontologyAi"])if(overrides[group])for(const key of Object.keys(overrides[group]))keys.push(`${group}.${key}`);for(const key of ["semanticQueryPlanMode","queryAgentMode","queryAgentTrafficPercent","queryAgentMaxIterations","queryAgentMaxSqlCalls","queryAgentMaxScannedRows","queryAgentPendingTtlMs","metricProposalEnabled","queryMaxRows","explainMaxRows","queryTimeoutMs","queryLlmTimeoutMs"])if(key in overrides)keys.push(`query.${key}`);return keys;}
+function lockedSettingKeys(overrides){const keys=[];for(const group of ["llm","embedding","retrieval","discovery","profiling","ontologyAi","claudeQuery"])if(overrides[group])for(const key of Object.keys(overrides[group]))keys.push(`${group}.${key}`);for(const key of ["semanticQueryPlanMode","queryAgentMode","queryAgentTrafficPercent","queryAgentMaxIterations","queryAgentMaxSqlCalls","queryAgentMaxScannedRows","queryAgentPendingTtlMs","metricProposalEnabled","queryMaxRows","explainMaxRows","queryTimeoutMs","queryLlmTimeoutMs"])if(key in overrides)keys.push(`query.${key}`);return keys;}
 function mergeConnection(current,body){const merged={baseUrl:String(body?.baseUrl??"").trim()||current.baseUrl,apiKey:String(body?.apiKey??"").trim()||current.apiKey,model:String(body?.model??"").trim()||current.model};const dimensions=body?.dimensions??current.dimensions;return {...merged,...(Number(dimensions)>0?{dimensions:Number(dimensions)}:{})};}
 function visibleSources(store,identity){return store.listSources().filter((source)=>canAccessSource(identity,source.id));}
 function requiredSource(store,identity,id,minimum="viewer"){const source=store.getSource(Number(id));if(!source)throw notFound("数据源不存在");authorize(identity,minimum,source.id);return source;}
@@ -251,4 +277,4 @@ function parseCsvRows(value) {
 
 export const _internal={requireWrite,authenticate,authorize,createRateLimiter};
 
-if(import.meta.url===`file://${process.argv[1]}`){const app=createApp();const server=http.createServer(app.handler);server.requestTimeout=65_000;server.headersTimeout=10_000;server.keepAliveTimeout=5_000;server.listen(config.port,config.host,()=>console.log(`OntoQuery API: http://${config.host}:${config.port}/api/health`));const shutdown=()=>server.close(()=>app.close().finally(()=>process.exit(0)));process.on("SIGINT",shutdown);process.on("SIGTERM",shutdown);}
+if(import.meta.url===`file://${process.argv[1]}`){const app=createApp();const server=http.createServer(app.handler);server.requestTimeout=65_000;server.headersTimeout=10_000;server.keepAliveTimeout=5_000;server.listen(config.port,config.host,()=>console.log(`OntoQuery API: http://${config.host}:${config.port}/api/health`));let shuttingDown=false;const shutdown=()=>{if(shuttingDown)return;shuttingDown=true;const closeClaude=Promise.resolve().then(()=>app.closeClaude?.());const serverClosed=new Promise((resolve)=>{try{server.close(()=>resolve());}catch{resolve();}});Promise.allSettled([closeClaude,serverClosed]).then(()=>app.close()).finally(()=>process.exit(0));};process.on("SIGINT",shutdown);process.on("SIGTERM",shutdown);}
