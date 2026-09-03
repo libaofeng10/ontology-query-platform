@@ -13,7 +13,15 @@ export const CLAUDE_QUERY_TERMINAL_SCHEMA = Object.freeze({
       type: "object",
       properties: {
         status: { const: "answered" },
-        execution_ids: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: 5 },
+        // 一些 Anthropic 兼容模型（如 DashScope 上的 GLM）会把嵌套数组参数
+        // 序列化成 JSON 字符串再交给工具。这里接受两种形态，bridge 解析时
+        // 统一归一化为数组；否则 CLI 端 schema 重试打满直接退出。
+        execution_ids: {
+          anyOf: [
+            { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: 5 },
+            { type: "string", minLength: 1, maxLength: 1_200 },
+          ],
+        },
         conclusion: { type: "string", minLength: 1, maxLength: 8_000 },
         delta: { type: "string", maxLength: 8_000 },
       },
@@ -903,7 +911,13 @@ function parseTerminalEnvelope(raw) {
   const costUsd = extractCost(envelope);
   const iterations = Number(envelope.num_turns || envelope.turns || 0) || 0;
   if (status === "answered") {
-    const rawExecutionIds = structured.execution_ids ?? structured.executionIds;
+    // schema 允许 execution_ids 是数组或其 JSON 字符串形态（部分兼容模型会把
+    // 数组参数二次序列化）。字符串必须恰好解析为字符串数组，否则按协议违例。
+    let rawExecutionIds = structured.execution_ids ?? structured.executionIds;
+    if (typeof rawExecutionIds === "string") {
+      const parsed = parseJsonSafe(rawExecutionIds);
+      rawExecutionIds = Array.isArray(parsed) ? parsed : rawExecutionIds;
+    }
     const executionIds = normalizeExecutionIds(rawExecutionIds);
     const conclusion = safeText(structured.conclusion, 8_000);
     if (!Array.isArray(rawExecutionIds) || !executionIds.length || executionIds.length !== rawExecutionIds.length || new Set(executionIds).size !== executionIds.length || !conclusion) {

@@ -244,7 +244,10 @@ export function runProbe({ binary, model, timeoutMs = DEFAULT_TIMEOUT_MS, termin
         });
       }
       const parsed = parseJson(stdout);
-      finish(parsed && (parsed.ok === true || parsed.structured_output?.ok === true)
+      // `--output-format json` 的信封把模型文本放在 `result`（字符串）里，
+      // 与 bridge 的 parseTerminalEnvelope 保持同样的取值路径。
+      const structured = parsed?.structured_output ?? (typeof parsed?.result === "string" ? parseJson(parsed.result) : parsed?.result);
+      finish(parsed && (parsed.ok === true || structured?.ok === true)
         ? { ok: true, model: String(model || ""), exitCode: code }
         : { ok: false, failureClass: "protocol_error", exitCode: code, error: "Claude preflight 未返回预期 JSON" });
     });
