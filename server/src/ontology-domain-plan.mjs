@@ -121,7 +121,10 @@ export function domainNamingMessages({clusters}){
 
 export function createOntologyDomainPlanner({store,config,fetchImpl=globalThis.fetch}={}){
   function eligibleInputs(sourceId){
-    const tables=store.listTables(sourceId).filter((table)=>table.active!==0&&["A","B"].includes(table.grade));
+    // Respect the data source's table selection: domain planning must stay
+    // within opted-in tables, not the full A/B set.
+    const excluded=store.excludedTableNames(sourceId);
+    const tables=store.listTables(sourceId).filter((table)=>table.active!==0&&["A","B"].includes(table.grade)&&!excluded.has(table.tableName));
     const tableNames=new Set(tables.map((table)=>table.tableName));
     const relations=store.listRelations(sourceId,true).filter((relation)=>tableNames.has(relation.fromTable)&&tableNames.has(relation.toTable));
     return {tables,relations};

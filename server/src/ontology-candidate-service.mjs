@@ -21,7 +21,12 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
 
   function catalog(sourceId,tableNames=null) {
     const selected=tableNames?new Set(tableNames):null;
-    const tables=store.listTables(sourceId).filter((table)=>!selected||selected.has(table.tableName));
+    // Respect the data source's table selection: modeling must stay within the
+    // tables the user opted into. Excluded tables (included=0) are not part of
+    // the ontology and must not generate objects, or drafts later fail their
+    // mapping validation with ONTOLOGY_MAPPING_TABLE_NOT_FOUND.
+    const excludedTables=store.excludedTableNames(sourceId);
+    const tables=store.listTables(sourceId).filter((table)=>!excludedTables.has(table.tableName)&&(!selected||selected.has(table.tableName)));
     const profilingEnabled=Boolean(config?.profiling?.enabled);
     const columnsByTable=Object.fromEntries(tables.map((table)=>[table.tableName,store.listColumns(sourceId,table.tableName).map((column)=>profilingEnabled?column:{...column,profile:null})]));
     const enumsByTable=Object.fromEntries(tables.map((table)=>[table.tableName,store.listEnums(sourceId,table.tableName)]));

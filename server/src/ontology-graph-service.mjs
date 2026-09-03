@@ -1,6 +1,10 @@
 export function createOntologyGraphService({store,knowledge}) {
   function build(sourceId) {
-    const tables=store.listTables(sourceId).filter((table)=>table.active&&table.grade!=="C");
+    // Respect the data source's table selection: only tables the user opted
+    // into (included != 0) are part of the ontology. Excluded tables must not
+    // appear as nodes nor anchor object/term mappings.
+    const excluded=store.excludedTableNames(sourceId);
+    const tables=store.listTables(sourceId).filter((table)=>table.active&&table.grade!=="C"&&!excluded.has(table.tableName));
     const tableNames=new Set(tables.map((table)=>table.tableName));
     const pages=knowledge.list(sourceId).filter((page)=>["term","metric","rule"].includes(page.pageType));
     const ontology=store.getPublishedOntologySchema(sourceId);
