@@ -13,6 +13,20 @@ export function guardSql(sql, policy = {}) {
   if (statements.length !== 1) return denied("只允许单条 SQL",{code:"MULTIPLE_STATEMENTS"});
   const statement = statements[0];
   if (statement?.type !== "select") return denied("只允许 SELECT 查询",{code:"NON_SELECT"});
+  // `tableList()` and the legacy allow-list intentionally compare only the
+  // physical table name.  Without this check a model could qualify an
+  // otherwise allowed table with another database (for example
+  // `secrets.customer`) and rely on the MySQL account's broader privileges to
+  // cross the request's source boundary.  The query connector already pins a
+  // database, so qualified names add no supported capability here; reject them
+  // unless a future caller explicitly supplies the one database it authorises.
+  const qualifiedDatabases = qualifiedTableDatabases(statement);
+  if (qualifiedDatabases.length) {
+    const configuredDatabase = normalizeName(policy.databaseName ?? policy.dbName ?? policy.database);
+    if (!configuredDatabase || qualifiedDatabases.some((name) => normalizeName(name) !== configuredDatabase)) {
+      return denied("禁止跨数据库限定查询", { code: "CROSS_DATABASE_FORBIDDEN" });
+    }
+  }
   // node-sql-parser represents UNION/INTERSECT/EXCEPT as a linked SELECT
   // chain (`set_op` + `_next`).  The result-contract lineage analyser does not
   // yet validate every branch independently, so permitting a set operation
@@ -47,7 +61,14 @@ export function guardSql(sql, policy = {}) {
   const joinVerdict = validateJoins(statement, policy.allowedRelations || [], aliasContext, cte);
   if (!joinVerdict.ok) return { ...joinVerdict, tables:tableNames };
 
-  const columnVerdict = validateColumns(statement, policy.allowedColumns || {}, policy.forbiddenColumns || [], aliasContext, cte);
+  const columnVerdict = validateColumns(
+    statement,
+    policy.allowedColumns || {},
+    policy.forbiddenColumns || [],
+    aliasContext,
+    cte,
+    policy.forbiddenOutputColumns || [],
+  );
   if (!columnVerdict.ok) return { ...columnVerdict, tables:tableNames };
 
   let enumVerdict;
@@ -317,12 +338,17 @@ function validateMandatoryFilters(statement,filters,aliasContext,cte) {
   return {ok:true};
 }
 
-function validateColumns(statement,allowedColumns,forbiddenColumns,aliasContext,cte) {
+function validateColumns(statement,allowedColumns,forbiddenColumns,aliasContext,cte,forbiddenOutputColumns=[]) {
   const allowedEntries=Object.entries(allowedColumns).map(([table,columns])=>[normalizeName(table),new Set(columns.map(normalizeName))]);
-  if(!allowedEntries.length&&!forbiddenColumns.length) return {ok:true};
+  if(!allowedEntries.length&&!forbiddenColumns.length&&!forbiddenOutputColumns.length) return {ok:true};
   const allowed=new Map(allowedEntries); const forbidden=new Set(forbiddenColumns.map((value)=>String(value).split(".").map(normalizeName).join(".")));
+  const forbiddenOutput=new Set(forbiddenOutputColumns.map((value)=>String(value).split(".").map(normalizeName).join(".")));
   const outputAliases=new Set();
-  for(const select of collectSelects(statement)) for(const column of select.columns||[]) if(column.as) outputAliases.add(normalizeName(column.as));
+  const outputRefs=new Set();
+  for(const select of collectSelects(statement)) for(const column of select.columns||[]) {
+    if(column.as) outputAliases.add(normalizeName(column.as));
+    walk(column,(node)=>{if(node.type==="column_ref")outputRefs.add(node);});
+  }
   let failure=null;
   walkWithAncestors(statement,(node,ancestors)=>{
     if(failure||node.type!=="column_ref") return;
@@ -349,11 +375,12 @@ function validateColumns(statement,allowedColumns,forbiddenColumns,aliasContext,
       else if(candidates.length>1){failure=`未限定表的字段 ${column} 同时属于多张表：${candidates.join("、")}；请使用表别名限定`;return;}
     }
     if(table&&forbidden.has(`${table}.${column}`)){failure=`禁止查询敏感字段 ${table}.${column}`;return;}
+    if(table&&outputRefs.has(node)&&forbiddenOutput.has(`${table}.${column}`)){failure=`禁止输出敏感字段 ${table}.${column}`;return;}
     if(table&&allowed.has(table)&&!allowed.get(table).has(column)&&!outputAliases.has(column)){failure=`字段不在白名单：${table}.${column}`;return;}
     if(table&&!allowed.has(table)&&!outputAliases.has(column)) return;
     if(!table&&!outputAliases.has(column)) failure=`字段不在当前查询表的白名单：${column}`;
   });
-  return failure?denied(failure,{code:/同时属于多张表/.test(failure)?"AMBIGUOUS_COLUMN":"UNKNOWN_COLUMN"}):{ok:true};
+  return failure?denied(failure,{code:/禁止输出敏感字段/.test(failure)?"SENSITIVE_OUTPUT_FORBIDDEN":/同时属于多张表/.test(failure)?"AMBIGUOUS_COLUMN":"UNKNOWN_COLUMN"}):{ok:true};
 }
 
 function validateValueSemantics(statement,valueKinds,columnKinds,allowedColumns,aliasContext,cte) {
@@ -448,13 +475,33 @@ function parseLimitSpec(limit) {
 
 function limitInteger(node){const value=node?.type==="number"?Number(node.value):NaN;return Number.isSafeInteger(value)&&value>=0?value:null;}
 function edgeKey(a,ac,b,bc){return `${normalizeName(a)}.${normalizeName(ac)}>${normalizeName(b)}.${normalizeName(bc)}`;}
-function normalizeName(name=""){return String(name).replaceAll("`","").replaceAll("'","").replaceAll('"',"").replaceAll("[","").replaceAll("]","").split(".").at(-1).toLowerCase();}
+function nodeName(value) {
+  if (value && typeof value === "object") return value.value ?? value.name ?? "";
+  return value;
+}
+function normalizeName(name=""){return String(nodeName(name) ?? "").replaceAll("`","").replaceAll("'","").replaceAll('"',"").replaceAll("[","").replaceAll("]","").split(".").at(-1).toLowerCase();}
 function denied(reason, extra={}) { return { ok:false, code:extra.code||guardCode(reason),reason, ...extra }; }
 function guardCode(reason){const text=String(reason||"");if(/枚举字段/.test(text))return "ENUM_VALUE_INVALID";if(/未确认/.test(text))return "UNCONFIRMED_RELATION";if(/白名单/.test(text))return "UNKNOWN_COLUMN";if(/禁止/.test(text))return "POLICY_VIOLATION";return "GUARD_REJECTED";}
 
 function getTableNames(sql) {
   try { return [...new Set(parser.tableList(sql,{database:"MySQL"}).map((entry)=>entry.split("::").at(-1)).filter(Boolean))]; }
   catch { return []; }
+}
+
+function qualifiedTableDatabases(statement) {
+  const databases = [];
+  walk(statement, (node) => {
+    if (node?.type === "select") {
+      for (const source of node.from || []) {
+        if (nodeName(source?.db)) databases.push(nodeName(source.db));
+      }
+    }
+    // MySQL also permits a three-part column reference such as
+    // `other_db.customer.id` while the FROM table remains local. Looking only
+    // at FROM/JOIN sources would let that form cross the connector boundary.
+    if (node?.type === "column_ref" && nodeName(node.db)) databases.push(nodeName(node.db));
+  });
+  return [...new Set(databases)];
 }
 
 function collectSelects(ast) {

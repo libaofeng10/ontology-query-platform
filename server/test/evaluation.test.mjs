@@ -47,9 +47,9 @@ test("evaluation runner records equivalent results and classifies mismatches",as
 });
 
 test("evaluation runner explicitly forwards the requested Agent mode",async()=>{
-  const modes=[];const ask=async({question,queryAgentMode})=>{modes.push(queryAgentMode);return {id:"q",question,conclusion:"完成",columns:[],rows:[{label:"全部",total:100}],chart:null,evidence:{pages:[],rules:[],tables:["sales_summary"],sql:"SELECT label, total FROM sales_summary",durationMs:1,scannedRows:1,planningMode:"agent",planningAttempts:2}};};
+  const modes=[];const claudeModes=[];const ask=async({question,queryAgentMode,claudeQueryMode})=>{modes.push(queryAgentMode);claudeModes.push(claudeQueryMode);return {id:"q",question,conclusion:"完成",columns:[],rows:[{label:"全部",total:100}],chart:null,evidence:{pages:[],rules:[],tables:["sales_summary"],sql:"SELECT label, total FROM sales_summary",durationMs:1,scannedRows:1,planningMode:"agent",planningAttempts:2}};};
   const {store,service,source}=await fixture(ask);service.create(source.id,{setName:"agent-run",question:"销售总额",goldSql:"SELECT label, total FROM sales_summary",category:"金额",heldOut:false});const result=await service.run({task:{id:"agent-run-1"},source,payload:{setName:"agent-run",queryAgentMode:"required",tolerance:1e-6},onProgress:()=>{}});
-  assert.equal(result.queryAgentMode,"required");assert.deepEqual(modes,["required"]);assert.equal(store.listEvalRuns(source.id)[0].requestedMode,"agent_required");store.close();
+  assert.equal(result.queryAgentMode,"required");assert.deepEqual(modes,["required"]);assert.deepEqual(claudeModes,["off"]);assert.equal(store.listEvalRuns(source.id)[0].requestedMode,"agent_required");store.close();
 });
 
 test("semantic repair hints locate object properties and links without exposing physical mappings",()=>{
@@ -62,7 +62,7 @@ test("semantic repair hints locate object properties and links without exposing 
 });
 
 test("semantic evaluation gate compares off and prefer and persists rollout evidence",async()=>{
-  const candidateVersions=[];const ask=async({question,semanticQueryPlanMode,ontologySchemaVersionId})=>{
+  const candidateVersions=[];const claudeModes=[];const ask=async({question,semanticQueryPlanMode,ontologySchemaVersionId,claudeQueryMode})=>{claudeModes.push(claudeQueryMode);
     if(semanticQueryPlanMode==="prefer")candidateVersions.push(ontologySchemaVersionId);
     if(semanticQueryPlanMode==="off"&&question==="关联问题")return {refused:true,reason:"系统没有执行不可靠 SQL：JOIN 路径失败",planningMode:"legacy",planningAttempts:2};
     return {id:"q",question,conclusion:"完成",columns:[],rows:[{label:"全部",total:100}],chart:null,evidence:{pages:[],rules:[],tables:["sales_summary"],sql:"SELECT label, total FROM sales_summary",durationMs:1,scannedRows:1,planningMode:semanticQueryPlanMode==="prefer"?"semantic":"legacy",ontologySchemaVersion:1,semanticPath:semanticQueryPlanMode==="prefer"?{rootObject:"summary",objects:["summary"],links:[],relations:[]}:undefined,planningAttempts:1}};
@@ -82,7 +82,7 @@ test("semantic evaluation gate compares off and prefer and persists rollout evid
   assert.equal(result.candidate.semanticExecutionRate,1);
   const runs=store.listEvalRuns(source.id);assert.equal(runs.length,4);assert.equal(runs.filter((item)=>item.comparisonRole==="candidate").length,2);
   const gate=store.listEvalGates(source.id)[0];assert.equal(gate.decision,"enable_prefer");assert.equal(gate.candidate.semanticExecutions,2);
-  assert.equal(gate.ontologySchemaVersion,1);assert.equal(gate.ontologySchemaPublishedAt,store.getOntologySchemaVersion(draft.id).publishedAt);assert.equal(result.ontologySchemaPublishedAt,gate.ontologySchemaPublishedAt);assert.ok(gate.evaluationChecksum);assert.deepEqual(candidateVersions,[draft.id,draft.id]);
+  assert.equal(gate.ontologySchemaVersion,1);assert.equal(gate.ontologySchemaPublishedAt,store.getOntologySchemaVersion(draft.id).publishedAt);assert.equal(result.ontologySchemaPublishedAt,gate.ontologySchemaPublishedAt);assert.ok(gate.evaluationChecksum);assert.deepEqual(candidateVersions,[draft.id,draft.id]);assert.deepEqual(claudeModes,["off","off","off","off"]);
   store.close();
 });
 

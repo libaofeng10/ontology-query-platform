@@ -5,11 +5,12 @@ import { compileSemanticQueryPlan, semanticPlanningView } from "./semantic-query
 import { guardSql } from "./sql-guard.mjs";
 import { buildQueryColumnSemantics, columnSemanticKind, detectQuestionValueKinds, redactTypedLiterals } from "./query-column-semantics.mjs";
 import { normalizeQueryRow } from "./query-result-normalization.mjs";
-import { exhaustiveAccountTables, missingExhaustiveAccountProductColumns, missingExhaustiveAccountTables, missingIntentSubjectFacets, missingRequiredRetrievalFacets, queryIntentFilterError, queryResultContractValidation } from "./query-scope-coverage.mjs";
+import { exhaustiveAccountTables, missingExhaustiveAccountProductColumns, missingExhaustiveAccountTables, missingIntentSubjectFacets, missingRequiredRetrievalFacets, queryResultContractValidation } from "./query-scope-coverage.mjs";
 import { applyIntentClarification, buildIntentRetrievalQuestion, describeIntentFacets, parseQueryIntent } from "./query-intent.mjs";
 import { buildQueryResultContract, validateQueryRunSet } from "./query-result-contract.mjs";
 import { dominantFailureClass, toolFailure } from "./query-errors.mjs";
 import { QUERY_PROMPT_DEFAULTS, renderQueryPrompt } from "./query-prompts.mjs";
+import { createQueryExecutionKernel } from "./query-execution-kernel.mjs";
 
 export const QUERY_AGENT_TOOLS=[
   {
@@ -88,7 +89,6 @@ export async function runQueryAgent({store,connector,config,source,question,cont
   let sampleDataCalls=0;
   let askUserCalls=0;
   let explorationCalls=0;
-  let scannedRowsTotal=0;
   let forcedTerminal=false;
   let consecutiveProtocolErrors=0;
   let consecutiveRepeatedActions=0;
@@ -96,6 +96,23 @@ export async function runQueryAgent({store,connector,config,source,question,cont
   let currentPhase="UNDERSTAND";
   const clarifications=[];
   const tokenUsage={promptTokens:0,completionTokens:0,totalTokens:0,available:false};
+  // All planners share this execution authority.  Getter functions keep the
+  // kernel aligned with a clarified intent/retrieval snapshot during a resumed
+  // conversation without exposing mutable loop state to the executor.
+  const executionKernel=createQueryExecutionKernel({
+    connector,
+    source,
+    config,
+    question,
+    catalog,
+    getQueryIntent:()=>queryIntent,
+    getRetrievalEvidence:()=>retrievalEvidence,
+    getDisclosedTables:()=>disclosedTables,
+    signal:()=>activeSignal,
+    maxSqlCalls,
+    maxScannedRows,
+    forbidSensitiveOutput:Boolean(config.queryAgentForbidSensitiveOutput),
+  });
 
   const intentClarification=blockingIntentClarification(queryIntent);
   if(intentClarification)return pauseForIntentClarification(intentClarification);
@@ -166,6 +183,7 @@ export async function runQueryAgent({store,connector,config,source,question,cont
       // for the exact immutable intent contract that produced them.
       retrievalEvidence.splice(0,retrievalEvidence.length);
       successfulRuns.splice(0,successfulRuns.length);
+      executionKernel.clearRuns();
       validatedSemanticPlans.clear();
       exploredPageSlugs.clear();
       exploredRuleNames.clear();
@@ -503,7 +521,7 @@ export async function runQueryAgent({store,connector,config,source,question,cont
     const verdict=guardSql(sql,catalog.policy);
     if(!verdict.ok) return {ok:false,stage:"guard",error:verdict.reason};
     const executionStarted=Date.now();
-    const explanation=await explainSql(verdict.sql);
+    const explanation=await executionKernel.explain(verdict.sql,{signal:activeSignal});
     if(!explanation.ok) return explanation;
     try {
       const [rawRows,rawFields]=await connector.query(source,verdict.sql,[],activeSignal);
@@ -537,42 +555,29 @@ export async function runQueryAgent({store,connector,config,source,question,cont
     const sql=requiredText(args.sql,"sql",50_000);
     const name=args.name==null?`查询 ${runSqlCalls+1}`:requiredText(args.name,"name",100);
     runSqlCalls++;
-    if(runSqlCalls>maxSqlCalls) return toolFailure({stage:"budget",code:"SQL_CALL_BUDGET_EXCEEDED",error:`run_sql 已达到 ${maxSqlCalls} 次上限`});
     const semanticPlan=validatedSemanticPlans.get(sqlHash(sql));
-    const verdict=guardSql(sql,{...(semanticPlan?.policy||catalog.policy),valueKinds:catalog.policy.valueKinds});
-    if(!verdict.ok) {
-      const suggestedTables=verdict.code==="UNKNOWN_TABLE"?suggestCatalogTables(verdict.details?.unknownTables||[],catalog.tables):[];
+    const result=await executionKernel.execute({name,sql,semanticPlan,signal:activeSignal});
+    if(result?.ok) {
+      const run=executionKernel.getRun(result.executionId);
+      if(run) successfulRuns.push(run);
+      return result;
+    }
+    // Preserve the existing repair hints while keeping guard/contract logic in
+    // the shared kernel.  The verdict is internal metadata and must never be
+    // serialized into the model-facing tool result (it contains the parsed
+    // SQL AST and may retain typed literals).  Keep a local reference only
+    // long enough to derive bounded repair hints.
+    const {verdict:internalVerdict,...publicResult}=result||{};
+    if(result?.stage==="guard") {
+      const verdict=internalVerdict||{};
+      const suggestedTables=result.code==="UNKNOWN_TABLE"?suggestCatalogTables(verdict.details?.unknownTables||result.details?.unknownTables||[],catalog.tables):[];
       const bindingTables=new Set(retrievalEvidence.flatMap((item)=>item?.diagnostics?.facets||[]).flatMap((facet)=>facet.bindingTables||[]));
-      const relationPath=verdict.code==="UNCONFIRMED_RELATION"?suggestConfirmedRelationPath(verdict.reason,catalog.relations,bindingTables):null;
+      const relationPath=result.code==="UNCONFIRMED_RELATION"?suggestConfirmedRelationPath(verdict.reason||result.error,catalog.relations,bindingTables):null;
       const relationHint=relationPath?`；已确认的替代关联路径：${relationPath.joins.join(" → ")}。${relationPath.intermediateTables.length?`请先用 get_schema 查看中间表 ${relationPath.intermediateTables.join("、")}`:"请按此已确认字段关系改写"}`:"";
-      return toolFailure({stage:"guard",code:verdict.code||"GUARD_REJECTED",error:`${verdict.reason}${suggestedTables.length?`；可能相关的真实表：${suggestedTables.join("、")}，请先调用 get_schema 确认字段`:""}${relationHint}`,retryable:true,details:{...(verdict.details||{}),...(suggestedTables.length?{suggestedTables}:{}),...(relationPath?{suggestedRelationPath:relationPath}:{})}});
+      const baseError=result.error||verdict.reason||"SQL 未通过安全护栏";
+      return {...publicResult,error:`${baseError}${suggestedTables.length?`；可能相关的真实表：${suggestedTables.join("、")}，请先调用 get_schema 确认字段`:""}${relationHint}`,details:{...(result.details||{}),...(suggestedTables.length?{suggestedTables}:{}),...(relationPath?{suggestedRelationPath:relationPath}:{})}};
     }
-    const contractExecution={usedTables:verdict.tables,retrieval:retrievalEvidence,verdict,columnsByTable:catalog.columnsByTable,semanticContract:semanticPlan?.semanticContract||null};
-    const intentError=queryIntentFilterError(question,verdict.sql,queryIntent,contractExecution);
-    if(intentError)return toolFailure({stage:"intent",code:intentError.code,error:intentError.message,retryable:intentError.retryable,details:intentError.details});
-    const contractValidation=queryResultContractValidation(queryIntent,verdict.sql,contractExecution);
-    if(!contractValidation.ok) {
-      const error=contractValidation.errors?.[0]||{};
-      return toolFailure({stage:"intent",code:error.code||"INTENT_RESULT_CONTRACT_MISMATCH",error:error.message||"SQL 未满足查询结果契约",retryable:true,details:error.details});
-    }
-    const undisclosed=verdict.tables.filter((table)=>!disclosedTables.has(normalizeIdentifier(table)));
-    if(undisclosed.length) return {ok:false,stage:"guard",error:`执行前必须先用 get_schema 查看表：${undisclosed.join(", ")}`};
-    const executionStarted=Date.now();
-    const explanation=await explainSql(verdict.sql);
-    if(!explanation.ok) return explanation;
-    try {
-      const [rawRows,rawFields]=await connector.query(source,verdict.sql,[],activeSignal);
-      const rows=rawRows.map(normalizeQueryRow);
-      const fields=normalizeFields(rawFields,rows);
-      const resultDelivery=rows.length>100?"direct":"preview";
-      const mayBeTruncated=Number.isFinite(Number(verdict.limit?.effective))&&rows.length>=Number(verdict.limit.effective);
-      const run={name,requestedSql:sql,sql:verdict.sql,sqlHashes:new Set([sqlHash(sql),sqlHash(verdict.sql)]),rows,fields,verdict,contractValidation,scannedRows:explanation.scannedRows,durationMs:Date.now()-executionStarted,resultDelivery,semanticPlan,mayBeTruncated};
-      successfulRuns.push(run);
-      const contextRows=resultDelivery==="direct"?{rows:[],truncated:true,modelRowsOmitted:true}:truncateRows(rows,{maxRows:40,maxBytes:64*1024,maxCellChars:200});
-      return {ok:true,executedSql:verdict.sql,columns:fields,rowCount:rows.length,scannedRows:explanation.scannedRows,durationMs:run.durationMs,rows:contextRows.rows,truncated:contextRows.truncated,modelRowsOmitted:contextRows.modelRowsOmitted||undefined,resultDelivery,mayBeTruncated,limit:verdict.limit};
-    } catch(error) {
-      return toolFailure({stage:"query",code:"EXECUTION_ERROR",error:safeError(error),retryable:true});
-    }
+    return publicResult;
   }
 
   function askUser(args) {
@@ -650,16 +655,6 @@ export async function runQueryAgent({store,connector,config,source,question,cont
     return {result:{ok:true},terminal:{status:"refused",reason,failureClass:dominantFailureClass(toolTrace,"policy_block")}};
   }
 
-  async function explainSql(sql) {
-    let explain;
-    try { explain=await connector.explain(source,sql,activeSignal); }
-    catch(error) { return toolFailure({stage:"explain",code:"EXPLAIN_ERROR",error:safeError(error),retryable:true}); }
-    const scannedRows=explain.reduce((sum,row)=>sum+Math.max(0,Number(row.rows||0)),0);
-    if(scannedRows>Number(config.explainMaxRows||1_000_000)) return toolFailure({stage:"explain",code:"SCAN_LIMIT_EXCEEDED",error:`EXPLAIN 预计扫描 ${scannedRows} 行，超过单次阈值 ${config.explainMaxRows||1_000_000}`,retryable:true});
-    if(scannedRowsTotal+scannedRows>maxScannedRows) return toolFailure({stage:"budget",code:"SCAN_BUDGET_EXCEEDED",error:`累计 EXPLAIN 扫描预算将超过 ${maxScannedRows} 行`});
-    scannedRowsTotal+=scannedRows;
-    return {ok:true,scannedRows};
-  }
 }
 
 function completeAccountFallbackRuns(successfulRuns,question,context) {

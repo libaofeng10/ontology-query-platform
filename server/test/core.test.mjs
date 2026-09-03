@@ -8,7 +8,7 @@ import { writeTablePage } from "../src/ontology-writer.mjs";
 import { inferRelation } from "../src/relation-inference.mjs";
 import { detectSensitiveField } from "../src/sensitive-fields.mjs";
 import { guardSql } from "../src/sql-guard.mjs";
-import { buildQueryColumnSemantics, detectQuestionValueKinds } from "../src/query-column-semantics.mjs";
+import { buildQueryColumnSemantics, detectQuestionValueKinds, redactTypedLiterals } from "../src/query-column-semantics.mjs";
 import { gradeTable } from "../src/table-grading.mjs";
 
 test("credentials round-trip with authenticated encryption", () => {
@@ -32,6 +32,18 @@ test("query column semantics exposes every column and adds non-blocking value ki
   const policy=buildQueryColumnSemantics({alpha_user:[{columnName:"alpha_id",dataType:"varchar",isSensitive:0,comment:"用户ID"},{columnName:"alp_cell",dataType:"varchar",isSensitive:1,comment:"alpha用户手机号"},{columnName:"access_token",dataType:"varchar",isSensitive:1,comment:"访问密钥"}]});
   assert.deepEqual(policy.allowedColumns.alpha_user,["alpha_id","alp_cell","access_token"]);assert.equal(policy.columnKinds["alpha_user.alp_cell"],"phone");
   assert.deepEqual(detectQuestionValueKinds("13774665233查询Alpha到期时间"),[{value:"13774665233",kind:"phone"}]);
+});
+
+test("typed-literal redaction does not mutate opaque fingerprints",()=>{
+  const fingerprint="0f1e2d3c4b5a69788776655443322110";
+  assert.equal(redactTypedLiterals(fingerprint),fingerprint);
+  assert.equal(redactTypedLiterals("mobile = '13800138000'"),"mobile = '[REDACTED]'");
+  assert.deepEqual(detectQuestionValueKinds("电话 +1 (415) 555-2671，身份证 110105-19491231-002X"),[
+    {value:"+1 (415) 555-2671",kind:"phone"},
+    {value:"110105-19491231-002X",kind:"china_id"},
+  ]);
+  assert.equal(redactTypedLiterals("电话 +1 (415) 555-2671，身份证 110105-19491231-002X"),"电话 [REDACTED]，身份证 [REDACTED]");
+  assert.equal(redactTypedLiterals("card=6222.0202.0202.0202"),"card=[REDACTED]");
 });
 
 test("table grading excludes inactive backup noise and promotes active hubs", () => {
@@ -109,6 +121,22 @@ test("SQL guard blocks mutations, multiple statements, invented joins, bad enums
   assert.match(guardSql("SELECT * FROM crm_customer WHERE cert_status=9",policy).reason,/字典外/);
   assert.match(guardSql("SELECT SLEEP(10) FROM crm_customer",policy).reason,/危险函数/);
   assert.match(guardSql("SELECT * FROM unknown_table",policy).reason,/白名单/);
+});
+
+test("SQL guard rejects database-qualified tables instead of widening the source boundary", () => {
+  const policy = { allowedTables: ["crm_customer"], allowedColumns: { crm_customer: ["customer_id"] }, maxRows: 100 };
+  const crossDatabase = guardSql("SELECT customer_id FROM another_database.crm_customer", policy);
+  assert.equal(crossDatabase.ok, false);
+  assert.equal(crossDatabase.code, "CROSS_DATABASE_FORBIDDEN");
+  const quoted = guardSql("SELECT customer_id FROM `another_database`.`crm_customer`", policy);
+  assert.equal(quoted.ok, false);
+  assert.equal(quoted.code, "CROSS_DATABASE_FORBIDDEN");
+  const qualifiedColumn = guardSql("SELECT another_database.crm_customer.customer_id FROM crm_customer", policy);
+  assert.equal(qualifiedColumn.ok, false);
+  assert.equal(qualifiedColumn.code, "CROSS_DATABASE_FORBIDDEN");
+  const nestedQualifiedColumn = guardSql("SELECT customer_id FROM crm_customer WHERE customer_id IN (SELECT another_database.crm_customer.customer_id FROM crm_customer)", policy);
+  assert.equal(nestedQualifiedColumn.ok, false);
+  assert.equal(nestedQualifiedColumn.code, "CROSS_DATABASE_FORBIDDEN");
 });
 
 test("SQL guard never borrows an enum dictionary from another table with the same column name",()=>{

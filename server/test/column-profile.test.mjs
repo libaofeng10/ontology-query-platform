@@ -9,6 +9,7 @@ import { ontologyCatalogChecksum } from "../src/ontology-candidate-service.mjs";
 
 test("value profiling suppresses phone, identity, email and bank-card values",()=>{
   for(const value of ["13800138000","11010519491231002X","user@example.com","6222020202020202"])assert.equal(detectSensitiveValue(value).sensitive,true,value);
+  for(const value of ["138-0013-8000","138 0013 8000","+1 (415) 555-2671","110105-19491231-002X","6222-0202-0202-0202","6222.0202.0202.0202"])assert.equal(detectSensitiveValue(value).sensitive,true,value);
   const profiled=buildColumnProfile({values:["user@example.com","normal","normal",null],dataType:"varchar(255)"});
   assert.deepEqual(profiled.profile.sampleValues,[]);
   assert.equal(profiled.profile.minMax,null);

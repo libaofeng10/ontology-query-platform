@@ -29,6 +29,17 @@ function llmResponse(content) {
   return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify(content)}}],usage:{prompt_tokens:11,completion_tokens:4,total_tokens:15}}),{status:200,headers:{"content-type":"application/json"}});
 }
 
+// Keep SQL fixtures aligned with the parser's default business calendar. The
+// service resolves relative ranges in Asia/Shanghai, so hard-coding a month
+// here would make these agent-repair tests fail as soon as the calendar moves.
+function currentBusinessMonth() {
+  const parts=Object.fromEntries(new Intl.DateTimeFormat("en-US-u-ca-iso8601-nu-latn",{timeZone:"Asia/Shanghai",year:"numeric",month:"2-digit"}).formatToParts(new Date()).filter((item)=>item.type==="year"||item.type==="month").map((item)=>[item.type,item.value]));
+  const start=`${parts.year}-${parts.month}-01`;
+  const next=new Date(Date.UTC(Number(parts.year),Number(parts.month),1));
+  const endExclusive=`${next.getUTCFullYear()}-${String(next.getUTCMonth()+1).padStart(2,"0")}-01`;
+  return {start,endExclusive};
+}
+
 test("agent loop feeds guard failures back to the model, corrects SQL and audits the tool trace",async()=>{
   const {store,source}=await createFixture();
   let queries=0;
@@ -99,6 +110,7 @@ test("agent rejects splitting a law-firm proper name across multiple LIKE filter
 
 test("agent preserves 北京大成 as an organization for monthly incoming clues and ignores another table's city enum",async()=>{
   const {store,source}=await createFixture();
+  const {start,endExclusive}=currentBusinessMonth();
   store.upsertTable({sourceId:source.id,tableName:"alpha_crm_clue",rowEstimate:10,grade:"A",active:1,comment:"CRM 进线线索"});
   store.upsertColumn({sourceId:source.id,tableName:"alpha_crm_clue",columnName:"clue_id",dataType:"bigint",isPrimary:1,isSensitive:0,comment:"线索 ID"});
   store.upsertColumn({sourceId:source.id,tableName:"alpha_crm_clue",columnName:"office_name",dataType:"varchar",isSensitive:0,comment:"律所名称"});
@@ -110,9 +122,9 @@ test("agent preserves 北京大成 as an organization for monthly incoming clues
   store.upsertEnum({sourceId:source.id,tableName:"alpha_user",columnName:"city",value:"北京",count:10,ratio:1});
   store.upsertKnowledge({sourceId:source.id,pageType:"term",slug:"进线线索",title:"进线线索",aliases:'["线索"]',tablesJson:'["alpha_crm_clue"]',content:"CRM 收到的进线线索",sqlContent:"按 clue_create_time 统计",antiExamples:"机构名不能当作城市",verified:1,owner:"owner"});
   const wrongSql="SELECT clue_id FROM alpha_crm_clue WHERE city = '北京市'";
-  const correctSql="SELECT clue_id, office_name, clue_create_time FROM alpha_crm_clue WHERE office_name LIKE '%北京大成%' AND clue_create_time >= '2026-08-01' AND clue_create_time < '2026-09-01'";
+  const correctSql=`SELECT clue_id, office_name, clue_create_time FROM alpha_crm_clue WHERE office_name LIKE '%北京大成%' AND clue_create_time >= '${start}' AND clue_create_time < '${endExclusive}'`;
   let queryCalls=0;
-  const connector={explain:async()=>[{rows:2}],query:async()=>{queryCalls++;return [[{clue_id:1,office_name:"北京大成",clue_create_time:"2026-08-10"}],[{name:"clue_id"},{name:"office_name"},{name:"clue_create_time"}]];}};
+  const connector={explain:async()=>[{rows:2}],query:async()=>{queryCalls++;return [[{clue_id:1,office_name:"北京大成",clue_create_time:`${start.slice(0,8)}10`}],[{name:"clue_id"},{name:"office_name"},{name:"clue_create_time"}]];}};
   const actions=[
     {thought:"先按城市尝试。",tool:"run_sql",args:{sql:wrongSql}},
     {thought:"保持机构原文并使用进线时间。",tool:"run_sql",args:{sql:correctSql}},
@@ -227,6 +239,7 @@ test("agent rejects a valid but unrelated table before executing a business-obje
 
 test("agent result contract rejects an executable analytical shortcut before EXPLAIN and accepts the repaired lineage",async()=>{
   const {store,source}=await createFixture();
+  const {start,endExclusive}=currentBusinessMonth();
   const definitions={
     lead_entity:{comment:"线索主表",columns:[
       ["id","bigint",1,"线索主键"],["created_at","datetime",0,"线索进线时间"],["allocated_owner_id","varchar",0,"线索分配人ID"],["is_won","tinyint",0,"是否赢单"],
@@ -240,8 +253,8 @@ test("agent result contract rejects an executable analytical shortcut before EXP
   }
   store.upsertRelation({sourceId:source.id,fromTable:"deal_event",fromCol:"lead_id",toTable:"lead_entity",toCol:"id",cardinality:"N:1",confidence:1,status:"confirmed",inferenceSource:"foreign_key"});
   store.upsertRelation({sourceId:source.id,fromTable:"lead_owner_rel",fromCol:"lead_id",toTable:"lead_entity",toCol:"id",cardinality:"N:1",confidence:1,status:"confirmed",inferenceSource:"foreign_key"});
-  const wrongSql="SELECT allocated_owner_id AS owner_id, COUNT(*) AS won_count FROM lead_entity WHERE created_at >= '2026-08-01' AND created_at < '2026-09-01' AND is_won = 1 GROUP BY allocated_owner_id ORDER BY won_count DESC";
-  const correctSql="SELECT r.owner_id, MAX(r.owner_name) AS owner_name, COUNT(DISTINCT l.id) AS won_count FROM deal_event e JOIN lead_entity l ON l.id = e.lead_id JOIN lead_owner_rel r ON r.lead_id = l.id WHERE e.completed_at >= '2026-08-01' AND e.completed_at < '2026-09-01' AND r.is_deleted = 0 GROUP BY r.owner_id ORDER BY won_count DESC";
+  const wrongSql=`SELECT allocated_owner_id AS owner_id, COUNT(*) AS won_count FROM lead_entity WHERE created_at >= '${start}' AND created_at < '${endExclusive}' AND is_won = 1 GROUP BY allocated_owner_id ORDER BY won_count DESC`;
+  const correctSql=`SELECT r.owner_id, MAX(r.owner_name) AS owner_name, COUNT(DISTINCT l.id) AS won_count FROM deal_event e JOIN lead_entity l ON l.id = e.lead_id JOIN lead_owner_rel r ON r.lead_id = l.id WHERE e.completed_at >= '${start}' AND e.completed_at < '${endExclusive}' AND r.is_deleted = 0 GROUP BY r.owner_id ORDER BY won_count DESC`;
   let explains=0;let queries=0;
   const connector={explain:async()=>{explains++;return [{rows:10}];},query:async()=>{queries++;return [[{owner_id:"owner-1",owner_name:"销售甲",won_count:3}],[{name:"owner_id"},{name:"owner_name"},{name:"won_count"}]];}};
   const actions=[
@@ -733,6 +746,7 @@ test("a second protocol slip surfaces the already-valid run instead of discardin
   try {
     const service=createQueryService({store,connector,config:config()});
     const answer=await service.ask({sourceId:source.id,question:"查询有效客户",userName:"tester"});
+    assert.ok(modelCalls>0,"应至少调用一次规划模型");
     assert.equal(answer.refused,undefined,"应带出已成功的查询结果而不是拒答");
     assert.equal(answer.evidence.budgetFallback,true);
     assert.equal(answer.rows.length,1);

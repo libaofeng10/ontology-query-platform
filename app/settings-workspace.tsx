@@ -10,6 +10,7 @@ type ConnectionForm = { baseUrl:string; apiKey:string; model:string; dimensions:
 type RetrievalForm = { vectorEnabled:boolean; topK:string; vectorWeight:string; minSimilarity:string; semanticThreshold:string };
 type ProfilingForm = { enabled:boolean; sampleLimit:string; maxTablesPerRefresh:string; timeoutMs:string };
 type QueryForm = { semanticQueryPlanMode:"off"|"prefer"|"required"; queryAgentMode:"off"|"prefer"|"required"; queryAgentTrafficPercent:string; queryAgentMaxIterations:string; queryAgentMaxSqlCalls:string; queryAgentMaxScannedRows:string; queryAgentPendingTtlMs:string; queryMaxRows:string; explainMaxRows:string; queryTimeoutMs:string; queryLlmTimeoutMs:string };
+type ClaudeQueryForm = { mode:"off"|"prefer"|"required"; trafficPercent:string; binary:string; model:string; promptVersion:string; timeoutMs:string; maxTurns:string; maxBudgetUsd:string; maxConcurrency:string; queueTimeoutMs:string; maxStdioBytes:string };
 type OntologyAiForm = { mode:"off"|"review"|"auto_draft"; autoConfirmScore:string; maxTables:string; maxFields:string; timeoutMs:string; criticEnabled:boolean; calibrationMinSamples:string; calibrationMinPrecision:string; maxManualObjectRate:string; maxFailureRate:string; maxP95LatencyMs:string; maxAverageTokens:string };
 const PROMPT_KEYS:QueryPromptKey[]=["agentSystem","agentQuestion","legacySqlPlanner","semanticPlanner","resultSummary"];
 const EMPTY_PROMPTS=Object.fromEntries(PROMPT_KEYS.map((key)=>[key,""])) as QueryPromptMap;
@@ -21,6 +22,7 @@ export function SettingsWorkspace({sourceId,role,onRefresh}:{sourceId?:number;ro
   const [retrieval,setRetrieval]=useState<RetrievalForm>({vectorEnabled:true,topK:"8",vectorWeight:"0.4",minSimilarity:"0.35",semanticThreshold:"0.55"});
   const [profiling,setProfiling]=useState<ProfilingForm>({enabled:false,sampleLimit:"1000",maxTablesPerRefresh:"20",timeoutMs:"10000"});
   const [query,setQuery]=useState<QueryForm>({semanticQueryPlanMode:"off",queryAgentMode:"off",queryAgentTrafficPercent:"100",queryAgentMaxIterations:"8",queryAgentMaxSqlCalls:"5",queryAgentMaxScannedRows:"5000000",queryAgentPendingTtlMs:"600000",queryMaxRows:"500",explainMaxRows:"1000000",queryTimeoutMs:"30000",queryLlmTimeoutMs:"90000"});
+  const [claudeQuery,setClaudeQuery]=useState<ClaudeQueryForm>({mode:"off",trafficPercent:"0",binary:"/app/node_modules/.bin/claude",model:"",promptVersion:"claude-query-v1",timeoutMs:"120000",maxTurns:"12",maxBudgetUsd:"1",maxConcurrency:"2",queueTimeoutMs:"5000",maxStdioBytes:"2097152"});
   const [ontologyAi,setOntologyAi]=useState<OntologyAiForm>({mode:"off",autoConfirmScore:"80",maxTables:"20",maxFields:"600",timeoutMs:"300000",criticEnabled:false,calibrationMinSamples:"40",calibrationMinPrecision:"0.95",maxManualObjectRate:"0.2",maxFailureRate:"0.05",maxP95LatencyMs:"90000",maxAverageTokens:"50000"});
   const [activeTab,setActiveTab]=useState<"runtime"|"prompts">("runtime");
   const [prompts,setPrompts]=useState<QueryPromptMap>(EMPTY_PROMPTS);
@@ -43,6 +45,7 @@ export function SettingsWorkspace({sourceId,role,onRefresh}:{sourceId?:number;ro
     setRetrieval({vectorEnabled:next.retrieval.vectorEnabled,topK:String(next.retrieval.topK),vectorWeight:String(next.retrieval.vectorWeight),minSimilarity:String(next.retrieval.minSimilarity),semanticThreshold:String(next.retrieval.semanticThreshold)});
     setProfiling({enabled:next.profiling.enabled,sampleLimit:String(next.profiling.sampleLimit),maxTablesPerRefresh:String(next.profiling.maxTablesPerRefresh),timeoutMs:String(next.profiling.timeoutMs)});
     setQuery({semanticQueryPlanMode:next.query.semanticQueryPlanMode,queryAgentMode:next.query.queryAgentMode,queryAgentTrafficPercent:String(next.query.queryAgentTrafficPercent),queryAgentMaxIterations:String(next.query.queryAgentMaxIterations),queryAgentMaxSqlCalls:String(next.query.queryAgentMaxSqlCalls),queryAgentMaxScannedRows:String(next.query.queryAgentMaxScannedRows),queryAgentPendingTtlMs:String(next.query.queryAgentPendingTtlMs),queryMaxRows:String(next.query.queryMaxRows),explainMaxRows:String(next.query.explainMaxRows),queryTimeoutMs:String(next.query.queryTimeoutMs),queryLlmTimeoutMs:String(next.query.queryLlmTimeoutMs)});
+    setClaudeQuery({mode:next.claudeQuery.mode,trafficPercent:String(next.claudeQuery.trafficPercent),binary:next.claudeQuery.binary,model:next.claudeQuery.model,promptVersion:next.claudeQuery.promptVersion,timeoutMs:String(next.claudeQuery.timeoutMs),maxTurns:String(next.claudeQuery.maxTurns),maxBudgetUsd:String(next.claudeQuery.maxBudgetUsd),maxConcurrency:String(next.claudeQuery.maxConcurrency),queueTimeoutMs:String(next.claudeQuery.queueTimeoutMs),maxStdioBytes:String(next.claudeQuery.maxStdioBytes)});
     setOntologyAi({mode:next.ontologyAi.mode,autoConfirmScore:String(next.ontologyAi.autoConfirmScore),maxTables:String(next.ontologyAi.maxTables),maxFields:String(next.ontologyAi.maxFields),timeoutMs:String(next.ontologyAi.timeoutMs),criticEnabled:next.ontologyAi.criticEnabled,calibrationMinSamples:String(next.ontologyAi.calibrationMinSamples),calibrationMinPrecision:String(next.ontologyAi.calibrationMinPrecision),maxManualObjectRate:String(next.ontologyAi.maxManualObjectRate),maxFailureRate:String(next.ontologyAi.maxFailureRate),maxP95LatencyMs:String(next.ontologyAi.maxP95LatencyMs),maxAverageTokens:String(next.ontologyAi.maxAverageTokens)});
     setPrompts(next.prompts);
     setPromptChanges(new Set());
@@ -68,6 +71,7 @@ export function SettingsWorkspace({sourceId,role,onRefresh}:{sourceId?:number;ro
       retrieval:{vectorEnabled:retrieval.vectorEnabled,topK:Number(retrieval.topK),vectorWeight:Number(retrieval.vectorWeight),minSimilarity:Number(retrieval.minSimilarity),semanticThreshold:Number(retrieval.semanticThreshold)},
       profiling:{enabled:profiling.enabled,sampleLimit:Number(profiling.sampleLimit),maxTablesPerRefresh:Number(profiling.maxTablesPerRefresh),timeoutMs:Number(profiling.timeoutMs)},
       query:{semanticQueryPlanMode:query.semanticQueryPlanMode,queryAgentMode:query.queryAgentMode,queryAgentTrafficPercent:Number(query.queryAgentTrafficPercent),queryAgentMaxIterations:Number(query.queryAgentMaxIterations),queryAgentMaxSqlCalls:Number(query.queryAgentMaxSqlCalls),queryAgentMaxScannedRows:Number(query.queryAgentMaxScannedRows),queryAgentPendingTtlMs:Number(query.queryAgentPendingTtlMs),queryMaxRows:Number(query.queryMaxRows),explainMaxRows:Number(query.explainMaxRows),queryTimeoutMs:Number(query.queryTimeoutMs),queryLlmTimeoutMs:Number(query.queryLlmTimeoutMs)},
+      claudeQuery:{mode:claudeQuery.mode,trafficPercent:Number(claudeQuery.trafficPercent),timeoutMs:Number(claudeQuery.timeoutMs),maxTurns:Number(claudeQuery.maxTurns),maxBudgetUsd:Number(claudeQuery.maxBudgetUsd),maxConcurrency:Number(claudeQuery.maxConcurrency),queueTimeoutMs:Number(claudeQuery.queueTimeoutMs),maxStdioBytes:Number(claudeQuery.maxStdioBytes)},
       ontologyAi:{mode:ontologyAi.mode,autoConfirmScore:Number(ontologyAi.autoConfirmScore),maxTables:Number(ontologyAi.maxTables),maxFields:Number(ontologyAi.maxFields),timeoutMs:Number(ontologyAi.timeoutMs),criticEnabled:ontologyAi.criticEnabled,calibrationMinSamples:Number(ontologyAi.calibrationMinSamples),calibrationMinPrecision:Number(ontologyAi.calibrationMinPrecision),maxManualObjectRate:Number(ontologyAi.maxManualObjectRate),maxFailureRate:Number(ontologyAi.maxFailureRate),maxP95LatencyMs:Number(ontologyAi.maxP95LatencyMs),maxAverageTokens:Number(ontologyAi.maxAverageTokens)},
       ...(Object.keys(promptInput).length?{prompts:promptInput}:{}),
     };
@@ -171,6 +175,24 @@ export function SettingsWorkspace({sourceId,role,onRefresh}:{sourceId?:number;ro
           <Field label="SQL 执行超时（ms）"><input type="number" min={1000} value={query.queryTimeoutMs} disabled={!isAdmin} onChange={(event)=>setQuery({...query,queryTimeoutMs:event.target.value})}/></Field>
           <Field label="LLM 规划超时（ms）"><input type="number" min={1000} value={query.queryLlmTimeoutMs} disabled={!isAdmin} onChange={(event)=>setQuery({...query,queryLlmTimeoutMs:event.target.value})}/></Field>
         </div>
+      </section>
+
+      <section className="panel settings-panel">
+        <div className="panel-title"><div><h2>Claude Code 问数</h2><p>通过受限的 Claude CLI + 请求级 MCP 执行问数。默认关闭；启用前请完成真实环境 preflight 与评测门禁。</p></div></div>
+        <div className="form-grid">
+          <Field label="Claude 模式"><select value={claudeQuery.mode} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,mode:event.target.value as ClaudeQueryForm["mode"]})}><option value="off">off · 不调用 Claude</option><option value="prefer">prefer · 灰度调用，基础链路可回退</option><option value="required">required · 强制 Claude，失败即拒答</option></select></Field>
+          <Field label="Claude 灰度比例（%）"><input type="number" min={0} max={100} value={claudeQuery.trafficPercent} disabled={!isAdmin||claudeQuery.mode!=="prefer"} onChange={(event)=>setClaudeQuery({...claudeQuery,trafficPercent:event.target.value})}/></Field>
+          <Field label="模型精确 ID（部署固定）"><input value={claudeQuery.model} disabled readOnly placeholder="通过 CLAUDE_QUERY_MODEL 配置"/></Field>
+          <Field label="CLI 路径（部署固定）"><input value={claudeQuery.binary} disabled readOnly/></Field>
+          <Field label="Prompt 契约版本（部署固定）"><input value={claudeQuery.promptVersion} disabled readOnly/></Field>
+          <Field label="单请求超时（ms）"><input type="number" min={1000} max={600000} value={claudeQuery.timeoutMs} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,timeoutMs:event.target.value})}/></Field>
+          <Field label="最大 CLI turns"><input type="number" min={1} max={100} value={claudeQuery.maxTurns} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,maxTurns:event.target.value})}/></Field>
+          <Field label="单请求预算（USD）"><input type="number" min={0} max={100} step={0.01} value={claudeQuery.maxBudgetUsd} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,maxBudgetUsd:event.target.value})}/></Field>
+          <Field label="最大并发请求"><input type="number" min={1} max={32} value={claudeQuery.maxConcurrency} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,maxConcurrency:event.target.value})}/></Field>
+          <Field label="排队超时（ms）"><input type="number" min={0} max={120000} value={claudeQuery.queueTimeoutMs} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,queueTimeoutMs:event.target.value})}/></Field>
+          <Field label="CLI 输出上限（bytes）"><input type="number" min={65536} max={16777216} value={claudeQuery.maxStdioBytes} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,maxStdioBytes:event.target.value})}/></Field>
+        </div>
+        <p className="settings-help">Anthropic API Key 和模型精确 ID 只从部署环境变量 ANTHROPIC_API_KEY / CLAUDE_QUERY_MODEL 注入，不会保存或显示在这里。CLI 路径、模型和契约版本需要重新部署后变更。</p>
       </section>
 
       <section className="panel settings-panel">

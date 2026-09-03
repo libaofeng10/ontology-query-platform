@@ -48,6 +48,23 @@ const GROUPS = {
     queryTimeoutMs: { envVar: "QUERY_TIMEOUT_MS", validate: intRange(1_000, 600_000) },
     queryLlmTimeoutMs: { envVar: "QUERY_LLM_TIMEOUT_MS", validate: intRange(1_000, 600_000) },
   },
+  // Claude Code itself is deployment-owned.  The executable path, exact model
+  // ID and prompt contract version are visible for diagnostics but cannot be
+  // changed through the API; changing any of them requires a reviewed
+  // deployment so the readiness and cost/quality audit identity stay true.
+  claudeQuery: {
+    mode: { envVar: "CLAUDE_QUERY_MODE", validate: oneOf(["off", "prefer", "required"]) },
+    trafficPercent: { envVar: "CLAUDE_QUERY_TRAFFIC_PERCENT", validate: intRange(0, 100) },
+    binary: { envVar: "CLAUDE_QUERY_BINARY", validate: text, readonly: true },
+    model: { envVar: "CLAUDE_QUERY_MODEL", validate: text, readonly: true },
+    promptVersion: { envVar: "CLAUDE_QUERY_PROMPT_VERSION", validate: text, readonly: true },
+    timeoutMs: { envVar: "CLAUDE_QUERY_TIMEOUT_MS", validate: intRange(1_000, 600_000) },
+    maxTurns: { envVar: "CLAUDE_QUERY_MAX_TURNS", validate: intRange(1, 100) },
+    maxBudgetUsd: { envVar: "CLAUDE_QUERY_MAX_BUDGET_USD", validate: decimalRange(0, 100) },
+    maxConcurrency: { envVar: "CLAUDE_QUERY_MAX_CONCURRENCY", validate: intRange(1, 32) },
+    queueTimeoutMs: { envVar: "CLAUDE_QUERY_QUEUE_TIMEOUT_MS", validate: intRange(0, 120_000) },
+    maxStdioBytes: { envVar: "CLAUDE_QUERY_MAX_STDIO_BYTES", validate: intRange(64 * 1024, 16 * 1024 * 1024) },
+  },
   ontologyAi: {
     mode: { envVar: "ONTOLOGY_AI_MODELING_MODE", validate: oneOf(["off", "review", "auto_draft"]) },
     autoConfirmScore: { envVar: "ONTOLOGY_AI_AUTO_CONFIRM_SCORE", validate: intRange(0, 100) },
@@ -67,12 +84,13 @@ const GROUPS = {
 
 export function createSettingsService({ store, baseConfig, appSecret, lockedKeys = [] }) {
   const locked = new Set(lockedKeys);
-  const state = { llm: {}, embedding: {}, retrieval: {}, discovery: {}, profiling: {}, query: {}, ontologyAi: {}, prompts: {} };
+  const state = { llm: {}, embedding: {}, retrieval: {}, discovery: {}, profiling: {}, query: {}, claudeQuery: {}, ontologyAi: {}, prompts: {} };
   const sources = {};
 
   function defaultsFor(group, key) {
     if (group === "query") return baseConfig[key];
     if (group === "prompts") return QUERY_PROMPT_DEFAULTS[key];
+    if (group === "claudeQuery") return baseConfig[group]?.[key] ?? CLAUDE_QUERY_FALLBACKS[key] ?? "";
     return baseConfig[group]?.[key] ?? (key === "dimensions" ? null : "");
   }
 
@@ -88,6 +106,9 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
         const fallback = defaultsFor(group, key);
         if (locked.has(settingKey)) { state[group][key] = fallback; sources[settingKey] = "override"; continue; }
         const row = store.getSetting(settingKey);
+        // Deployment-owned values (the CLI path and prompt contract version)
+        // must never be resurrected from an old or hand-written settings row.
+        if (spec.readonly) { state[group][key] = fallback; sources[settingKey] = fallbackSource(spec); continue; }
         if (!row) { state[group][key] = fallback; sources[settingKey] = fallbackSource(spec); continue; }
         try {
           const raw = JSON.parse(row.valueJson);
@@ -111,6 +132,7 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
         if (!spec) throw httpError(400, `未知设置项 ${group}.${key}`);
         const settingKey = `${group}.${key}`;
         if (locked.has(settingKey)) throw httpError(400, `${settingKey} 由启动参数固定，不可在线修改`);
+        if (spec.readonly) throw httpError(400, `${settingKey} 由部署配置固定，不可在线修改`);
         if (value === null) { writes.push(() => store.deleteSetting(settingKey)); continue; }
         if (spec.secret) {
           if (value === "" || value === undefined) continue;
@@ -156,6 +178,7 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
   const retrievalView = viewOf(state.retrieval, ["vectorEnabled", "topK", "vectorWeight", "minSimilarity", "semanticThreshold"]);
   const discoveryView = viewOf(state.discovery, ["enumMaxDistinctRatio", "labelDictionaryMaxRows"]);
   const profilingView = viewOf(state.profiling, ["enabled", "sampleLimit", "maxTablesPerRefresh", "timeoutMs"]);
+  const claudeQueryView = viewOf(state.claudeQuery, Object.keys(GROUPS.claudeQuery));
   const ontologyAiView = viewOf(state.ontologyAi, ["mode", "autoConfirmScore", "maxTables", "maxFields", "timeoutMs", "criticEnabled", "calibrationMinSamples", "calibrationMinPrecision", "maxManualObjectRate", "maxFailureRate", "maxP95LatencyMs", "maxAverageTokens"]);
   const promptsView = viewOf(state.prompts, Object.keys(QUERY_PROMPT_SPECS));
   const config = {
@@ -165,6 +188,7 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
     retrieval: retrievalView,
     discovery: discoveryView,
     profiling: profilingView,
+    claudeQuery: claudeQueryView,
     ontologyAi: ontologyAiView,
     prompts: promptsView,
     get semanticQueryPlanMode() { return state.query.semanticQueryPlanMode; },
@@ -196,10 +220,25 @@ function maskSecret(value) {
   return { set: true, masked: `****${tail}` };
 }
 
+const CLAUDE_QUERY_FALLBACKS = {
+  mode: "off",
+  trafficPercent: 0,
+  binary: "/app/node_modules/.bin/claude",
+  model: "",
+  promptVersion: "claude-query-v1",
+  timeoutMs: 120_000,
+  maxTurns: 12,
+  maxBudgetUsd: 1,
+  maxConcurrency: 2,
+  queueTimeoutMs: 5_000,
+  maxStdioBytes: 2 * 1024 * 1024,
+};
+
 function text(value, key) { if (typeof value !== "string") throw httpError(400, `${key} 必须是字符串`); return value.trim(); }
 function url(value, key) { const trimmed = text(value, key); if (trimmed && !/^https?:\/\//i.test(trimmed)) throw httpError(400, `${key} 必须是 http(s) 地址`); return trimmed; }
 function bool(value, key) { if (typeof value !== "boolean") throw httpError(400, `${key} 必须是布尔值`); return value; }
 function ratio(value, key) { const num = Number(value); if (!Number.isFinite(num) || num < 0 || num > 1) throw httpError(400, `${key} 必须在 0 和 1 之间`); return num; }
+function decimalRange(min, max) { return (value, key) => { const num = Number(value); if (!Number.isFinite(num) || num < min || num > max) throw httpError(400, `${key} 必须在 ${min} 和 ${max} 之间`); return num; }; }
 function intRange(min, max) { return (value, key) => { const num = Number(value); if (!Number.isInteger(num) || num < min || num > max) throw httpError(400, `${key} 必须是 ${min} 到 ${max} 的整数`); return num; }; }
 function nullablePositiveInt(value, key) { if (value === null || value === "") return null; const num = Number(value); if (!Number.isInteger(num) || num <= 0) throw httpError(400, `${key} 必须是正整数或留空`); return num; }
 function oneOf(allowed) { return (value, key) => { const normalized = String(value).trim().toLowerCase(); if (!allowed.includes(normalized)) throw httpError(400, `${key} 必须是 ${allowed.join("、")} 之一`); return normalized; }; }

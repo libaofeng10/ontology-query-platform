@@ -28,6 +28,22 @@ export const config = {
   queryAgentMaxSqlCalls: numberFromEnv("QUERY_AGENT_MAX_SQL_CALLS", 5),
   queryAgentMaxScannedRows: numberFromEnv("QUERY_AGENT_MAX_SCANNED_ROWS", 5_000_000),
   queryAgentPendingTtlMs: numberFromEnv("QUERY_AGENT_PENDING_TTL_MS", 600_000),
+  // Claude Code query bridge is disabled by default.  The API key is deliberately
+  // not copied into this runtime config object: the bridge reads ANTHROPIC_API_KEY
+  // from its explicitly constructed child-process environment.
+  claudeQuery: {
+    mode: enumFromEnv("CLAUDE_QUERY_MODE", ["off", "prefer", "required"], "off"),
+    trafficPercent: integerRangeFromEnv("CLAUDE_QUERY_TRAFFIC_PERCENT", 0, 100, 0),
+    binary: textFromEnv("CLAUDE_QUERY_BINARY", "/app/node_modules/.bin/claude"),
+    model: textFromEnv("CLAUDE_QUERY_MODEL", ""),
+    promptVersion: textFromEnv("CLAUDE_QUERY_PROMPT_VERSION", "claude-query-v1"),
+    timeoutMs: integerRangeFromEnv("CLAUDE_QUERY_TIMEOUT_MS", 1_000, 600_000, 120_000),
+    maxTurns: integerRangeFromEnv("CLAUDE_QUERY_MAX_TURNS", 1, 100, 12),
+    maxBudgetUsd: decimalRangeFromEnv("CLAUDE_QUERY_MAX_BUDGET_USD", 0, 100, 1),
+    maxConcurrency: integerRangeFromEnv("CLAUDE_QUERY_MAX_CONCURRENCY", 1, 32, 2),
+    queueTimeoutMs: integerRangeFromEnv("CLAUDE_QUERY_QUEUE_TIMEOUT_MS", 0, 120_000, 5_000),
+    maxStdioBytes: integerRangeFromEnv("CLAUDE_QUERY_MAX_STDIO_BYTES", 64 * 1024, 16 * 1024 * 1024, 2 * 1024 * 1024),
+  },
   metricProposalEnabled: String(process.env.METRIC_PROPOSAL_ENABLED??"false").toLowerCase()==="true",
   rateLimits: {
     queryPerMinute:numberFromEnv("RATE_LIMIT_QUERY_PER_MINUTE",30),
@@ -97,6 +113,16 @@ export const config = {
 function numberFromEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function textFromEnv(name, fallback) {
+  const value = process.env[name];
+  return value == null || String(value).trim() === "" ? fallback : String(value).trim();
+}
+
+function decimalRangeFromEnv(name, min, max, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value >= min && value <= max ? value : fallback;
 }
 
 function numberRatioFromEnv(name,fallback) { const value=Number(process.env[name]);return Number.isFinite(value)&&value>=0&&value<=1?value:fallback; }

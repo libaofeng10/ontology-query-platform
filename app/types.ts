@@ -1,4 +1,6 @@
 export type NavId = "query" | "sources" | "discovery" | "questions" | "modeling" | "knowledge" | "graph" | "evaluation" | "audit" | "settings";
+export type QueryPlanningMode = "semantic" | "legacy" | "agent" | "claude" | "demo";
+export type ClaudeQueryMode = "off" | "prefer" | "required";
 
 export type QueryColumn = { key:string; label:string; type:"text"|"number"|"percent" };
 export type QueryRow = Record<string,string|number|null>;
@@ -28,16 +30,16 @@ export type Evidence = {
   pages:string[]; rules:string[]; tables:string[]; joins?:string[]; sql:string; durationMs:number; scannedRows:number;
   sqls?:Array<{name:string;sql:string;tables:string[];joins:string[];scannedRows:number;durationMs:number;rowCount:number}>;
   coverage?:"semantic"|"structural"|"session"|"demo"; retrievalMode?:"lexical"|"hybrid";
-  planningMode?:"semantic"|"legacy"|"agent"|"demo"; ontologySchemaVersion?:number;
+  planningMode?:QueryPlanningMode; ontologySchemaVersion?:number;
   queryPlan?:SemanticQueryPlan; semanticPath?:SemanticQueryPath; semanticFallbackReason?:string; agentFallbackReason?:string; planningAttempts?:number;
   zeroResultProbe?:{findings:Array<{table:string;filterColumn:string;siblingColumn:string;value:string;matchCount:number}>;probedAt:string};
   iterations?:number; toolTrace?:QueryToolTrace[]; stateTransitions?:Array<{from:string;to:string;step:number}>; budgetFallback?:boolean; resultDelivery?:"preview"|"direct"; clarifications?:Array<{question:string;answer:string}>; tokenUsage?:{promptTokens:number;completionTokens:number;totalTokens:number;available:boolean}; queryIntent?:QueryIntent; agentRollout?:{configuredMode:"off"|"prefer"|"required";effectiveMode:"off"|"prefer"|"required";trafficPercent:number;bucket:number|null;reason:string}; resultCompleteness?:{complete:boolean;mayBeTruncated:boolean;incompleteResultSets:string[];reason?:string};
 };
 export type QueryAnswer = { id:string; sessionId?:string; question:string; conclusion:string; delta?:string; columns:QueryColumn[]; rows:QueryRow[]; resultSets?:QueryResultSet[]; chart:{type:"line"|"bar"|"pie";xKey:string;yKey:string}|null; evidence:Evidence };
-export type QueryRefusal = { refused:true; reason:string; errorCode?:string; failureClass?:string; sessionId?:string; missingTerm?:string; missingConfiguration?:string[]; missingFacets?:string[]; missingAssets?:Array<{kind:string;label:string}>; attemptedSql?:string; planningMode?:"semantic"|"legacy"|"agent"; planningAttempts?:number; toolTrace?:QueryToolTrace[]; clarifications?:Array<{question:string;answer:string}> };
+export type QueryRefusal = { refused:true; reason:string; errorCode?:string; failureClass?:string; sessionId?:string; missingTerm?:string; missingConfiguration?:string[]; missingFacets?:string[]; missingAssets?:Array<{kind:string;label:string}>; attemptedSql?:string; planningMode?:Exclude<QueryPlanningMode,"demo">; planningAttempts?:number; toolTrace?:QueryToolTrace[]; clarifications?:Array<{question:string;answer:string}> };
 export type CapabilityGap = { key:string; code:string; assetLabel:string; count:number; lastAskedAt:string|null; sampleQuestions:string[]; detail?:string|null; remedy:{action:string;prefill?:{pageType?:string;slug?:string;title?:string;field?:string}}; status:"open"|"resolved" };
 export type CapabilityGapBoard = { gaps:CapabilityGap[]; generatedAt:string; auditWindow:number };
-export type QueryClarification = { clarification:{pendingId:string;question:string;options:string[];allowFreeText:boolean;expiresAt:string}; sessionId:string; planningMode:"agent"; planningAttempts:number; toolTrace:QueryToolTrace[]; tokenUsage?:{promptTokens:number;completionTokens:number;totalTokens:number;available:boolean} };
+export type QueryClarification = { clarification:{pendingId:string;question:string;options:string[];allowFreeText:boolean;expiresAt:string}; sessionId:string; planningMode:"agent"|"claude"; planningAttempts:number; toolTrace:QueryToolTrace[]; tokenUsage?:{promptTokens:number;completionTokens:number;totalTokens:number;available:boolean} };
 export type QueryResponse = QueryAnswer|QueryRefusal|QueryClarification;
 export type QuerySession = { id:string; sourceId:number; userName:string; title:string; messageCount:number; createdAt:string; updatedAt:string };
 export type QuerySessionMessage = { id:number; sessionId:string; role:"user"|"assistant"; auditId?:number|null; content:{text?:string}|QueryResponse; createdAt:string };
@@ -116,7 +118,7 @@ export type AuditRecord = {
   id:number; userName:string; question:string; retrievedPages:string; sql:string|null;
   verdict:"passed"|"refused"|"failed"|string; failReason:string|null;
   durationMs:number|null; rowCount:number|null; createdAt:string;
-  planningMode:"semantic"|"legacy"|"agent"|"demo"|null; ontologySchemaVersion:number|null;
+  planningMode:QueryPlanningMode|null; ontologySchemaVersion:number|null;
   queryPlan:SemanticQueryPlan|null; semanticPath:SemanticQueryPath|null; semanticFallbackReason:string|null; planningAttempts:number|null;
   iterations:number|null; clarificationCount:number; toolTrace:QueryToolTrace[];
   intentVersion:string|null; intent:QueryIntent|null; promptVersion:string|null; retrievalTrace:Record<string,unknown>|null; failureClass:string|null;
@@ -126,11 +128,11 @@ export type AuditStats = { total:number; passed:number; blocked:number; averageM
 export type EvalCase = { id:number; setName:string; question:string; goldSql:string|null; hasGoldSql:number|boolean; category:string; heldOut:number };
 export type EvalInput = { sourceId:number; setName:string; question:string; goldSql:string; category:string; heldOut:boolean };
 export type EvaluationRepairHint = { targetType:"object"|"property"|"link"; target:string; label:string; action:string };
-export type EvalRun = { id:number; evalId:number; batchId:string; setName:string; question:string; generatedSql:string|null; passed:number; failReason:string|null; durationMs:number|null; failureClass:string|null; suggestion:string|null; repairHints:EvaluationRepairHint[]; requestedMode:"off"|"prefer"|"single"|"agent_prefer"|"agent_required"|null; planningMode:"semantic"|"legacy"|"agent"|null; comparisonRole:"baseline"|"candidate"|null; ontologySchemaVersion:number|null; semanticPath:SemanticQueryPath|null; tableCount:number|null; planningAttempts:number|null; agentMetrics:{agentExecution:number;iterations:number;toolCalls:number;toolSuccesses:number;clarificationCount:number;budgetFallback:number;repeatedActions:number;intentFailures:number;incompleteFailures:number;totalTokens:number|null}|null; runAt:string };
-export type EvaluationSummary = { batchId:string; setName:string; queryAgentMode?:"off"|"prefer"|"required"; total:number; passed:number; failed:number; failures:Array<{evalId:number;question:string;failureClass:string;reason:string;suggestion:string;repairHints:EvaluationRepairHint[]}> };
-export type EvaluationGateMetrics = { gateKind?:"agent"; requestedMode:"off"|"prefer"|"single"|"agent_required"; total:number; passed:number; failed:number; refused:number; passRate:number; averageDurationMs:number; joinFailures?:number; semanticExecutions?:number; joinFailureRate?:number; refusalRate:number; semanticExecutionRate?:number; subtypeRootObjects?:string[]; subtypeRootCoverage?:number; averageContextTables?:number; averagePlanningAttempts?:number; agentExecutions?:number; agentExecutionRate?:number; averageIterations?:number; toolCalls?:number; toolSuccesses?:number; toolSuccessRate?:number; clarifications?:number; clarificationRate?:number; budgetFallbacks?:number; budgetFallbackRate?:number; repeatedActions?:number; repeatedActionRate?:number; intentFailures?:number; intentFailureRate?:number; incompleteFailures?:number; incompleteFailureRate?:number; p95DurationMs?:number; tokenCoverage?:number; averageTokens?:number; p95Tokens?:number };
-export type EvaluationGate = { id:string; sourceId:number; setName:string; total:number; ontologySchemaVersion:number|null; ontologySchemaPublishedAt?:string|null; evaluationChecksum?:string|null; baseline:EvaluationGateMetrics; candidate:EvaluationGateMetrics; passed:number|boolean; decision:"enable_prefer"|"enable_agent_prefer"|"keep_off"; reason:string; createdAt:string };
-export type EvaluationGateSummary = { batchId:string; gateKind?:"agent"; setName:string; total:number; ontologySchemaVersion:number|null; ontologySchemaPublishedAt?:string|null; baseline:EvaluationGateMetrics; candidate:EvaluationGateMetrics; passed:boolean; decision:"enable_prefer"|"enable_agent_prefer"|"keep_off"; reason:string; failures:EvaluationSummary["failures"] };
+export type EvalRun = { id:number; evalId:number; batchId:string; setName:string; question:string; generatedSql:string|null; passed:number; failReason:string|null; durationMs:number|null; failureClass:string|null; suggestion:string|null; repairHints:EvaluationRepairHint[]; requestedMode:"off"|"prefer"|"single"|"agent_prefer"|"agent_required"|"claude_prefer"|"claude_required"|null; planningMode:Exclude<QueryPlanningMode,"demo">|null; comparisonRole:"baseline"|"candidate"|null; ontologySchemaVersion:number|null; semanticPath:SemanticQueryPath|null; tableCount:number|null; planningAttempts:number|null; agentMetrics:{agentExecution:number;iterations:number;toolCalls:number;toolSuccesses:number;clarificationCount:number;budgetFallback:number;repeatedActions:number;intentFailures:number;incompleteFailures:number;totalTokens:number|null}|null; runAt:string };
+export type EvaluationSummary = { batchId:string; setName:string; queryAgentMode?:ClaudeQueryMode; claudeQueryMode?:ClaudeQueryMode; total:number; passed:number; failed:number; failures:Array<{evalId:number;question:string;failureClass:string;reason:string;suggestion:string;repairHints:EvaluationRepairHint[]}> };
+export type EvaluationGateMetrics = { gateKind?:"agent"|"claude"; requestedMode:"off"|"prefer"|"single"|"agent_required"|"claude_prefer"|"claude_required"; total:number; passed:number; failed:number; refused:number; passRate:number; averageDurationMs:number; joinFailures?:number; semanticExecutions?:number; joinFailureRate?:number; refusalRate:number; semanticExecutionRate?:number; subtypeRootObjects?:string[]; subtypeRootCoverage?:number; averageContextTables?:number; averagePlanningAttempts?:number; agentExecutions?:number; agentExecutionRate?:number; averageIterations?:number; toolCalls?:number; toolSuccesses?:number; toolSuccessRate?:number; clarifications?:number; clarificationRate?:number; budgetFallbacks?:number; budgetFallbackRate?:number; repeatedActions?:number; repeatedActionRate?:number; intentFailures?:number; intentFailureRate?:number; incompleteFailures?:number; incompleteFailureRate?:number; p95DurationMs?:number; tokenCoverage?:number; averageTokens?:number; p95Tokens?:number };
+export type EvaluationGate = { id:string; sourceId:number; setName:string; total:number; ontologySchemaVersion:number|null; ontologySchemaPublishedAt?:string|null; evaluationChecksum?:string|null; baseline:EvaluationGateMetrics; candidate:EvaluationGateMetrics; passed:number|boolean; decision:"enable_prefer"|"enable_agent_prefer"|"enable_claude_prefer"|"keep_off"; reason:string; createdAt:string };
+export type EvaluationGateSummary = { batchId:string; gateKind?:"agent"|"claude"; setName:string; total:number; ontologySchemaVersion:number|null; ontologySchemaPublishedAt?:string|null; baseline:EvaluationGateMetrics; candidate:EvaluationGateMetrics; passed:boolean; decision:"enable_prefer"|"enable_agent_prefer"|"enable_claude_prefer"|"keep_off"; reason:string; failures:EvaluationSummary["failures"] };
 
 export type BootstrapData = {
   sources:DataSource[]; sourceId:number; discovery:DiscoverySummary|null;
@@ -257,6 +259,10 @@ export type MaskedSecret = { set:boolean; masked?:string };
 export type QueryPromptKey = "agentSystem"|"agentQuestion"|"legacySqlPlanner"|"semanticPlanner"|"resultSummary";
 export type QueryPromptMap = Record<QueryPromptKey,string>;
 export type QueryPromptMeta = Record<QueryPromptKey,{label:string;description:string;variables:string[]}>;
+export type ClaudeQuerySettings = {
+  mode:ClaudeQueryMode; trafficPercent:number; binary:string; model:string; promptVersion:string;
+  timeoutMs:number; maxTurns:number; maxBudgetUsd:number; maxConcurrency:number; queueTimeoutMs:number; maxStdioBytes:number;
+};
 export type SettingsData = {
   llm:{ baseUrl:string; apiKey:MaskedSecret; model:string };
   embedding:{ baseUrl:string; apiKey:MaskedSecret; model:string; dimensions:number|null };
@@ -264,6 +270,7 @@ export type SettingsData = {
   discovery:{enumMaxDistinctRatio:number};
   profiling:{enabled:boolean;sampleLimit:number;maxTablesPerRefresh:number;timeoutMs:number};
   query:{ semanticQueryPlanMode:"off"|"prefer"|"required"; queryAgentMode:"off"|"prefer"|"required"; queryAgentTrafficPercent:number; queryAgentMaxIterations:number; queryAgentMaxSqlCalls:number; queryAgentMaxScannedRows:number; queryAgentPendingTtlMs:number; queryMaxRows:number; explainMaxRows:number; queryTimeoutMs:number; queryLlmTimeoutMs:number };
+  claudeQuery:ClaudeQuerySettings;
   ontologyAi:{mode:"off"|"review"|"auto_draft";autoConfirmScore:number;maxTables:number;maxFields:number;timeoutMs:number;criticEnabled:boolean;calibrationMinSamples:number;calibrationMinPrecision:number;maxManualObjectRate:number;maxFailureRate:number;maxP95LatencyMs:number;maxAverageTokens:number};
   prompts:QueryPromptMap;
   promptMeta:QueryPromptMeta;
@@ -278,6 +285,7 @@ export type SettingsInput = {
   discovery?:Partial<{enumMaxDistinctRatio:number}>;
   profiling?:Partial<{enabled:boolean;sampleLimit:number;maxTablesPerRefresh:number;timeoutMs:number}>;
   query?:Partial<{ semanticQueryPlanMode:"off"|"prefer"|"required"; queryAgentMode:"off"|"prefer"|"required"; queryAgentTrafficPercent:number; queryAgentMaxIterations:number; queryAgentMaxSqlCalls:number; queryAgentMaxScannedRows:number; queryAgentPendingTtlMs:number; queryMaxRows:number; explainMaxRows:number; queryTimeoutMs:number; queryLlmTimeoutMs:number }>;
+  claudeQuery?:Partial<Omit<ClaudeQuerySettings,"binary"|"model"|"promptVersion">>;
   ontologyAi?:Partial<{mode:"off"|"review"|"auto_draft";autoConfirmScore:number;maxTables:number;maxFields:number;timeoutMs:number;criticEnabled:boolean;calibrationMinSamples:number;calibrationMinPrecision:number;maxManualObjectRate:number;maxFailureRate:number;maxP95LatencyMs:number;maxAverageTokens:number}>;
   prompts?:Partial<Record<QueryPromptKey,string|null>>;
 };

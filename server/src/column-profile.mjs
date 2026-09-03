@@ -4,6 +4,11 @@ export const COLUMN_PROFILE_VERSION="column-profile-v1";
 
 const EMAIL=/^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/i;
 const PHONE=/^(?:\+?86[-\s]?)?1[3-9]\d{9}$/;
+// International numbers are only treated as phone values when they carry an
+// explicit `+` country prefix.  This avoids classifying ordinary 10–15 digit
+// business identifiers as phone numbers while still covering values such as
+// `+1 (415) 555-2671`.
+const INTERNATIONAL_PHONE=/^\+\d{10,15}$/;
 const CHINA_ID=/^\d{17}[\dX]$/i;
 const BANK_CARD=/^\d{12,19}$/;
 const NUMBER_TYPE=/int|decimal|numeric|float|double|real/i;
@@ -14,8 +19,12 @@ export function detectSensitiveValue(value) {
   const text=String(value).trim();
   if(!text)return {sensitive:false,kind:null};
   if(EMAIL.test(text))return {sensitive:true,kind:"email"};
-  const compact=text.replace(/[\s()-]/g,"");
+  // Keep the detector tolerant of the common display formats used by CRM
+  // exports.  The compact form is only used after the anchored shape checks
+  // below, so punctuation cannot turn an arbitrary sentence into a match.
+  const compact=text.replace(/[\s().-]/g,"");
   if(PHONE.test(compact))return {sensitive:true,kind:"phone"};
+  if(INTERNATIONAL_PHONE.test(compact))return {sensitive:true,kind:"phone"};
   if(CHINA_ID.test(compact))return {sensitive:true,kind:"china_id"};
   if(BANK_CARD.test(compact))return {sensitive:true,kind:"bank_card"};
   return {sensitive:false,kind:null};

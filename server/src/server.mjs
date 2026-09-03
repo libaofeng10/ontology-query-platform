@@ -1,6 +1,5 @@
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
 import { config } from "./config.mjs";
 import { authenticate, authorize, canAccessSource, createRateLimiter } from "./auth.mjs";
 import { encryptCredential } from "./crypto.mjs";
@@ -34,11 +33,9 @@ import { createOntologyDomainPlanner } from "./ontology-domain-plan.mjs";
 import { createOntologyDomainModelingService } from "./ontology-domain-modeling-service.mjs";
 import { createOntologyDomainDraftService } from "./ontology-domain-draft-service.mjs";
 import { detectSensitiveValue } from "./column-profile.mjs";
-import { inspectClaudeQueryReadiness } from "./claude-query-readiness.mjs";
-import { createClaudeQueryBridge } from "./claude-query-bridge.mjs";
 
 export function createApp(overrides={}) {
-  const runtime={...config,...overrides,rateLimits:{...config.rateLimits,...overrides.rateLimits},ontologyAi:{...config.ontologyAi,...overrides.ontologyAi},claudeQuery:{...config.claudeQuery,...overrides.claudeQuery}};
+  const runtime={...config,...overrides,rateLimits:{...config.rateLimits,...overrides.rateLimits},ontologyAi:{...config.ontologyAi,...overrides.ontologyAi}};
   const store=overrides.store||createStore(runtime.dbPath);seedDemo(store,runtime.appSecret);
   const sensitiveCatalogMigration=applySensitiveCatalogMigration(store);
   const enumCatalogMigration=applyEnumCatalogMigration(store);
@@ -60,15 +57,7 @@ export function createApp(overrides={}) {
   const ontologyGenerationAudits=createOntologyGenerationAuditService({auditDir:runtime.ontologyAi.auditDir});
   const graph=createOntologyGraphService({store,knowledge});
   const capabilityGaps=createCapabilityGapService({store});
-  const claudeBridge=overrides.claudeBridge||createClaudeQueryBridge({
-    config:settingsConfig,
-    systemPromptFile:fileURLToPath(new URL("../claude/ontology-query/SKILL.md",import.meta.url)),
-    // A production app must never silently fall back to an interactive
-    // `claude login`; credentials are deployment-owned and passed only via
-    // the bridge's allow-listed child environment.
-    requireApiKey:true,
-  });
-  const queries=createQueryService({store,connector,config:settingsConfig,embeddingIndex,claudeBridge});
+  const queries=createQueryService({store,connector,config:settingsConfig,embeddingIndex});
   const evaluation=createEvaluationService({store,connector,queries,config:settingsConfig});
   // evaluation depends on queries, so the proposal wiring is backfilled after both exist.
   const knowledgeProposals=overrides.knowledgeProposalService||createKnowledgeProposalService({store,config:settingsConfig,knowledge,fetchImpl:overrides.llmFetchImpl});
@@ -82,12 +71,7 @@ export function createApp(overrides={}) {
     const url=new URL(req.url,"http://localhost");
     try {
       if(req.method==="GET"&&url.pathname==="/api/health")return send(res,200,{ok:true,service:"ontology-query-api",time:new Date().toISOString(),requestId});
-      if(req.method==="GET"&&url.pathname==="/api/ready"){
-        store.db.prepare("SELECT 1").get();
-        const claudeReadiness=inspectClaudeQueryReadiness({config:settingsConfig});
-        const ready=claudeReadiness.ok||!claudeReadiness.enabled;
-        return send(res,ready?200:503,{ok:ready,store:"ready",claudeQuery:claudeReadiness,sensitiveFieldRules:{version:sensitiveCatalogMigration.version,promotedColumns:sensitiveCatalogMigration.promotedColumns,skipped:sensitiveCatalogMigration.skipped},enumDictionaryRules:{version:enumCatalogMigration.version,removedColumns:enumCatalogMigration.removedColumns,removedHumanMeanings:enumCatalogMigration.removedHumanMeanings,skipped:enumCatalogMigration.skipped},requestId});
-      }
+      if(req.method==="GET"&&url.pathname==="/api/ready"){store.db.prepare("SELECT 1").get();return send(res,200,{ok:true,store:"ready",sensitiveFieldRules:{version:sensitiveCatalogMigration.version,promotedColumns:sensitiveCatalogMigration.promotedColumns,skipped:sensitiveCatalogMigration.skipped},enumDictionaryRules:{version:enumCatalogMigration.version,removedColumns:enumCatalogMigration.removedColumns,removedHumanMeanings:enumCatalogMigration.removedHumanMeanings,skipped:enumCatalogMigration.skipped},requestId});}
       const identity=authenticate(req,runtime);applyRateLimit(req,res,url,identity,runtime,limiter);
 
       if(req.method==="GET"&&url.pathname==="/api/bootstrap"){
@@ -199,24 +183,14 @@ export function createApp(overrides={}) {
     } finally { req.off?.("aborted",abort); }
   }
 
-  let closePromise=null;
-  async function closeClaude(){await claudeBridge?.close?.();}
-  async function close(){
-    if(closePromise)return closePromise;
-    // Stop request-scoped Claude children before waiting for background tasks.
-    // Otherwise an evaluation/discovery task that is currently inside a
-    // Claude bridge can hold shutdown open for the full request timeout and
-    // may race connector/store teardown.
-    closePromise=(async()=>{await closeClaude();await tasks.close();await connector.close();store.close();})();
-    return closePromise;
-  }
-  return {handler,close,closeClaude,store,ontologyCandidates,ontologyCalibration,relationDocuments,sensitiveCatalogMigration,enumCatalogMigration};
+  async function close(){await tasks.close();await connector.close();store.close();}
+  return {handler,close,store,ontologyCandidates,ontologyCalibration,relationDocuments,sensitiveCatalogMigration,enumCatalogMigration};
 }
 
 function setSecurityHeaders(req,res,runtime,requestId){const origin=req.headers.origin;if(origin&&runtime.allowedOrigins.includes(origin)){res.setHeader("access-control-allow-origin",origin);res.setHeader("vary","Origin");}res.setHeader("access-control-allow-methods","GET,POST,PUT,DELETE,OPTIONS");res.setHeader("access-control-allow-headers","authorization,content-type,x-request-id,x-ontoquery-token");res.setHeader("access-control-max-age","86400");res.setHeader("cache-control","no-store");res.setHeader("x-content-type-options","nosniff");res.setHeader("referrer-policy","no-referrer");res.setHeader("x-request-id",requestId);}
 function applyRateLimit(req,res,url,identity,runtime,limiter){const kind=["/api/query","/api/eval/run","/api/eval/gate"].includes(url.pathname)?"query":req.method==="GET"?"read":"write";const limit=kind==="query"?runtime.rateLimits.queryPerMinute:kind==="read"?runtime.rateLimits.readPerMinute:runtime.rateLimits.writePerMinute;const ip=String(req.socket?.remoteAddress||"local");const state=limiter.check(`${identity.key}:${ip}:${kind}`,limit);res.setHeader("x-ratelimit-limit",String(limit));res.setHeader("x-ratelimit-remaining",String(state.remaining));}
 function evalSetChecksum(cases){return createHash("sha256").update(JSON.stringify(cases.map((item)=>[item.id,item.question,item.goldSql,item.category,item.heldOut]))).digest("hex");}
-function lockedSettingKeys(overrides){const keys=[];for(const group of ["llm","embedding","retrieval","discovery","profiling","ontologyAi","claudeQuery"])if(overrides[group])for(const key of Object.keys(overrides[group]))keys.push(`${group}.${key}`);for(const key of ["semanticQueryPlanMode","queryAgentMode","queryAgentTrafficPercent","queryAgentMaxIterations","queryAgentMaxSqlCalls","queryAgentMaxScannedRows","queryAgentPendingTtlMs","metricProposalEnabled","queryMaxRows","explainMaxRows","queryTimeoutMs","queryLlmTimeoutMs"])if(key in overrides)keys.push(`query.${key}`);return keys;}
+function lockedSettingKeys(overrides){const keys=[];for(const group of ["llm","embedding","retrieval","discovery","profiling","ontologyAi"])if(overrides[group])for(const key of Object.keys(overrides[group]))keys.push(`${group}.${key}`);for(const key of ["semanticQueryPlanMode","queryAgentMode","queryAgentTrafficPercent","queryAgentMaxIterations","queryAgentMaxSqlCalls","queryAgentMaxScannedRows","queryAgentPendingTtlMs","metricProposalEnabled","queryMaxRows","explainMaxRows","queryTimeoutMs","queryLlmTimeoutMs"])if(key in overrides)keys.push(`query.${key}`);return keys;}
 function mergeConnection(current,body){const merged={baseUrl:String(body?.baseUrl??"").trim()||current.baseUrl,apiKey:String(body?.apiKey??"").trim()||current.apiKey,model:String(body?.model??"").trim()||current.model};const dimensions=body?.dimensions??current.dimensions;return {...merged,...(Number(dimensions)>0?{dimensions:Number(dimensions)}:{})};}
 function visibleSources(store,identity){return store.listSources().filter((source)=>canAccessSource(identity,source.id));}
 function requiredSource(store,identity,id,minimum="viewer"){const source=store.getSource(Number(id));if(!source)throw notFound("数据源不存在");authorize(identity,minimum,source.id);return source;}
@@ -277,4 +251,4 @@ function parseCsvRows(value) {
 
 export const _internal={requireWrite,authenticate,authorize,createRateLimiter};
 
-if(import.meta.url===`file://${process.argv[1]}`){const app=createApp();const server=http.createServer(app.handler);server.requestTimeout=65_000;server.headersTimeout=10_000;server.keepAliveTimeout=5_000;server.listen(config.port,config.host,()=>console.log(`OntoQuery API: http://${config.host}:${config.port}/api/health`));let shuttingDown=false;const shutdown=()=>{if(shuttingDown)return;shuttingDown=true;const closeClaude=Promise.resolve().then(()=>app.closeClaude?.());const serverClosed=new Promise((resolve)=>{try{server.close(()=>resolve());}catch{resolve();}});Promise.allSettled([closeClaude,serverClosed]).then(()=>app.close()).finally(()=>process.exit(0));};process.on("SIGINT",shutdown);process.on("SIGTERM",shutdown);}
+if(import.meta.url===`file://${process.argv[1]}`){const app=createApp();const server=http.createServer(app.handler);server.requestTimeout=65_000;server.headersTimeout=10_000;server.keepAliveTimeout=5_000;server.listen(config.port,config.host,()=>console.log(`OntoQuery API: http://${config.host}:${config.port}/api/health`));const shutdown=()=>server.close(()=>app.close().finally(()=>process.exit(0)));process.on("SIGINT",shutdown);process.on("SIGTERM",shutdown);}

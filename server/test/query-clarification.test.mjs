@@ -77,6 +77,17 @@ function seedSalesRanking(store) {
 
 function llmResponse(content) { return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify(content)}}]}),{status:200}); }
 
+// Relative month intent is evaluated in the service's Asia/Shanghai business
+// calendar. Keep the repaired SQL in this clarification regression on that
+// same calendar instead of freezing an already-expired month.
+function currentBusinessMonth() {
+  const parts=Object.fromEntries(new Intl.DateTimeFormat("en-US-u-ca-iso8601-nu-latn",{timeZone:"Asia/Shanghai",year:"numeric",month:"2-digit"}).formatToParts(new Date()).filter((item)=>item.type==="year"||item.type==="month").map((item)=>[item.type,item.value]));
+  const start=`${parts.year}-${parts.month}-01`;
+  const next=new Date(Date.UTC(Number(parts.year),Number(parts.month),1));
+  const endExclusive=`${next.getUTCFullYear()}-${String(next.getUTCMonth()+1).padStart(2,"0")}-01`;
+  return {start,endExclusive};
+}
+
 test("a result-changing clarification must bind to the immutable intent before any SQL can run",async()=>{
   const {app,source}=await appFixture();
   const actions=[
@@ -128,6 +139,7 @@ test("a model clarification that leaves structured intent unchanged cannot reuse
 
 test("a parsed seller-attribution clarification invalidates stale evidence and automatically refreshes the resolved contract",async()=>{
   const root=await mkdtemp(join(tmpdir(),"ontoquery-intent-clarification-"));
+  const {start,endExclusive}=currentBusinessMonth();
   const sql=`SELECT s.seller_alpha_id AS seller_id,
        s.seller_alpha_name AS seller_name,
        COUNT(DISTINCT c.id) AS won_clue_cnt
@@ -136,8 +148,8 @@ JOIN alpha_clue_order_rel o ON o.crm_clue_id=c.id AND o.is_deleted=0
 JOIN alpha_crm_clue_seller_rel r ON r.clue_id=c.clue_id AND r.is_deleted=0
 JOIN seller s ON s.seller_alpha_id=r.seller_id AND s.is_valid=1
 WHERE c.is_deleted=0
-  AND o.order_time >= '2026-08-01'
-  AND o.order_time < '2026-09-01'
+  AND o.order_time >= '${start}'
+  AND o.order_time < '${endExclusive}'
 GROUP BY s.seller_alpha_id,s.seller_alpha_name
 ORDER BY won_clue_cnt DESC
 LIMIT 50`;

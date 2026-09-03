@@ -46,7 +46,11 @@ export function createEvaluationService({store,connector,queries,config}) {
         if(!item.goldSql) throw classified("configuration","缺少 Gold SQL","为该用例补充经审核的 Gold SQL。");
         const gold=guardSql(item.goldSql,policy);if(!gold.ok)throw classified("gold_sql",`Gold SQL 未通过安全校验：${gold.reason}`,"修正 Gold SQL，使其仅使用当前本体中的表、字段和已确认 JOIN。");
         const [goldRows]=await connector.query(source,gold.sql);expectedRows=goldRows.map(normalizeRow);
-        answer=await queries.ask({sourceId:source.id,question:item.question,userName:"eval-runner",queryAgentMode});
+        // Existing evaluation sets measure the configured legacy/semantic or
+        // Agent path.  Keep Claude opt-in explicit so enabling the global
+        // Claude rollout cannot silently turn a historical Gold comparison
+        // into a paid, differently-planned run.
+        answer=await queries.ask({sourceId:source.id,question:item.question,userName:"eval-runner",queryAgentMode,claudeQueryMode:"off"});
         if(answer.refused) throw classified(answer.missingTerm?"retrieval":"generation",answer.reason,answer.missingTerm?"补充命中该问题的术语、指标或别名，并加入失败问法作为反例。":"检查 LLM 配置、SQL 护栏反馈和本体约束。");
         generatedSql=answer.evidence.sql;actualRows=answer.rows;queryMeta={requestedMode:evalRequestedMode(queryAgentMode),...metadataFromAnswer(answer)};
         const verdict=equivalentResults(expectedRows,actualRows,{tolerance:Number(payload.tolerance||1e-6)});
@@ -124,7 +128,7 @@ export function createEvaluationService({store,connector,queries,config}) {
   async function evaluateMode({source,item,expectedRows,requestedMode,tolerance,userName,ontologySchemaVersionId}) {
     const started=Date.now();let answer;
     try {
-      answer=await queries.ask({sourceId:source.id,question:item.question,userName,semanticQueryPlanMode:requestedMode,queryAgentMode:"off",ontologySchemaVersionId});
+      answer=await queries.ask({sourceId:source.id,question:item.question,userName,semanticQueryPlanMode:requestedMode,queryAgentMode:"off",claudeQueryMode:"off",ontologySchemaVersionId});
       if(answer.refused) {
         const failureClass=classifyRefusal(answer);
         throw classified(failureClass,answer.reason,failureClass==="join"?"检查 Object/Link 映射与已确认 JOIN 路径。":answer.missingTerm?"补充命中该问题的术语、指标或别名。":"检查规划、护栏反馈和本体约束。");
@@ -141,7 +145,7 @@ export function createEvaluationService({store,connector,queries,config}) {
   async function evaluateAgentMode({source,item,expectedRows,requestedMode,tolerance,userName}) {
     const started=Date.now();let answer;
     try {
-      answer=await queries.ask({sourceId:source.id,question:item.question,userName,semanticQueryPlanMode:"off",queryAgentMode:requestedMode==="agent_required"?"required":"off"});
+      answer=await queries.ask({sourceId:source.id,question:item.question,userName,semanticQueryPlanMode:"off",queryAgentMode:requestedMode==="agent_required"?"required":"off",claudeQueryMode:"off"});
       if(answer.clarification){queries.discardPending?.({pendingId:answer.clarification.pendingId,sourceId:source.id,sessionId:answer.sessionId,userName});throw classified("clarification","Agent 需要人工澄清，自动评测无法继续","补充默认业务口径或将该用例标记为需澄清场景。");}
       if(answer.refused)throw classified(classifyRefusal(answer),answer.reason,"检查知识覆盖、SQL 护栏反馈与工具轨迹。");
       const verdict=equivalentResults(expectedRows,answer.rows,{tolerance});if(!verdict.equal)throw classified("result_mismatch",verdict.reason,"对照 Gold SQL 检查 Agent 的探索路径、最终 SQL 与业务口径。");

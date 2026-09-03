@@ -165,14 +165,27 @@ function proposalLlmResponse() {
   return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({proposals:[{table:"crm_clue",numerator:{aggregation:"count",distinct:true,column:"clue_id",predicates:[{column:"is_win_order",operator:"=",value:1}]},denominator:{aggregation:"count",distinct:true,column:"clue_id",predicates:[]},timeColumn:"order_time",rationale:"以成单标记为分子"}]})}}]}),{status:200});
 }
 
+// The query service resolves “本月” in the Asia/Shanghai business calendar.
+// Derive the SQL range from the same calendar so this regression remains
+// stable across month boundaries.
+function currentBusinessMonth() {
+  const parts=Object.fromEntries(new Intl.DateTimeFormat("en-US-u-ca-iso8601-nu-latn",{timeZone:"Asia/Shanghai",year:"numeric",month:"2-digit"}).formatToParts(new Date()).filter((item)=>item.type==="year"||item.type==="month").map((item)=>[item.type,item.value]));
+  const start=`${parts.year}-${parts.month}-01`;
+  const next=new Date(Date.UTC(Number(parts.year),Number(parts.month),1));
+  const endExclusive=`${next.getUTCFullYear()}-${String(next.getUTCMonth()+1).padStart(2,"0")}-01`;
+  return {start,endExclusive};
+}
+
 test("clarification round-trip regression: verdict clarified persists and pendingId resumes",async(t)=>{
   // S9 前置回归：真实库 SELECT DISTINCT verdict 从无 clarified —— 先自证澄清链路可用。
   // 用无法解析的时间范围触发确定性意图澄清（不消耗 LLM）；答复“本月”可被确定性绑定，随后 loop 执行并给出答案。
   const {app,source}=await appFixture({queryAgentMode:"required",queryAgentMaxIterations:6,queryAgentMaxSqlCalls:3,queryAgentMaxScannedRows:100});
   t.after(async()=>{await app.close();});
+  const {start,endExclusive}=currentBusinessMonth();
+  const sql=`SELECT clue_id FROM crm_clue WHERE order_time >= '${start}' AND order_time < '${endExclusive}'`;
   const replies=[
-    {thought:"执行查询。",tool:"run_sql",args:{sql:"SELECT clue_id FROM crm_clue WHERE order_time >= '2026-08-01' AND order_time < '2026-09-01'"}},
-    {thought:"提交结论。",tool:"submit_answer",args:{sql:"SELECT clue_id FROM crm_clue WHERE order_time >= '2026-08-01' AND order_time < '2026-09-01'",conclusion:"已按本月口径返回结果。"}},
+    {thought:"执行查询。",tool:"run_sql",args:{sql}},
+    {thought:"提交结论。",tool:"submit_answer",args:{sql,conclusion:"已按本月口径返回结果。"}},
   ];
   const originalFetch=globalThis.fetch;
   globalThis.fetch=async()=>new Response(JSON.stringify({choices:[{message:{content:JSON.stringify(replies.shift())}}]}),{status:200});

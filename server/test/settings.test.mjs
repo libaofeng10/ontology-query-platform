@@ -12,6 +12,7 @@ const BASE_CONFIG={
   embedding:{baseUrl:"",apiKey:"",model:"",dimensions:null},
   retrieval:{vectorEnabled:true,topK:8,vectorWeight:0.4,minSimilarity:0.35,semanticThreshold:0.55},
   discovery:{enumMaxDistinctRatio:0.05,labelDictionaryMaxRows:20},
+  claudeQuery:{mode:"off",trafficPercent:0,binary:"/app/node_modules/.bin/claude",model:"",promptVersion:"claude-query-v1",timeoutMs:120_000,maxTurns:12,maxBudgetUsd:1,maxConcurrency:2,queueTimeoutMs:5_000,maxStdioBytes:2*1024*1024},
   ontologyAi:{mode:"off",autoConfirmScore:80,maxTables:20,maxFields:600,timeoutMs:90_000},
   semanticQueryPlanMode:"off",queryAgentMode:"off",queryAgentTrafficPercent:100,queryAgentMaxIterations:8,queryAgentMaxSqlCalls:5,queryAgentMaxScannedRows:5_000_000,queryAgentPendingTtlMs:600_000,queryMaxRows:500,explainMaxRows:1_000_000,queryTimeoutMs:30_000,queryLlmTimeoutMs:90_000,
 };
@@ -28,17 +29,23 @@ test("settings fall back to env defaults and update hot-reloads getters",async()
   try {
     assert.equal(settings.config.llm.model,"env-model");
     assert.equal(settings.config.queryMaxRows,500);
+    assert.equal(settings.config.claudeQuery.mode,"off");
+    assert.equal(settings.config.claudeQuery.maxTurns,12);
     assert.equal(settings.publicView().sources["llm.model"],"default");
     assert.equal(settings.config.prompts.agentSystem,QUERY_PROMPT_DEFAULTS.agentSystem);
     assert.equal(settings.publicView().sources["prompts.agentSystem"],"default");
     assert.deepEqual(settings.publicView().promptMeta.agentQuestion.variables,["context"]);
-    const view=settings.update({llm:{model:"qwen-plus"},retrieval:{vectorWeight:0.6},query:{queryMaxRows:200,semanticQueryPlanMode:"prefer",queryAgentMode:"prefer",queryAgentTrafficPercent:10}},"admin-user");
+    const view=settings.update({llm:{model:"qwen-plus"},retrieval:{vectorWeight:0.6},query:{queryMaxRows:200,semanticQueryPlanMode:"prefer",queryAgentMode:"prefer",queryAgentTrafficPercent:10},claudeQuery:{mode:"prefer",trafficPercent:10,maxTurns:20,maxBudgetUsd:2}},"admin-user");
     assert.equal(settings.config.llm.model,"qwen-plus");
     assert.equal(settings.config.retrieval.vectorWeight,0.6);
     assert.equal(settings.config.queryMaxRows,200);
     assert.equal(settings.config.semanticQueryPlanMode,"prefer");
     assert.equal(settings.config.queryAgentMode,"prefer");
     assert.equal(settings.config.queryAgentTrafficPercent,10);
+    assert.equal(settings.config.claudeQuery.mode,"prefer");
+    assert.equal(settings.config.claudeQuery.trafficPercent,10);
+    assert.equal(settings.config.claudeQuery.maxTurns,20);
+    assert.equal(settings.config.claudeQuery.maxBudgetUsd,2);
     settings.update({ontologyAi:{mode:"review",autoConfirmScore:81}});
     assert.equal(settings.config.ontologyAi.mode,"review");
     assert.equal(settings.config.ontologyAi.autoConfirmScore,81);
@@ -103,6 +110,9 @@ test("invalid values are rejected with a chinese error and nothing is written",a
     assert.throws(()=>settings.update({query:{queryAgentPendingTtlMs:999}}),/必须是 1000 到 3600000 的整数/);
     assert.throws(()=>settings.update({llm:{baseUrl:"ftp://bad"}}),/必须是 http\(s\) 地址/);
     assert.throws(()=>settings.update({ontologyAi:{mode:"publish"}}),/必须是 off、review、auto_draft 之一/);
+    assert.throws(()=>settings.update({claudeQuery:{mode:"maybe"}}),/必须是 off、prefer、required 之一/);
+    assert.throws(()=>settings.update({claudeQuery:{maxBudgetUsd:101}}),/必须在 0 和 100 之间/);
+    assert.throws(()=>settings.update({claudeQuery:{binary:"/tmp/other"}}),/由部署配置固定/);
     assert.throws(()=>settings.update({ontologyAi:{autoConfirmScore:101}}),/必须是 0 到 100 的整数/);
     assert.throws(()=>settings.update({llm:{unknown:"x"}}),/未知设置项/);
     assert.throws(()=>settings.update({prompts:{unknown:"x"}}),/未知设置项/);
@@ -118,6 +128,23 @@ test("keys locked by createApp overrides ignore db values and refuse updates",as
     assert.equal(settings.publicView().sources["llm.model"],"override");
     settings.update({llm:{baseUrl:"https://db-llm.example/v1"}});
     assert.equal(settings.config.llm.baseUrl,"https://db-llm.example/v1");
+  } finally { store.close(); }
+});
+
+test("deployment-owned Claude path and prompt version ignore stale settings rows",async()=>{
+  const {store,settings}=await createFixture();
+  try {
+    store.upsertSetting({key:"claudeQuery.binary",valueJson:JSON.stringify("/tmp/attacker"),encrypted:0,updatedBy:"test"});
+    store.upsertSetting({key:"claudeQuery.model",valueJson:JSON.stringify("claude-attacker-model"),encrypted:0,updatedBy:"test"});
+    store.upsertSetting({key:"claudeQuery.promptVersion",valueJson:JSON.stringify("forged"),encrypted:0,updatedBy:"test"});
+    settings.reload();
+    assert.equal(settings.config.claudeQuery.binary,"/app/node_modules/.bin/claude");
+    assert.equal(settings.config.claudeQuery.model,"");
+    assert.equal(settings.config.claudeQuery.promptVersion,"claude-query-v1");
+    assert.notEqual(settings.publicView().sources["claudeQuery.binary"],"db");
+    assert.notEqual(settings.publicView().sources["claudeQuery.model"],"db");
+    assert.throws(()=>settings.update({claudeQuery:{binary:"/tmp/other"}}),/由部署配置固定/);
+    assert.throws(()=>settings.update({claudeQuery:{model:"claude-other"}}),/由部署配置固定/);
   } finally { store.close(); }
 });
 
