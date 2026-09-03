@@ -130,6 +130,21 @@ export function createOntologyDomainDraftService({store,candidates,semanticSchem
     const source=store.getSource(state.task.sourceId);
     const emptySchema={name:`source_${state.task.sourceId}_ontology`,displayName:`${source?.name||"数据源"}业务本体`,description:"由全域自动建模汇总生成。",objectTypes:[],linkTypes:[]};
     const originalBase=base?.schema||emptySchema;let schema=structuredClone(originalBase);const includedCandidates=[];const conflicts=[];let renamedLinkCount=0;
+    // Prune stale base objects before merging: objects whose property mappings
+    // reference tables no longer in the catalog (e.g. excluded from the data
+    // source after the base version was built). Carrying them forward would
+    // make every merged draft inherit ONTOLOGY_MAPPING_TABLE_NOT_FOUND errors
+    // and never become publishable. The diff against originalBase reports them
+    // as removals, so the change stays visible at review time.
+    const knownTables=new Set(store.listTables(state.task.sourceId).map((table)=>table.tableName));
+    const excludedTables=store.excludedTableNames(state.task.sourceId);
+    const tableAllowed=(table)=>knownTables.has(table)&&!excludedTables.has(table);
+    const keptObjects=(schema.objectTypes||[]).filter((object)=>(object.properties||[]).every((property)=>!property.mapping?.table||tableAllowed(property.mapping.table)));
+    const keptObjectNames=new Set(keptObjects.map((object)=>object.apiName));
+    const prunedStaleObjectCount=(schema.objectTypes||[]).length-keptObjects.length;
+    for(const object of keptObjects)if(object.parent&&!keptObjectNames.has(object.parent))delete object.parent;
+    schema.objectTypes=keptObjects;
+    schema.linkTypes=(schema.linkTypes||[]).filter((link)=>keptObjectNames.has(link.source)&&keptObjectNames.has(link.target));
     for(const run of runs) {
       const runItems=state.runCandidates.get(run.id)||[];
       const eligibleItems=options.repairDraftId?runItems.filter((candidate)=>(candidate.status==="applied"&&Number(candidate.appliedSchemaVersionId)===Number(options.repairDraftId))||ACCEPTED_STATUSES.has(candidate.status)):runItems;
@@ -144,6 +159,7 @@ export function createOntologyDomainDraftService({store,candidates,semanticSchem
       linksAdded:Math.max(0,(validation.schema.linkTypes||[]).length-(originalBase.linkTypes||[]).length),
       candidateCount:includedCandidates.length,renamedLinkCount,conflictCount:conflicts.length,resolvedConflictCount:conflicts.filter((item)=>item.resolution!=="unresolved").length,
       unresolvedConflictCount:conflicts.filter((item)=>item.resolution==="unresolved").length,excludedCount:excludedCandidateIds.length,
+      prunedStaleObjectCount,
     };
     return {state,baseSchemaVersionId,expectedPublishedId,includedCandidates,conflicts,excludedCandidateIds,assembledSchema:schema,validation,diff,draftSummary};
   }
