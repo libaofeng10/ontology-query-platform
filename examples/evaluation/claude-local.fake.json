@@ -1,0 +1,81 @@
+{
+  "version": "claude-local-fixture-v1",
+  "setName": "claude-local-smoke",
+  "description": "Synthetic, deterministic fixture. It validates the local comparison harness only and is not evidence of real Claude quality.",
+  "cases": [
+    {
+      "id": "customer-count",
+      "category": "结果等价",
+      "question": "统计客户数量",
+      "expectedRows": [
+        { "customer_count": 2 }
+      ],
+      "baseline": {
+        "status": "answered",
+        "rows": [
+          { "customer_count": 2 }
+        ],
+        "durationMs": 25,
+        "planningMode": "agent",
+        "planningAttempts": 2,
+        "generatedSql": "SELECT COUNT(*) AS customer_count FROM customer",
+        "tokenUsage": { "promptTokens": 80, "completionTokens": 20, "totalTokens": 100, "available": true },
+        "localOnly": true,
+        "paidApiCalls": 0
+      },
+      "candidate": {
+        "status": "answered",
+        "rows": [
+          { "customer_count": 2 }
+        ],
+        "durationMs": 20,
+        "planningMode": "claude",
+        "planningAttempts": 2,
+        "generatedSql": "SELECT COUNT(*) AS customer_count FROM customer",
+        "toolTrace": [
+          { "tool": "ontology_read", "ok": true },
+          { "tool": "db_query", "ok": true }
+        ],
+        "tokenUsage": { "promptTokens": 120, "completionTokens": 30, "totalTokens": 150, "available": true },
+        "localOnly": true,
+        "paidApiCalls": 0
+      }
+    },
+    {
+      "id": "typed-literal-redaction",
+      "category": "边界脱敏",
+      "question": "手机号 13800138000 对应的客户编号",
+      "expectedRows": [
+        { "customer_id": 7 }
+      ],
+      "baseline": {
+        "status": "answered",
+        "rows": [
+          { "customer_id": 9 }
+        ],
+        "durationMs": 12,
+        "planningMode": "agent",
+        "generatedSql": "SELECT customer_id FROM customer WHERE phone='13800138000'",
+        "localOnly": true,
+        "paidApiCalls": 0
+      },
+      "candidate": {
+        "status": "answered",
+        "rows": [
+          { "customer_id": 7 }
+        ],
+        "durationMs": 15,
+        "planningMode": "claude",
+        "planningAttempts": 1,
+        "generatedSql": "SELECT customer_id FROM customer WHERE phone='13800138000'",
+        "toolTrace": [
+          { "tool": "ontology_read", "ok": true },
+          { "tool": "db_query", "ok": true }
+        ],
+        "tokenUsage": { "promptTokens": 90, "completionTokens": 20, "totalTokens": 110, "available": true },
+        "localOnly": true,
+        "paidApiCalls": 0
+      }
+    }
+  ]
+}

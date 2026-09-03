@@ -21,6 +21,8 @@
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {
+    "@anthropic-ai/claude-code": "^2.1.258",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "13.0.3",
     "mysql2": "3.14.5",
     "node-sql-parser": "5.3.13",

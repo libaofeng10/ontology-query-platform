@@ -14,15 +14,19 @@ import { missingExhaustiveAccountProductColumns, missingExhaustiveAccountTables,
 import { applyGlobalRowDomainRules, buildIntentRetrievalQuestion, catalogFilterConcepts, describeIntentFacets, knowledgeIntentConcepts, knowledgeIntentRowDomains, mergeContextualQueryIntent, parseQueryIntent } from "./query-intent.mjs";
 import { buildQueryResultContract, validateQueryRunSet } from "./query-result-contract.mjs";
 import { failureClassFor } from "./query-errors.mjs";
+import { createClaudeQuerySnapshot } from "./claude-query-snapshot.mjs";
+import { createClaudeQueryMcpSession } from "./claude-query-mcp.mjs";
+import { createQueryExecutionKernel } from "./query-execution-kernel.mjs";
 import { QUERY_PROMPT_DEFAULTS, QUERY_PROMPT_VERSION, renderQueryPrompt } from "./query-prompts.mjs";
 
-export function createQueryService({store,connector,config,embeddingIndex,knowledge,evaluation,proposalService}) {
+export function createQueryService({store,connector,config,embeddingIndex,knowledge,evaluation,proposalService,claudeBridge,claudeSnapshotBuilder,claudeMcpFactory}) {
   const pendingLoops=new Map();const pendingBySession=new Map();
   // server.mjs constructs evaluation AFTER queries (it depends on queries), so these two
   // arrive via setDependencies backfill instead of the constructor — never reorder there.
-  const deps={knowledge:knowledge||null,evaluation:evaluation||null,proposalService:proposalService||null};
+  const deps={knowledge:knowledge||null,evaluation:evaluation||null,proposalService:proposalService||null,claudeBridge:claudeBridge||null,claudeSnapshotBuilder:claudeSnapshotBuilder||createClaudeQuerySnapshot,claudeMcpFactory:claudeMcpFactory||createClaudeQueryMcpSession};
   function setDependencies(next={}){if(next.knowledge)deps.knowledge=next.knowledge;if(next.evaluation)deps.evaluation=next.evaluation;if(next.proposalService)deps.proposalService=next.proposalService;}
-  async function ask({sourceId,question,userName="local-user",userRole="viewer",sessionId,pendingId,semanticQueryPlanMode,queryAgentMode,ontologySchemaVersionId,signal,onEvent,_skipMetricProposal=false}) {
+
+  async function ask({sourceId,question,userName="local-user",userRole="viewer",sessionId,pendingId,semanticQueryPlanMode,queryAgentMode,claudeQueryMode,ontologySchemaVersionId,signal,onEvent,_skipMetricProposal=false}) {
     if(!pendingId)sweepExpiredPending();
     const source=store.getSource(sourceId);
     if(!source) throw httpError(404,"数据源不存在");
@@ -56,6 +60,8 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
     const configuredAgentMode=normalizeAgentMode(queryAgentMode??config.queryAgentMode);
     const agentRollout=selectQueryAgentRollout({mode:configuredAgentMode,trafficPercent:config.queryAgentTrafficPercent,cohortKey:`${sourceId}:${session.id}`,explicit:queryAgentMode!=null});
     const agentMode=agentRollout.effectiveMode;
+    const configuredClaudeMode=normalizeClaudeMode(claudeQueryMode??config.claudeQuery?.mode);
+    const claudeRollout=selectClaudeQueryRollout({mode:configuredClaudeMode,trafficPercent:config.claudeQuery?.trafficPercent??0,cohortKey:`${sourceId}:${session.id}`,explicit:claudeQueryMode!=null});
     const auditContext=auditContextFields(context,agentRollout);
     throwIfAborted(signal);
     const rankingLimitFailure=rankingLimitPreflight(context.queryIntent,config.queryMaxRows||500);
@@ -101,6 +107,30 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
     }
     let agentFallbackReason=null;
     let agentTried=false;
+    let claudeTried=false,claudeFallbackReason=null,claudeToolTrace=null;
+    async function tryClaudeQuery() {
+      claudeTried=true;
+      let outcome;
+      try {
+        outcome=await runClaudeQueryBranch({store,connector,config,source,session,userName,question,context,conversationHistory,deps,claudeRollout,started,requestId:session.id,signal,onEvent});
+      } catch(error) {
+        if(signal?.aborted) throw error;
+        outcome={status:"failed",reason:safeError(error),failureClass:"protocol_error",iterations:0,toolTrace:[],durationMs:Date.now()-started};
+      }
+      const terminal=finalizeClaudeOutcome({outcome,source,session,userName,question,context,started,claudeRollout});if(terminal)return terminal;
+      claudeFallbackReason=outcome?.reason||"Claude 查询未在预算内收敛";
+      claudeToolTrace=outcome?.toolTrace||[];
+      if(claudeRollout.effectiveMode==="required"||!claudeFailureCanFallback(outcome)) {
+        const auditId=store.addAudit({userName,sourceId:source.id,question,verdict:"failed",failReason:claudeFallbackReason,durationMs:outcome.durationMs??Date.now()-started,rowCount:0,planningMode:"claude",planningAttempts:outcome.iterations||0,iterations:outcome.iterations||0,clarificationCount:0,toolTraceJson:JSON.stringify(redactClaudeBoundaryValue(claudeToolTrace)),failureClass:outcome.failureClass||"execution_error",...auditContextFields({...context,queryIntent:outcome.queryIntent||context.queryIntent},claudeRollout,{})});
+        return {refused:true,reason:`系统没有执行不可靠的 Claude 查询：${claudeFallbackReason}`,...(outcome?.errorCode?{errorCode:String(outcome.errorCode)}:{}),failureClass:outcome.failureClass||"execution_error",sessionId:session.id,planningMode:"claude",planningAttempts:outcome.iterations||0,toolTrace:redactClaudeBoundaryValue(claudeToolTrace),_auditId:auditId,_sessionQuestion:question};
+      }
+      return null;
+    }
+    if(claudeRollout.effectiveMode!=="off"&&!claudeTried) {
+      const terminal=await tryClaudeQuery();
+      if(terminal)return terminal;
+      if(claudeRollout.effectiveMode==="required") return {refused:true,reason:`系统没有执行不可靠的 Claude 查询：${claudeFallbackReason}`,failureClass:"execution_error",sessionId:session.id,planningMode:"claude",planningAttempts:0,toolTrace:redactClaudeBoundaryValue(claudeToolTrace||[])};
+    }
     if(agentMode==="required"||(agentMode==="prefer"&&(context.queryIntent?.ambiguities||[]).some((item)=>item.blocking))) { const terminal=await tryAgent();if(terminal)return terminal; }
     async function tryAgent() {
       agentTried=true;
@@ -320,6 +350,31 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
     const result=await ask({sourceId:pending.sourceId,question:pending.question,userName,userRole:pending.userRole,sessionId:session.id,signal,onEvent,_skipMetricProposal:true});
     result._sessionQuestion??=pending.question;
     return result;
+  }
+
+  function finalizeClaudeOutcome({outcome,source,session,userName,question,context,started,claudeRollout}) {
+    const clarificationCount=Array.isArray(outcome.clarifications)?outcome.clarifications.length:0;
+    if(outcome.status==="clarification") {
+      invalidatePendingSession(session.id);
+      const pendingId=randomUUID();const ttl=Number(config.queryAgentPendingTtlMs)>0?Number(config.queryAgentPendingTtlMs):10*60_000;const expiresAt=Date.now()+ttl;
+      const auditId=store.addAudit({userName,sourceId:source.id,question,verdict:"clarified",durationMs:outcome.durationMs??Date.now()-started,rowCount:0,planningMode:"claude",planningAttempts:outcome.iterations,iterations:outcome.iterations,clarificationCount:1,toolTraceJson:JSON.stringify(redactClaudeBoundaryValue(outcome.toolTrace||[]))});
+      const response={clarification:{pendingId,question:outcome.clarification.question,options:outcome.clarification.options,allowFreeText:outcome.clarification.allowFreeText,expiresAt:new Date(expiresAt).toISOString()},sessionId:session.id,planningMode:"claude",planningAttempts:outcome.iterations,toolTrace:redactClaudeBoundaryValue(outcome.toolTrace||[]),tokenUsage:outcome.tokenUsage};
+      pendingLoops.set(pendingId,{id:pendingId,sourceId:source.id,sessionId:session.id,userName,question,context,started,claudeRollout,resume:outcome.resume,expiresAt,publicState:{question,response}});pendingBySession.set(session.id,pendingId);
+      return {...response,_auditId:auditId,_sessionQuestion:question};
+    }
+    if(outcome.status==="answered") {
+      const runs=Array.isArray(outcome.runs)&&outcome.runs.length?outcome.runs:[outcome.run].filter(Boolean);
+      const combined=combineQueryRuns(runs);
+      const analyticalConclusion=deterministicAnalyticalConclusion(context.queryIntent,combined.rows.length,combined.resultSets.length);
+      const answer={id:`query-${Date.now()}`,sessionId:session.id,question,conclusion:analyticalConclusion||outcome.conclusion||'查询已完成。',delta:analyticalConclusion?undefined:outcome.delta||undefined,columns:combined.columns,rows:combined.rows,resultSets:combined.resultSets,chart:runs.length===1?inferChart(runs[0].rows,runs[0].fields):null,evidence:{pages:(context.knowledge||[]).map((page)=>page.title),rules:(context.rules||[]).map((rule)=>rule.name),tables:combined.tables,joins:combined.joins,sql:combined.sql,sqls:combined.sqls,durationMs:outcome.durationMs??Date.now()-started,scannedRows:combined.scannedRows,coverage:retrievalSnapshot(context).coverage||'none',retrievalMode:retrievalSnapshot(context).retrievalMode||'lexical',planningMode:'claude',planningAttempts:outcome.iterations,iterations:outcome.iterations,toolTrace:redactClaudeBoundaryValue(outcome.toolTrace||[]),stateTransitions:outcome.stateTransitions,budgetFallback:outcome.budgetFallback||undefined,resultDelivery:runs.some((run)=>run.resultDelivery==='direct')?'direct':'preview',clarifications:outcome.clarifications||[],tokenUsage:outcome.tokenUsage,queryIntent:context.queryIntent,resultContract:outcome.resultContract||buildQueryResultContract(context.queryIntent,[context.retrieval].filter(Boolean),null),resultContractFingerprint:outcome.resultContractFingerprint||hash(JSON.stringify(outcome.resultContract||{})),claudeRollout,resultCompleteness:combined.completeness}};
+      const auditId=store.addAudit({userName,sourceId:source.id,question,retrievedPages:JSON.stringify(answer.evidence.pages),sql:combined.sql,verdict:"passed",durationMs:answer.evidence.durationMs,rowCount:combined.rows.length,planningMode:"claude",planningAttempts:outcome.iterations,iterations:outcome.iterations,clarificationCount,toolTraceJson:JSON.stringify(answer.evidence.toolTrace)});
+      store.updateSession(session.id,nextSessionContext(session.context,combined.tables,[...new Set(answer.evidence.pages)],context.queryIntent));return {...answer,_auditId:auditId,_sessionQuestion:question};
+    }
+    if(outcome.status==="refused") {
+      const auditId=store.addAudit({userName,sourceId:source.id,question,verdict:"refused",failReason:outcome.reason,durationMs:outcome.durationMs??Date.now()-started,rowCount:0,planningMode:"claude",planningAttempts:outcome.iterations,iterations:outcome.iterations,clarificationCount,toolTraceJson:JSON.stringify(redactClaudeBoundaryValue(outcome.toolTrace||[])),failureClass:outcome.failureClass||"policy_block"});
+      return {refused:true,reason:outcome.reason,failureClass:outcome.failureClass||"policy_block",...(outcome.errorCode?{errorCode:outcome.errorCode}:{}),sessionId:session.id,planningMode:"claude",planningAttempts:outcome.iterations,toolTrace:redactClaudeBoundaryValue(outcome.toolTrace||[]),clarifications:outcome.clarifications||[],_auditId:auditId,_sessionQuestion:question};
+    }
+    return null;
   }
 
   function finalizeAgentOutcome({outcome,source,session,userName,question,context,started,agentMode,agentRollout}) {
@@ -853,4 +908,44 @@ function selectQueryAgentRollout({mode,trafficPercent=100,cohortKey="",explicit=
   return {configuredMode,effectiveMode:bucket<percent?"prefer":"off",trafficPercent:percent,bucket,reason:bucket<percent?"in_cohort":"out_of_cohort"};
 }
 
-export const _internal={buildContext,buildSemanticRuntime,planSql,planSemanticQuery,summarize,llmOptions,ensureSummaryConsistency,deterministicAnalyticalConclusion,inferChart,semanticQuestionMatches,normalizeAgentMode,rankingLimitPreflight,selectQueryAgentRollout,contextualRetrievalQuestion,isContextualFollowUp,nextSessionContext,sessionSafeIntent,plannedQuerySpecs,combineQueryRuns,missingExhaustiveAccountTables,scopedKnowledgeOntologyConflicts,refusalMissingAssets};
+function normalizeClaudeMode(value) { return ["off","prefer","required"].includes(value)?value:"off"; }
+function selectClaudeQueryRollout({mode,trafficPercent=0,cohortKey="",explicit=false}) {
+  const configuredMode=normalizeClaudeMode(mode);const percent=Math.max(0,Math.min(100,Number.isFinite(Number(trafficPercent))?Math.round(Number(trafficPercent)):0));
+  if(explicit||configuredMode!=="prefer")return {configuredMode,effectiveMode:configuredMode,trafficPercent:configuredMode==="prefer"?100:percent,bucket:null,reason:explicit?"explicit_override":"mode_not_sampled"};
+  const bucket=createHash("sha256").update(String(cohortKey)).digest().readUInt32BE(0)%100;
+  return {configuredMode,effectiveMode:bucket<percent?"prefer":"off",trafficPercent:percent,bucket,reason:bucket<percent?"in_cohort":"out_of_cohort"};
+}
+function claudeFailureCanFallback(outcome) { return outcome?.status!=="refused"&&outcome?.failureClass!=="policy_block"&&outcome?.failureClass!=="protocol_error"&&outcome?.failureClass!=="auth_error"&&outcome?.failureClass!=="model_missing"&&outcome?.failureClass!=="budget_disabled"; }
+
+async function runClaudeQueryBranch({store,connector,config,source,session,userName,question,context,conversationHistory,deps,claudeRollout,started,requestId,signal,onEvent}) {
+  const sourceId=source.id;
+  const snapshot=deps.claudeSnapshotBuilder({...context,sourceId,source:snapshotSource(source),store});
+  if(!snapshot||typeof snapshot.read!=="function") throw new Error("Claude ontology snapshot 构造失败");
+  const kernelCatalog=buildKernelCatalog(context,config);
+  const kernel=createQueryExecutionKernel({connector,source,config,question,catalog:kernelCatalog,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),getDisclosedTables:()=>snapshot.disclosedTables||new Set(),signal,maxSqlCalls:config.claudeQuery?.maxSqlCalls??config.queryAgentMaxSqlCalls,maxScannedRows:config.claudeQuery?.maxScannedRows??config.queryAgentMaxScannedRows,forbidSensitiveOutput:true,preview:{maxRows:20,maxBytes:24*1024,maxCellChars:200}});
+  const produced=await deps.claudeMcpFactory({snapshot,kernel,source,sourceId,requestId,signal,listen:true,previewRows:20,previewBytes:24*1024,initialDisclosedTables:[]});
+  const mcpSession=produced?.session||produced;
+  if(!mcpSession) throw new Error("Claude MCP session 构造失败");
+  const bridge=typeof deps.claudeBridge==="function"?deps.claudeBridge:deps.claudeBridge;
+  const runner=bridge&&(bridge.run||bridge.execute||bridge.invoke);
+  if(typeof runner!=="function") throw new Error("Claude bridge 不可用");
+  const claudeConfig=config.claudeQuery||{};
+  return await runner.call(bridge,{
+    requestId,question:question,context,conversationHistory,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),snapshot,kernel,mcp:mcpSession,mcpSession,signal,onEvent,closeMcp:false,requireApiKey:claudeConfig.requireApiKey??true,requireModel:claudeConfig.requireModel??false,binary:claudeConfig.binary,promptVersion:claudeConfig.promptVersion,timeoutMs:claudeConfig.timeoutMs,maxTurns:claudeConfig.maxTurns,maxBudgetUsd:claudeConfig.maxBudgetUsd,model:claudeConfig.model,mcpFactory:null,
+  });
+}
+
+function snapshotSource(source) { return {id:source.id}; }
+function buildKernelCatalog(context,config) {
+  const tables=context.tables||[];
+  return {tables,columnsByTable:context.columnsByTable||{},relations:context.relations||[],enums:context.enums||{},enumItemsByColumn:context.enumItemsByColumn||{},ontologySchema:context.ontologySchema||null,pages:context.knowledge||[],rules:context.rules||[],policy:{allowedTables:tables.map((table)=>table.tableName),allowedColumns:context.allowedColumns||{},columnKinds:context.columnKinds||{},valueKinds:context.valueKinds||[],allowedRelations:context.relations||[],maxRows:config.queryMaxRows||500,enums:{}}};
+}
+function retrievalSnapshot(context) { return {coverage:context.retrieval?.coverage,retrievalMode:context.retrieval?.retrievalMode}; }
+function redactClaudeBoundaryValue(value,depth=0,seen=new WeakSet()) {
+  if(value==null||typeof value!=="object")return value;
+  if(seen.has(value))return "[Circular]";seen.add(value);
+  if(Array.isArray(value))return value.slice(0,200).map((item)=>redactClaudeBoundaryValue(item,depth+1,seen));
+  const result={};for(const [key,item] of Object.entries(value)){if(['sql','error','reason','query','prompt'].includes(key)&&typeof item==="string")result[key]=redactTypedLiterals(item);else result[key]=redactClaudeBoundaryValue(item,depth+1,seen);}return result;
+}
+
+export const _internal={buildContext,buildSemanticRuntime,planSql,planSemanticQuery,summarize,llmOptions,ensureSummaryConsistency,deterministicAnalyticalConclusion,inferChart,semanticQuestionMatches,normalizeAgentMode,rankingLimitPreflight,selectQueryAgentRollout,contextualRetrievalQuestion,isContextualFollowUp,nextSessionContext,sessionSafeIntent,plannedQuerySpecs,combineQueryRuns,missingExhaustiveAccountTables,scopedKnowledgeOntologyConflicts,refusalMissingAssets,normalizeClaudeMode,selectClaudeQueryRollout,claudeFailureCanFallback,runClaudeQueryBranch};
