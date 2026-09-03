@@ -19,6 +19,7 @@ services:
       WEB_PORT: 3000
       PLATFORM_DB_PATH: /var/lib/ontoquery/data/platform.sqlite
       ONTOLOGY_WIKI_DIR: /var/lib/ontoquery/wiki
+      ONTOLOGY_AI_AUDIT_DIR: /var/lib/ontoquery/data/ontology-generation
     read_only: true
     tmpfs:
       - /tmp:size=128m,mode=1777
