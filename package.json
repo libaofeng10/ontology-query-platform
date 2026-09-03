@@ -17,6 +17,8 @@
     "test": "node --test server/test/*.test.mjs",
     "test:rendered": "node --test tests/rendered-html.test.mjs",
     "eval:loop-v2:readiness": "node scripts/eval-readiness.mjs --manifest examples/evaluation/loop-v2-rock-readonly.candidate.json",
+    "claude:preflight": "node scripts/claude-query-preflight.mjs",
+    "eval:claude:local": "node scripts/claude-query-eval-local.mjs",
     "check": "npm run lint && npm run build && npm run test && npm run test:rendered",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
