@@ -71,6 +71,7 @@ function stubStore({tables,relations}){
   return {
     getSource:(id)=>id===1?{id:1,name:"demo"}:null,
     listTables:()=>tables,
+    excludedTableNames:()=>new Set(),
     listRelations:()=>relations,
     getOntologyDomainPlan:(sourceId)=>savedPlans.get(sourceId)||null,
     upsertOntologyDomainPlan({sourceId,planJson,catalogChecksum,createdBy}){savedPlans.set(sourceId,{sourceId,plan:JSON.parse(planJson),planJson,catalogChecksum,createdBy,createdAt:"2026-08-17 12:00:00"});},

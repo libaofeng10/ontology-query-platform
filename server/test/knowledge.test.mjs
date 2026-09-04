@@ -5,9 +5,63 @@ import { join } from "node:path";
 import test from "node:test";
 import { createKnowledgeService } from "../src/knowledge-service.mjs";
 import { retrieveKnowledge } from "../src/knowledge-retrieval.mjs";
-import { knowledgeIntentConcepts, parseQueryIntent } from "../src/query-intent.mjs";
+import { catalogFilterConcepts, knowledgeIntentConcepts, parseQueryIntent } from "../src/query-intent.mjs";
 import { _internal as serverInternal } from "../src/server.mjs";
 import { createStore } from "../src/store.mjs";
+
+test("单一 Alpha 产品的机构过滤不能混入 AlphaGPT 的同名字段",()=>{
+  const question="查询北京示例律师事务所的 Alpha 账号";
+  const tables=[{tableName:"alpha_user",comment:"Alpha 账号"},{tableName:"alpha_account_user",comment:""},{tableName:"alpha_account",comment:"账号基础表"}];
+  const columnsByTable={
+    alpha_user:[{columnName:"alpha_id",isPrimary:1,dataType:"varchar"},{columnName:"alp_office_name",comment:"Alpha律所名称",dataType:"varchar"}],
+    alpha_account_user:[{columnName:"user_id",isPrimary:1,dataType:"varchar"},{columnName:"office_name",comment:"律所名称",dataType:"varchar"},{columnName:"standard_office_name",comment:"标准律所名称",dataType:"varchar"}],
+    alpha_account:[{columnName:"id",isPrimary:1,dataType:"varchar"}],
+  };
+  const ontologySchema={objectTypes:tables.map((table)=>({apiName:table.tableName,displayName:table.comment,properties:columnsByTable[table.tableName].map((column)=>({apiName:column.columnName,displayName:column.comment||column.columnName,type:"string",mapping:{table:table.tableName,column:column.columnName}}))})),linkTypes:[]};
+  const pages=[
+    {pageType:"term",slug:"alpha-user",title:"Alpha 用户",aliases:["Alpha"],tables:["alpha_user"],content:"Alpha账号使用 alp_office_name；AlphaGPT账号存放在 alpha_account_user",sqlContent:"alpha_user",verified:true},
+    {pageType:"term",slug:"gpt-office",title:"alpha_account_user AlphaGpt律所名称",aliases:["AlphaGpt所属律所"],tables:["alpha_account_user"],content:"按律所名称查用户账号时使用 office_name",sqlContent:"office_name LIKE ?",verified:true},
+    {pageType:"term",slug:"office",title:"律师事务所名称",aliases:[],tables:["alpha_account_user"],content:"机构名称使用 office_name",sqlContent:"office_name LIKE ?",verified:true},
+  ];
+  const intent=parseQueryIntent(question,{filterConcepts:catalogFilterConcepts(tables,columnsByTable,ontologySchema)});
+  const relations=[{id:1,status:"confirmed",fromTable:"alpha_user",fromCol:"alpha_id",toTable:"alpha_account_user",toCol:"user_id"}];
+  const retrieval=retrieveKnowledge({question,pages,tables,columnsByTable,relations,intent,ontologySchema});
+  const filter=retrieval.diagnostics.facets.find((item)=>item.key==="filter:organization_name:0");
+  assert.equal(filter.covered,true,JSON.stringify(filter));
+  assert.deepEqual(filter.executionColumns,["alpha_user.alp_office_name"]);
+  assert.deepEqual(filter.executionTables,["alpha_user"]);
+  assert.equal(filter.authoritativePageKeys.includes("term:gpt-office"),false);
+  assert.deepEqual(retrieval.coverageContract.missing,[]);
+});
+
+test("multi-product organization filters honor each product's verified field definition",()=>{
+  const tables=[{tableName:"alpha_user",comment:"Alpha 账号"},{tableName:"alpha_account_user",comment:"AlphaGPT 账号"}];
+  const columnsByTable={
+    alpha_user:[{columnName:"alpha_id",isPrimary:1},{columnName:"alp_office_name",comment:"Alpha律所名称"}],
+    alpha_account_user:[{columnName:"user_id",isPrimary:1},{columnName:"office_name",comment:"律所名称"},{columnName:"standard_office_name",comment:"标准律所名称"},{columnName:"user_office_name",comment:"用户所属律所"}],
+  };
+  const ontologySchema={objectTypes:tables.map((table)=>({apiName:table.tableName,displayName:table.comment,properties:columnsByTable[table.tableName].map((column)=>({apiName:column.columnName,displayName:column.comment||column.columnName,type:"string",mapping:{table:table.tableName,column:column.columnName}}))})),linkTypes:[]};
+  const page={pageType:"term",slug:"gpt-office",title:"AlphaGPT律所名称",aliases:["律所名称"],tables:["alpha_account_user"],content:"按当前所属律所查询账号使用 user_office_name；office_name 是开通时的律所",sqlContent:"user_office_name LIKE CONCAT('%', ?, '%')",antiExamples:"不要用 office_name 查当前归属",verified:true};
+  const questions=[
+    "北京市百伦律师事务所 帮我查询一下这个所 alpha与 alphaGpt账号的明细",
+    "查询北京市百伦律师事务所的 Alpha 和 AlphaGPT 账号明细",
+    "帮我查询北京市百伦律所 alpha、alphaGPT 的用户明细",
+  ];
+  for(const question of questions) {
+    const intent=parseQueryIntent(question,{filterConcepts:catalogFilterConcepts(tables,columnsByTable,ontologySchema)});
+    const retrieval=retrieveKnowledge({question,pages:[page],tables,columnsByTable,relations:[],intent,ontologySchema});
+    const filter=retrieval.diagnostics.facets.find((item)=>item.key==="filter:organization_name:0");
+    assert.equal(filter?.covered,true,`${question}: ${JSON.stringify(filter)}`);
+    assert.deepEqual(filter.executionColumns.sort(),["alpha_account_user.user_office_name","alpha_user.alp_office_name"]);
+    assert.deepEqual(filter.productScopeIds,["product:alpha","product:alphaGpt"]);
+    assert.deepEqual(retrieval.coverageContract.missing,[]);
+    const withoutDefinition=retrieveKnowledge({question,pages:[],tables,columnsByTable,relations:[],intent,ontologySchema});
+    assert.ok(withoutDefinition.coverageContract.missing.includes("filter:organization_name:0"),"ambiguous siblings still require a definition");
+    const conflict={...page,slug:"conflicting-office",sqlContent:"office_name LIKE ?"};
+    const conflicting=retrieveKnowledge({question,pages:[page,conflict],tables,columnsByTable,relations:[],intent,ontologySchema});
+    assert.ok(conflicting.coverageContract.missing.includes("filter:organization_name:0"),"conflicting definitions cannot silently choose a column");
+  }
+});
 
 test("knowledge service persists validated term pages to SQLite and Markdown", async()=>{
   const dir=await mkdtemp(join(tmpdir(),"ontoquery-knowledge-"));

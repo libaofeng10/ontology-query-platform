@@ -58,6 +58,53 @@ test("MCP JSON-RPC exposes only the two tools and authenticates HTTP-shaped call
   } finally { await session.close(); }
 });
 
+test("MCP streams concurrent calls immediately and preserves invocation order in history", async () => {
+  const events = [];
+  const slowQuery = Promise.withResolvers();
+  const session = await createClaudeQueryMcpSession({
+    snapshot: snapshot(), listen: false, initialDisclosedTables: ["customer"],
+    onEvent: (event) => events.push(event),
+    executeFn: async ({ name }) => {
+      if (name === "slow") await slowQuery.promise;
+      return { rows: [{ id: 1 }], fields: ["id"] };
+    },
+  });
+  try {
+    const slow = session.callTool("db_query", { name: "slow", sql: "SELECT id FROM customer" });
+    const fast = session.callTool("db_query", { name: "fast", sql: "SELECT id FROM customer" });
+    assert.deepEqual(events.map(({ type, step }) => [type, step]), [["tool_call", 1], ["tool_call", 2]]);
+    assert.equal((await fast).ok, true);
+    assert.equal(events.at(-1).step, 2);
+    slowQuery.resolve();
+    assert.equal((await slow).ok, true);
+    assert.deepEqual(session.getTrace().map((item) => item.step), [1, 2]);
+    assert.deepEqual(events.filter((item) => item.type === "tool_result").map((item) => item.step), [2, 1]);
+  } finally { slowQuery.resolve(); await session.close(); }
+});
+
+test("MCP reports rejected tools and observer failures cannot change execution results", async () => {
+  const events = [];
+  let executions = 0;
+  const session = await createClaudeQueryMcpSession({
+    snapshot: snapshot(), listen: false, initialDisclosedTables: ["customer"],
+    onEvent: (event) => { events.push(event); throw new Error("client disconnected"); },
+    executeFn: async () => { executions++; return { rows: [], fields: ["id"] }; },
+  });
+  try {
+    const denied = await session.callTool("db_query", { sql: "DELETE FROM customer" });
+    assert.equal(denied.errorCode, "READ_ONLY_REQUIRED");
+    assert.equal(events.at(-1).type, "tool_result");
+    assert.equal(events.at(-1).ok, false);
+    assert.equal(events.at(-1).errorCode, "READ_ONLY_REQUIRED");
+    assert.match(events.at(-1).summary, /SELECT/);
+    assert.equal(executions, 0);
+    assert.equal((await session.callTool("db_query", { sql: "SELECT id FROM customer" })).ok, true);
+    assert.equal(executions, 1);
+    assert.equal(events.at(-1).ok, true);
+    assert.match(session.getTrace()[1].summary, /0 行/);
+  } finally { await session.close(); }
+});
+
 test("MCP blocks unknown tables and writes before invoking the kernel", async () => {
   let calls = 0;
   const session = await createClaudeQueryMcpSession({ snapshot: snapshot(), listen: false, initialDisclosedTables: ["customer"], executeFn: async () => { calls++; return { rows: [], fields: [] }; } });

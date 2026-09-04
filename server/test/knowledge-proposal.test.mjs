@@ -51,8 +51,8 @@ test("unknown columns, bad operators and time literals are rejected at compositi
   assert.equal(_internal.composeDraftPage({...base,table:"crm_clue",numerator:{aggregation:"count",column:"clue_id",predicates:[{column:"is_win_order",operator:"LIKE",value:"1"}]}},{sourceId:1,assetLabel:"成交率",shortlist}),null);
   assert.equal(_internal.composeDraftPage({...base,table:"crm_clue",numerator:{aggregation:"count",column:"clue_id",predicates:[{column:"order_time",operator:">",value:"2026-01-01"}]}},{sourceId:1,assetLabel:"成交率",shortlist}),null);
   assert.equal(_internal.composeDraftPage({...base,table:"ghost_table",numerator:{aggregation:"count",column:"clue_id",predicates:[]}},{sourceId:1,assetLabel:"成交率",shortlist}),null);
-  // The sensitive column is not in the shortlist column whitelist either.
-  assert.equal(_internal.composeDraftPage({...base,table:"crm_clue",numerator:{aggregation:"count",column:"owner_cell",predicates:[]}},{sourceId:1,assetLabel:"成交率",shortlist}),null);
+  // Historical sensitivity flags do not remove an existing catalog field.
+  assert.ok(_internal.composeDraftPage({...base,table:"crm_clue",numerator:{aggregation:"count",column:"owner_cell",predicates:[]}},{sourceId:1,assetLabel:"成交率",shortlist}));
 });
 
 test("a hand-written OR predicate fails validation even if composition is bypassed",()=>{
@@ -65,7 +65,7 @@ test("a hand-written OR predicate fails validation even if composition is bypass
   assert.equal(verdict.reason,"predicate_unsupported");
 });
 
-test("shortlist excludes sensitive columns and tags event, identity and time roles",()=>{
+test("shortlist keeps all catalog columns and tags event, identity and time roles",()=>{
   const shortlist=_internal.shortlistCandidates(contextFixture());
   assert.equal(shortlist.tables.length,1);
   const [table]=shortlist.tables;
@@ -73,8 +73,8 @@ test("shortlist excludes sensitive columns and tags event, identity and time rol
   assert.deepEqual(table.numeratorEvents.map((column)=>column.columnName),["is_win_order","order_time"]);
   assert.deepEqual(table.identities.map((column)=>column.columnName),["clue_id"]);
   assert.deepEqual(table.timeColumns.map((column)=>column.columnName),["order_time","create_time"]);
-  assert.equal(table.columns.includes("owner_cell"),false);
-  assert.doesNotMatch(JSON.stringify(shortlist),/owner_cell/);
+  assert.equal(table.columns.includes("owner_cell"),true);
+  assert.match(JSON.stringify(shortlist),/owner_cell/);
 });
 
 test("unimplemented kinds return null without throwing and without calling the LLM",async()=>{

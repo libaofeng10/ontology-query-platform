@@ -37,6 +37,21 @@ test("知识-本体冲突：模型已映射表中缺失被引用字段时报冲�
   assert.equal(findKnowledgeOntologyConflicts([{...page,verified:false}],columnsByTable,schemaMappedColumns({objectTypes:[]})).length,0);
 });
 
+test("知识页的对象名称不能仅凭包含关系与其 ID 属性形成硬冲突", () => {
+  const columns={alpha_user:[{columnName:"alpha_id"},{columnName:"alp_office_name"}]};
+  const page={verified:true,pageType:"term",slug:"alpha-user",title:"Alpha 用户",aliases:["Alpha"],tables:["alpha_user"],content:"Alpha账号使用 alpha_user.alp_office_name",sqlContent:"alpha_user"};
+  const schema={objectTypes:[{apiName:"alpha_user_profile",properties:[
+    {apiName:"alpha_id",displayName:"Alpha用户ID",mapping:{table:"alpha_user",column:"alpha_id"}},
+    {apiName:"office_name",displayName:"Alpha律所名称",mapping:{table:"alpha_user",column:"alp_office_name"}},
+  ]}]};
+  assert.deepEqual(findKnowledgeOntologyMappingConflicts([page],columns,schema),[]);
+});
+
+test("知识字段引用保留历史标记为敏感的手机号", () => {
+  const page={tables:["alpha_account_user"],sqlContent:"alpha_account_user.phone"};
+  assert.deepEqual(extractKnowledgeColumnRefs(page,columnsByTable),[{table:"alpha_account_user",column:"phone"}]);
+});
+
 test("查询期硬冲突要求同一属性概念的正向映射证据，anti 与 join 引用不升级",()=>{
   const schema={objectTypes:[{apiName:"alpha_product_account",properties:[
     {apiName:"office_name",displayName:"律所名称",mapping:{table:"alpha_account_user",column:"office_name"}},

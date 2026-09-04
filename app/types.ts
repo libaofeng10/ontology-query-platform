@@ -19,12 +19,12 @@ export type SemanticQueryPath = {
   rootObject:string; objects:string[]; links:string[];
   relations:Array<{id:number;fromTable:string;fromCol:string;toTable:string;toCol:string}>;
 };
-export type QueryToolTrace = { tool:string; phase?:string; thought:string; argsHash:string; durationMs:number; ok:boolean; summary:string; stage?:string; errorCode?:string; failureClass?:string; retryable?:boolean; sql?:string; pages?:string[]; tables?:Array<{name:string;fieldCount:number}>; sample?:{table:string;columns:string[]}; entity?:{type:string;value:string;candidateCount:number} };
+export type QueryToolTrace = { tool:string; step?:number; operation?:string; detail?:string; phase?:string; thought:string; argsHash:string; durationMs:number; ok:boolean; summary:string; stage?:string; errorCode?:string; failureClass?:string; retryable?:boolean; sql?:string; pages?:string[]; tables?:Array<{name:string;fieldCount:number}>; sample?:{table:string;columns:string[]}; entity?:{type:string;value:string;candidateCount:number} };
 export type QueryStreamEvent =
   | {type:"step";step:number;status:"started"|"completed"|"failed";durationMs?:number}
   | {type:"thought";step:number;text:string}
-  | {type:"tool_call";step:number;tool:string;sql?:string;tables?:string[];sample?:{table:string;columns:string[]}}
-  | {type:"tool_result";step:number;tool:string;ok:boolean;summary:string;durationMs:number;sql?:string;pages?:string[];tables?:Array<{name:string;fieldCount:number}>;sample?:{table:string;columns:string[]}}
+  | {type:"tool_call";step:number;tool:string;thought?:string;detail?:string;operation?:string;sql?:string;tables?:string[];sample?:{table:string;columns:string[]}}
+  | {type:"tool_result";step:number;tool:string;ok:boolean;summary:string;durationMs:number;thought?:string;detail?:string;operation?:string;sql?:string;pages?:string[];tables?:Array<{name:string;fieldCount:number}>;sample?:{table:string;columns:string[]}}
   | {type:"final"|"refused"|"clarification";result:QueryResponse};
 export type Evidence = {
   pages:string[]; rules:string[]; tables:string[]; joins?:string[]; sql:string; durationMs:number; scannedRows:number;

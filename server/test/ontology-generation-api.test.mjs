@@ -9,7 +9,7 @@ import { evalSetChecksum } from "../src/evaluation-evidence.mjs";
 import { ontologyCatalogChecksum } from "../src/ontology-candidate-service.mjs";
 import { scoreOntologyCandidate } from "../src/ontology-candidate-score.mjs";
 
-test("generation scope API uses server budgets, relation components, and sensitive-endpoint filtering",async()=>{
+test("generation scope API uses server budgets and keeps historically sensitive endpoints",async()=>{
   const root=await mkdtemp(join(tmpdir(),"ontoquery-generation-scope-api-"));
   const app=createApp({
     dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"generation-scope-api-secret",
@@ -25,8 +25,8 @@ test("generation scope API uses server budgets, relation components, and sensiti
     assert.equal(limits.status,200);assert.deepEqual(limits.body.limits,{maxTables:3,maxFields:5});assert.equal(limits.body.batchCount,0);
     app.store.upsertRelation({sourceId:source.id,fromTable:"crm_customer",fromCol:"mobile",toTable:"sales_refund",toCol:"refund_id",cardinality:"N:1",confidence:1,status:"confirmed"});
     const planned=await api(app,"/api/ontology/generation-scope","editor-token",{sourceId:source.id,tableNames:["crm_customer","sales_refund"]});
-    assert.equal(planned.status,200);assert.equal(planned.body.batchCount,2);assert.equal(planned.body.truncatedFieldCount,2);
-    assert.equal(planned.body.confirmedRelationCount,0);assert.equal(planned.body.excludedSensitiveRelationCount,1);
+    assert.equal(planned.status,200);assert.equal(planned.body.batchCount,2);assert.equal(planned.body.truncatedFieldCount,3);
+    assert.equal(planned.body.confirmedRelationCount,1);assert.equal(planned.body.excludedSensitiveRelationCount,0);
     assert.ok(planned.body.batches.every((batch)=>batch.fieldCount<=5));
   } finally { await app.close(); }
 });
@@ -95,7 +95,7 @@ test("generation API isolates candidates by source and audits failed model outpu
   } finally { await app.close(); }
 });
 
-test("generation task uses the configured JSON LLM client without sending sensitive columns",async()=>{
+test("generation task sends all selected catalog columns to the configured JSON LLM client",async()=>{
   const root=await mkdtemp(join(tmpdir(),"ontoquery-generation-api-llm-"));let requestBody=null;
   const llmFetchImpl=async(_url,init)=>{
     requestBody=JSON.parse(init.body);
@@ -111,7 +111,7 @@ test("generation task uses the configured JSON LLM client without sending sensit
     const created=await api(app,"/api/ontology/generation-runs","editor-token",{sourceId:source.id,tableNames:["crm_customer"],domainName:"客户"});
     const task=await waitForTask(app,created.body.taskId);assert.equal(task.status,"succeeded",task.error);
     assert.equal(requestBody.model,"object-model");assert.deepEqual(requestBody.response_format,{type:"json_object"});
-    const prompt=JSON.stringify(requestBody.messages);assert.match(prompt,/customer_id/);assert.doesNotMatch(prompt,/mobile|手机号/);
+    const prompt=JSON.stringify(requestBody.messages);assert.match(prompt,/customer_id/);assert.match(prompt,/mobile|手机号/);
     const candidates=app.store.listOntologyCandidates({runId:created.body.id});assert.equal(candidates.length,1);assert.equal(candidates[0].payload.apiName,"customer_profile");assert.equal(candidates[0].payload.properties[0].mapping.table,"crm_customer");
     const run=app.store.getOntologyGenerationRun(created.body.id);assert.equal(run.tokenUsage.totalTokens,30);assert.equal(run.summary.modelCalls[0].traceStored,true);assert.equal(run.summary.objectCoveredTableCount,1);assert.equal(run.summary.objectMissingTableCount,0);
     assert.equal((await api(app,`/api/ontology/generation-runs/${run.id}/traces`,"viewer-token",null,"GET")).status,403);

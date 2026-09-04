@@ -70,7 +70,7 @@ function shortlistCandidates(context) {
   const confirmedRelations=(context?.relations||[]).filter((relation)=>relation.status==="confirmed");
   const tables=[];
   for(const tableName of ordered) {
-    const columns=(context?.columns?.[tableName]||context?.allColumns?.[tableName]||[]).filter((column)=>!column.isSensitive);
+    const columns=(context?.columns?.[tableName]||context?.allColumns?.[tableName]||[]);
     if(!columns.length)continue;
     const describe=(column)=>`${column.columnName} ${column.comment||""}`;
     const numeratorEvents=columns.filter((column)=>NUMERATOR_EVENT_TERMS.some((term)=>term.pattern.test(describe(column)))).map((column)=>({columnName:column.columnName,dataType:column.dataType,comment:clip(column.comment,120)}));

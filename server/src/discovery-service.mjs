@@ -69,9 +69,8 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
       const probedColumns=probeResults.get(table.tableName)?.columns || columnsByTable[table.tableName] || [];
       for(const column of probedColumns) {
         // 2026-09-04 应用户要求移除敏感列逻辑：发现阶段不再自动推断 isSensitive。
-        const sensitive=column.isSensitive != null ? Boolean(column.isSensitive) : false;
-        store.upsertColumn({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,dataType:column.dataType,nullable:column.nullable==="YES"?1:Number(column.nullable??1),nullRate:column.nullRate??null,cardinality:column.cardinality??null,isSensitive:sensitive?1:0,comment:column.comment||null,isPrimary:Number(column.isPrimary||0),isUnique:Number(column.isUnique||0),isIndexed:Number(column.isIndexed||0)});
-        if(column.profile&&!sensitive)store.upsertColumnProfile({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,...column.profile,sampledAt:new Date().toISOString()});
+        store.upsertColumn({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,dataType:column.dataType,nullable:column.nullable==="YES"?1:Number(column.nullable??1),nullRate:column.nullRate??null,cardinality:column.cardinality??null,isSensitive:0,comment:column.comment||null,isPrimary:Number(column.isPrimary||0),isUnique:Number(column.isUnique||0),isIndexed:Number(column.isIndexed||0)});
+        if(column.profile)store.upsertColumnProfile({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,...column.profile,sampledAt:new Date().toISOString()});
         for(const value of column.enums||[]) store.upsertEnum({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,...value});
       }
     }
@@ -182,7 +181,7 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
   function summary(sourceId) {
     const tables=store.listTables(sourceId);
     const relations=store.listRelations(sourceId);
-    return {sourceId,tables,totalTables:tables.length,grades:Object.fromEntries(["A","B","C"].map((grade)=>[grade,tables.filter((table)=>table.grade===grade).length])),sensitiveFields:tables.reduce((sum,table)=>sum+store.listColumns(sourceId,table.tableName).filter((column)=>column.isSensitive).length,0),relations:relations.length,pendingQuestions:store.listQuestions(sourceId).length,relationDiscovery:store.relationStats(sourceId)};
+    return {sourceId,tables,totalTables:tables.length,grades:Object.fromEntries(["A","B","C"].map((grade)=>[grade,tables.filter((table)=>table.grade===grade).length])),sensitiveFields:0,relations:relations.length,pendingQuestions:store.listQuestions(sourceId).length,relationDiscovery:store.relationStats(sourceId)};
   }
 
   function demoSchema(sourceId) { const tables=store.listTables(sourceId); return normalizeSchema({tables,columns:tables.flatMap((table)=>store.listColumns(sourceId,table.tableName)),foreignKeys:store.listRelations(sourceId).map((item)=>({...item}))}); }

@@ -1,9 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { FormEvent } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { ApiError, answerQuestion, archiveEvalCase, askQuestion, continueQuestion, createQuerySession, createSource, deleteQuerySession, discoverSource, getBootstrap, getQuerySession, getTask, listCapabilityGaps, listQuerySessions, previewSourceTables, rotateSourceCredential, runAgentEvaluationGate, runEvaluation, runEvaluationGate, saveEvalCase, saveKnowledge, saveTableSelections, setApiToken, setTableGrade, syncKnowledge, testSource } from "./api";
-import { DataChart, formatCompact } from "./chart";
+import { DataChart } from "./chart";
 import { QUERY_SUGGESTIONS } from "./demo-data";
 import { coverageByType, missingAssetLines } from "./knowledge-coverage.mjs";
 import { Icon, type IconName } from "./icons";
@@ -14,7 +14,7 @@ import { RelationDocumentPanel } from "./relation-document-panel";
 import type { AuditRecord, BackgroundTask, BootstrapData, CapabilityGap, CapabilityGapBoard, DataSource, DiscoverySummary, EvalCase, EvalInput, EvalRun, EvaluationGate, EvaluationSummary, KnowledgeInput, KnowledgePage, NavId, OntologyQuestion, QueryAnswer, QueryClarification, QueryRefusal, QuerySession, QuerySessionDetail, QueryStreamEvent, QueryToolTrace, SchemaSnapshot, SourceInput, TableSelectionRow } from "./types";
 
 const NAV_ITEMS:{id:NavId;label:string;hint:string}[]=[
-  {id:"query",label:"问数工作台",hint:"自然语言分析"},{id:"sources",label:"数据源",hint:"连接与只读校验"},
+  {id:"query",label:"AI 问答",hint:"与业务数据对话"},{id:"sources",label:"数据源",hint:"连接与只读校验"},
   {id:"discovery",label:"数据探查",hint:"结构与分级"},{id:"questions",label:"消歧队列",hint:"证据驱动确认"},
   {id:"modeling",label:"业务对象建模",hint:"对象、属性与关系"},{id:"knowledge",label:"知识资产",hint:"本体与口径"},{id:"graph",label:"本体图谱",hint:"关系与语义网络"},{id:"evaluation",label:"评测中心",hint:"准确率回归"},{id:"audit",label:"审计日志",hint:"全链路追溯"},
   {id:"settings",label:"设置中心",hint:"模型与检索参数"},
@@ -56,11 +56,11 @@ export function PlatformApp(){
     </aside>
     {mobileNav&&<button className="nav-backdrop" aria-label="关闭导航" onClick={()=>setMobileNav(false)}/>}
 
-    <main className="workspace">
+    <main className={active==="query"?"workspace chat-workspace":"workspace"}>
       <header className="topbar"><button className="mobile-menu" aria-label="打开导航" onClick={()=>setMobileNav(true)}><Icon name="menu"/></button><div><span className="crumb">工作空间</span><span className="slash">/</span><strong>{NAV_ITEMS.find((item)=>item.id===active)?.label}</strong></div><div className="top-actions">{data?.sources.length?<select className="source-select" aria-label="切换数据源" value={selectedSourceId} onChange={(event)=>void selectSource(Number(event.target.value))}>{data.sources.map((source)=><option value={source.id} key={source.id}>{source.name} · {source.dbName}</option>)}</select>:null}<span className="env-pill"><span className={selectedSource?.lastTestOk===0?"status-dot offline":"status-dot"}/>{data?.identity?.name||"已认证"} · {data?.identity?.role||"viewer"}</span><div className="avatar">{(data?.identity?.name||"OQ").slice(0,2).toUpperCase()}</div></div></header>
       {error&&<div className="global-error"><Icon name="shield"/><span>{error}</span><button onClick={()=>void load(selectedSourceId)}>重试</button></div>}
       {loading&&!data?<LoadingState/>:<>
-        {active==="query"&&<QueryWorkspace key={selectedSourceId} source={selectedSource} knowledge={data?.knowledge||[]} role={data?.identity?.role||"viewer"} onNavigate={setActive} onCreateKnowledge={(prefill)=>{setKnowledgePrefill(prefill);setActive("knowledge");}}/>}
+        {active==="query"&&<QueryWorkspace key={selectedSourceId} source={selectedSource} role={data?.identity?.role||"viewer"} onNavigate={setActive} onCreateKnowledge={(prefill)=>{setKnowledgePrefill(prefill);setActive("knowledge");}}/>}
         {active==="sources"&&<SourcesWorkspace sources={data?.sources||[]} selectedId={selectedSourceId} onSelect={selectSource} onRefresh={refresh}/>} 
         {active==="discovery"&&<DiscoveryWorkspace key={selectedSourceId} source={selectedSource} discovery={data?.discovery||null} tasks={data?.tasks||[]} snapshots={data?.schemaSnapshots||[]} onRefresh={refresh}/>} 
         {active==="questions"&&<><RelationDocumentPanel sourceId={selectedSourceId} role={data?.identity.role||"viewer"} onRefresh={refresh}/><QuestionsWorkspace items={data?.questions||[]} onRefresh={refresh}/></>} 
@@ -78,7 +78,7 @@ export function PlatformApp(){
 function LoadingState(){return <div className="loading-state"><span className="mini-loader"/><h2>正在读取平台状态</h2><p>这里只显示 SQLite 与数据源返回的真实数据。</p></div>;}
 function LoginState({error,onLogin}:{error:string|null;onLogin:(token:string)=>Promise<void>}){const [token,setToken]=useState("");const [loading,setLoading]=useState(false);return <main className="login-page"><form className="panel login-card" onSubmit={(event)=>{event.preventDefault();setLoading(true);void onLogin(token).finally(()=>setLoading(false));}}><div className="brand-mark"><span/><span/><span/></div><span className="section-kicker">OntoQuery 安全入口</span><h1>输入 API 身份令牌</h1><p>令牌只保存在当前浏览器标签页的 sessionStorage；服务端据此应用角色和数据源权限。</p>{error&&<Notice tone="danger" title="认证失败" body={error}/>}<Field label="Bearer Token"><input type="password" autoComplete="current-password" value={token} onChange={(event)=>setToken(event.target.value)} placeholder="粘贴管理员、编辑者或分析师令牌"/></Field><button className="primary-button" type="submit" disabled={!token.trim()||loading}>{loading?"验证中…":"进入工作空间"}</button></form></main>;}
 
-function QueryWorkspace({source,knowledge,role,onNavigate,onCreateKnowledge}:{source:DataSource|null;knowledge:KnowledgePage[];role:string;onNavigate:(id:NavId)=>void;onCreateKnowledge:(prefill:KnowledgePrefill)=>void}){
+function QueryWorkspace({source,role,onNavigate,onCreateKnowledge}:{source:DataSource|null;role:string;onNavigate:(id:NavId)=>void;onCreateKnowledge:(prefill:KnowledgePrefill)=>void}){
   const [input,setInput]=useState("");
   const [sessions,setSessions]=useState<QuerySession[]>([]);
   const [detail,setDetail]=useState<QuerySessionDetail|null>(null);
@@ -86,12 +86,18 @@ function QueryWorkspace({source,knowledge,role,onNavigate,onCreateKnowledge}:{so
   const [failure,setFailure]=useState<string|null>(null);
   const [loading,setLoading]=useState(false);
   const [sessionLoading,setSessionLoading]=useState(true);
+  const [historyOpen,setHistoryOpen]=useState(false);
   const [liveQuestion,setLiveQuestion]=useState<string|null>(null);
   const [liveSteps,setLiveSteps]=useState<LiveQueryStep[]>([]);
+  const [liveReplies,setLiveReplies]=useState<Array<{question:string;answer:string}>>([]);
   const [clarification,setClarification]=useState<QueryClarification|null>(null);
   const streamController=useRef<AbortController|null>(null);
-  const coverage=useMemo(()=>coverageByType(knowledge),[knowledge]);
+  const scrollRef=useRef<HTMLDivElement|null>(null);
+  const inputRef=useRef<HTMLTextAreaElement|null>(null);
+  const followLatest=useRef(true);
   const suggestions=source?.isDemo?QUERY_SUGGESTIONS:[];
+  const hasMessages=Boolean(detail?.messages.length||liveQuestion);
+  const needsOption=Boolean(clarification&&!clarification.clarification.allowFreeText);
 
   useEffect(()=>{
     if(!source)return;
@@ -107,6 +113,19 @@ function QueryWorkspace({source,knowledge,role,onNavigate,onCreateKnowledge}:{so
     return()=>{cancelled=true;};
   },[source]);
   useEffect(()=>()=>streamController.current?.abort(),[]);
+  useEffect(()=>{
+    if(!historyOpen)return;
+    const closeOnEscape=(event:KeyboardEvent)=>{if(event.key==="Escape")setHistoryOpen(false);};
+    window.addEventListener("keydown",closeOnEscape);
+    return()=>window.removeEventListener("keydown",closeOnEscape);
+  },[historyOpen]);
+  useEffect(()=>{
+    const field=inputRef.current;
+    if(field){field.style.height="auto";field.style.height=`${Math.min(field.scrollHeight,176)}px`;}
+  },[input]);
+  useEffect(()=>{
+    if(followLatest.current&&scrollRef.current)scrollRef.current.scrollTop=scrollRef.current.scrollHeight;
+  },[sessionId,detail?.messages.length,liveQuestion,liveSteps,clarification,liveReplies]);
 
   async function refreshConversation(preferredId?:string){
     if(!source)return;
@@ -117,90 +136,148 @@ function QueryWorkspace({source,knowledge,role,onNavigate,onCreateKnowledge}:{so
   }
   function restorePending(selected:QuerySessionDetail){
     const pending=selected.pendingClarification;
+    setLiveReplies([]);
     if(!pending){setClarification(null);setLiveQuestion(null);setLiveSteps([]);return;}
     setClarification(pending.response);setLiveQuestion(pending.question);
-    setLiveSteps((pending.response.toolTrace||[]).map((item,index)=>({step:index+1,thought:item.thought,tool:item.tool,status:item.ok?"succeeded" as const:"failed" as const,summary:item.summary,durationMs:item.durationMs,sql:item.sql})));
+    setLiveSteps(traceSteps(pending.response.toolTrace));
   }
-  async function selectSession(id:string){if(loading||id===sessionId)return;setSessionLoading(true);setFailure(null);setClarification(null);setLiveQuestion(null);setLiveSteps([]);try{const selected=await getQuerySession(id);setSessionId(id);setDetail(selected);setInput("");restorePending(selected);}catch(cause){setFailure(errorMessage(cause));}finally{setSessionLoading(false);}}
-  async function newSession(){if(!source||loading)return;setSessionLoading(true);setFailure(null);setClarification(null);setLiveQuestion(null);setLiveSteps([]);try{const created=await createQuerySession(source.id);await refreshConversation(created.id);setInput("");}catch(cause){setFailure(errorMessage(cause));}finally{setSessionLoading(false);}}
-  async function removeSession(id:string){if(loading)return;setSessionLoading(true);setFailure(null);if(id===sessionId){setClarification(null);setLiveQuestion(null);setLiveSteps([]);}try{await deleteQuerySession(id);const remaining=sessions.filter((item)=>item.id!==id);setSessions(remaining);if(id===sessionId){const next=remaining[0];if(next){const selected=await getQuerySession(next.id);setSessionId(next.id);setDetail(selected);}else{setSessionId(undefined);setDetail(null);}}}catch(cause){setFailure(errorMessage(cause));}finally{setSessionLoading(false);}}
+  async function selectSession(id:string){
+    if(loading||sessionLoading||id===sessionId){setHistoryOpen(false);return;}
+    setSessionLoading(true);setFailure(null);
+    try{const selected=await getQuerySession(id);followLatest.current=true;setSessionId(id);setDetail(selected);setInput("");restorePending(selected);setHistoryOpen(false);}
+    catch(cause){setFailure(errorMessage(cause));}finally{setSessionLoading(false);}
+  }
+  async function newSession(){
+    if(!source||loading||sessionLoading)return;
+    setSessionLoading(true);setFailure(null);
+    try{const created=await createQuerySession(source.id);followLatest.current=true;await refreshConversation(created.id);setInput("");setHistoryOpen(false);}
+    catch(cause){setFailure(errorMessage(cause));}finally{setSessionLoading(false);inputRef.current?.focus();}
+  }
+  async function removeSession(id:string){
+    if(loading||sessionLoading)return;
+    setSessionLoading(true);setFailure(null);
+    try{
+      await deleteQuerySession(id);const remaining=sessions.filter((item)=>item.id!==id);setSessions(remaining);
+      if(id===sessionId){const next=remaining[0];followLatest.current=true;if(next){const selected=await getQuerySession(next.id);setSessionId(next.id);setDetail(selected);restorePending(selected);}else{setSessionId(undefined);setDetail(null);setClarification(null);setLiveQuestion(null);setLiveSteps([]);setLiveReplies([]);}setInput("");}
+    }catch(cause){setFailure(errorMessage(cause));}finally{setSessionLoading(false);}
+  }
   function handleStreamEvent(event:QueryStreamEvent){
+    if(event.type==="clarification"&&"clarification" in event.result)setLiveSteps(traceSteps(event.result.toolTrace));
     if(event.type==="final"||event.type==="refused"||event.type==="clarification")return;
     setLiveSteps((current)=>updateLiveSteps(current,event));
   }
   async function submit(question=input.trim()){
-    if(!question||loading||!source||clarification)return;
+    if(!question||loading||streamController.current||sessionLoading||!source)return;
+    if(clarification){await answerClarification(question);return;}
     const controller=new AbortController();streamController.current=controller;
-    let keepLive=false;setInput(question);setLoading(true);setFailure(null);setLiveQuestion(question);setLiveSteps([]);
-    try{const result=await askQuestion(question,source.id,sessionId,{onEvent:handleStreamEvent,signal:controller.signal});setInput("");if("clarification" in result){keepLive=true;setClarification(result);setSessionId(result.sessionId);}else await refreshConversation(result.sessionId);}
-    catch(cause){setFailure(errorMessage(cause));}
+    let keepLive=false;followLatest.current=true;setInput("");setLoading(true);setFailure(null);setLiveQuestion(question);setLiveSteps([]);setLiveReplies([]);
+    try{const result=await askQuestion(question,source.id,sessionId,{onEvent:handleStreamEvent,signal:controller.signal});if("clarification" in result){keepLive=true;setClarification(result);setSessionId(result.sessionId);}else await refreshConversation(result.sessionId);}
+    catch(cause){if(!controller.signal.aborted)setFailure(errorMessage(cause));setInput(question);}
     finally{if(streamController.current===controller)streamController.current=null;setLoading(false);if(!keepLive){setLiveQuestion(null);setLiveSteps([]);}}
   }
   async function answerClarification(answer:string){
-    if(!answer.trim()||loading||!source||!clarification)return;
-    const current=clarification;const controller=new AbortController();streamController.current=controller;let keepLive=false;
-    setLoading(true);setFailure(null);
-    try{const result=await continueQuestion(answer.trim(),source.id,current.sessionId,current.clarification.pendingId,{onEvent:handleStreamEvent,signal:controller.signal});if("clarification" in result){keepLive=true;setClarification(result);}else{setClarification(null);await refreshConversation(result.sessionId);}}
-    catch(cause){const expired=cause instanceof ApiError&&[404,410].includes(cause.status);keepLive=!expired;if(expired)setClarification(null);setFailure(errorMessage(cause));}
-    finally{if(streamController.current===controller)streamController.current=null;setLoading(false);if(!keepLive){setLiveQuestion(null);setLiveSteps([]);}}
+    if(!answer.trim()||loading||streamController.current||!source||!clarification)return;
+    const current=clarification;
+    if(!current.clarification.allowFreeText&&!current.clarification.options.includes(answer.trim()))return;
+    const controller=new AbortController();streamController.current=controller;let keepLive=false;
+    followLatest.current=true;setLoading(true);setFailure(null);setInput("");setClarification(null);
+    setLiveReplies((items)=>[...items,{question:current.clarification.question,answer:answer.trim()}]);
+    try{const result=await continueQuestion(answer.trim(),source.id,current.sessionId,current.clarification.pendingId,{onEvent:handleStreamEvent,signal:controller.signal});if("clarification" in result){keepLive=true;setClarification(result);}else await refreshConversation(result.sessionId);}
+    catch(cause){const expired=controller.signal.aborted||(cause instanceof ApiError&&[404,410].includes(cause.status));keepLive=!expired;if(!expired){setClarification(current);setLiveReplies((items)=>items.slice(0,-1));}if(!controller.signal.aborted)setFailure(errorMessage(cause));setInput(answer);}
+    finally{if(streamController.current===controller)streamController.current=null;setLoading(false);if(!keepLive){setLiveQuestion(null);setLiveSteps([]);setLiveReplies([]);}}
   }
-  const assistantMessages=detail?.messages.filter((message)=>message.role==="assistant"&&isQueryResponse(message.content))||[];
-  const lastAssistantId=assistantMessages.at(-1)?.id;
 
-  return <div className="content query-page query-conversation-page"><div className="query-conversation-layout">
-    <aside className="query-session-panel panel"><div className="query-session-head"><div><span className="section-kicker">会话记录</span><strong>{sessions.length} 个会话</strong></div><button onClick={()=>void newSession()} disabled={!source||loading||sessionLoading}><Icon name="plus" size={15}/>新会话</button></div><div className="query-session-list">{sessionLoading&&!sessions.length?<div className="session-loading"><span className="mini-loader"/>读取会话…</div>:sessions.length?sessions.map((item)=><article className={item.id===sessionId?"active":""} key={item.id}><button className="session-select" onClick={()=>void selectSession(item.id)}><strong>{item.title}</strong><small>{formatDate(item.updatedAt,"—")} · {item.messageCount} 条消息</small></button><button className="session-delete" aria-label={`删除会话 ${item.title}`} onClick={()=>void removeSession(item.id)} disabled={loading}><Icon name="trash" size={13}/></button></article>):<div className="session-empty"><Icon name="message" size={23}/><span>还没有历史会话</span><small>首次提问会自动创建</small></div>}</div></aside>
-    <div className="query-conversation-main"><section className="query-hero"><div className="eyebrow"><span className="pulse"/>已验证知识：术语 {coverage.term.verified} · <span className={coverage.metric.verified===0?"coverage-alert":undefined}>指标 {coverage.metric.verified}{coverage.metric.verified===0?"（缺失）":""}</span> · JOIN {coverage.join.verified} · 规则 {coverage.rule.verified} · {source?.name||"未选择数据源"}</div><h1>想了解什么业务数据？</h1><p>系统只使用当前数据源的已确认本体和安全 JOIN；当前会话的最近对话会用于理解追问。</p><form className="ask-box" onSubmit={(event)=>{event.preventDefault();void submit();}}><Icon name="spark" size={22}/><textarea aria-label="输入业务问题" value={input} onChange={(event)=>setInput(event.target.value)} placeholder={clarification?"请先回答下方的业务口径问题":source?"输入已建模的业务问题":"请先配置并选择数据源"} rows={1} disabled={!source||Boolean(clarification)} onKeyDown={(event)=>{if(event.key==="Enter"&&!event.shiftKey){event.preventDefault();void submit();}}}/><div className="ask-footer"><span>{clarification?"Agent 正在等待一次业务澄清":sessionId?"在当前会话中继续 · Enter 发送":"将自动创建新会话 · Enter 发送"}</span><button type="submit" disabled={!input.trim()||loading||!source||Boolean(clarification)}>{loading?<span className="mini-loader"/>:<><span>开始分析</span><Icon name="send" size={16}/></>}</button></div></form>{suggestions.length>0&&<div className="suggestions"><span>演示问题</span>{suggestions.map((question)=><button key={question} onClick={()=>void submit(question)}>{question}<Icon name="arrow" size={14}/></button>)}</div>}</section>
-      {failure&&<Notice tone="danger" title="会话操作失败" body={failure}/>} 
-      <section className={`query-turns ${sessionLoading?"loading":""}`} aria-live="polite">{detail?.messages.length?detail.messages.map((message)=>message.role==="user"?<article className="query-user-turn" key={message.id}><span>你</span><div><p>{sessionUserText(message.content)}</p><small>{formatDate(message.createdAt,"—")}</small></div></article>:isQueryResponse(message.content)?"refused" in message.content?<QueryRefusalCard key={message.id} refusal={message.content} role={role} onNavigate={onNavigate} onCreateKnowledge={onCreateKnowledge}/>:<QueryAnswerCard key={message.id} answer={message.content} onNavigate={onNavigate} defaultEvidenceOpen={message.id===lastAssistantId}/>:null):!sessionLoading&&!liveQuestion?<section className="query-empty panel"><Icon name="spark" size={30}/><h2>等待一个真实问题</h2><p>会话、问题和查询结果会持久化到本地 SQLite，刷新页面后仍可继续。</p></section>:null}{liveQuestion&&<><article className="query-user-turn pending"><span>你</span><div><p>{liveQuestion}</p><small>{clarification?"等待业务澄清":"正在分析"}</small></div></article><QueryTimeline liveSteps={liveSteps}/>{clarification&&<ClarificationCard value={clarification} loading={loading} onAnswer={answerClarification}/>}</>}</section>
-    </div>
+  return <div className="chat-page"><div className="chat-layout">
+    {historyOpen&&<button className="chat-history-backdrop" aria-label="关闭会话记录" onClick={()=>setHistoryOpen(false)}/>}
+    <aside className={`chat-history ${historyOpen?"is-open":""}`} aria-label="会话记录">
+      <div className="chat-history-heading"><strong>会话记录</strong><button className="chat-history-close" aria-label="关闭会话记录" onClick={()=>setHistoryOpen(false)}><Icon name="close"/></button></div>
+      <button className="chat-new" onClick={()=>void newSession()} disabled={!source||loading||sessionLoading}><Icon name="plus"/>新对话</button>
+      <div className="chat-session-list">{sessionLoading&&!sessions.length?<div className="chat-history-empty"><span className="mini-loader"/>读取会话…</div>:sessions.length?sessions.map((item)=><div className={`chat-session ${item.id===sessionId?"is-active":""}`} key={item.id}>
+        <button className="chat-session-select" onClick={()=>void selectSession(item.id)} disabled={loading||sessionLoading} aria-current={item.id===sessionId?"true":undefined}><Icon name="message" size={16}/><span><strong>{item.title}</strong><small>{formatDate(item.updatedAt,"—")}</small></span></button>
+        <button className="chat-session-delete" aria-label={`删除会话 ${item.title}`} onClick={()=>void removeSession(item.id)} disabled={loading||sessionLoading}><Icon name="trash" size={15}/></button>
+      </div>):<div className="chat-history-empty"><Icon name="message" size={22}/><span>还没有对话</span></div>}</div>
+      <div className="chat-history-source"><Icon name="database" size={16}/><span>{source?.name||"未选择数据源"}</span></div>
+    </aside>
+    <section className="chat-conversation" aria-label="AI 问答">
+      <header className="chat-heading"><button className="chat-history-toggle" aria-label="打开会话记录" aria-expanded={historyOpen} onClick={()=>setHistoryOpen(true)}><Icon name="message"/></button><div><strong>{detail?.title||"新对话"}</strong><span><i/>{loading?"正在分析":clarification?"等待你的回答":"OntoQuery"}</span></div><button className="chat-heading-new" onClick={()=>void newSession()} disabled={!source||loading||sessionLoading} aria-label="新建对话"><Icon name="plus"/><span>新对话</span></button></header>
+      <div className="chat-scroll" ref={scrollRef} onScroll={(event)=>{const el=event.currentTarget;followLatest.current=el.scrollHeight-el.scrollTop-el.clientHeight<100;}}>
+        {sessionLoading&&source?<div className="chat-opening" role="status"><span className="mini-loader"/>正在读取对话…</div>:!hasMessages?<div className="chat-welcome"><div className="chat-welcome-mark"><Icon name="spark" size={32}/></div><h1>今天想了解什么？</h1><p>{source?"直接提问，也可以在回答后继续追问。":"选择一个数据源，开始对话。"}</p>{suggestions.length>0&&<div className="chat-suggestions">{suggestions.map((question)=><button key={question} disabled={loading||!source} onClick={()=>void submit(question)}>{question}<Icon name="arrow" size={16}/></button>)}</div>}</div>:null}
+        <div className="chat-thread" role="log" aria-label="对话内容" aria-live="polite" aria-busy={loading||sessionLoading}>
+          {detail?.messages.map((message)=>message.role==="user"?<UserMessage key={message.id} text={sessionUserText(message.content)}/>:isQueryResponse(message.content)?<Fragment key={message.id}><ClarificationHistory items={"refused" in message.content?message.content.clarifications:message.content.evidence.clarifications}/>{"refused" in message.content?<QueryRefusalMessage refusal={message.content} role={role} onNavigate={onNavigate} onCreateKnowledge={onCreateKnowledge}/>:<QueryAnswerMessage answer={message.content} onNavigate={onNavigate}/>}</Fragment>:null)}
+          {liveQuestion&&<><UserMessage text={liveQuestion}/><ClarificationHistory items={liveReplies}/><AssistantMessage><QueryTimeline liveSteps={liveSteps} running={loading}/>{clarification&&<ClarificationPrompt value={clarification} answer={input} onSelect={(answer)=>{setInput(answer);inputRef.current?.focus();}}/>}</AssistantMessage></>}
+        </div>
+      </div>
+      <div className="chat-composer-dock">
+        {failure&&<div className="chat-error" role="alert"><Icon name="shield" size={16}/><span>{failure}</span><button aria-label="关闭错误提示" onClick={()=>setFailure(null)}><Icon name="close" size={16}/></button></div>}
+        <form className={`chat-composer ${clarification?"is-asking":""}`} onSubmit={(event)=>{event.preventDefault();void submit();}}>
+          {clarification&&<div className="chat-composer-context"><span>ASK</span>{needsOption?"选择上方选项，确认后继续":"选择上方选项，或在这里补充回答"}</div>}
+          <textarea ref={inputRef} aria-label={clarification?"回答 AI 追问":"输入业务问题"} value={input} onChange={(event)=>setInput(event.target.value)} placeholder={!source?"请先选择数据源":needsOption?"请选择上方选项":clarification?"补充你的回答…":hasMessages?"继续追问…":"向 OntoQuery 提问…"} rows={1} disabled={!source||loading||sessionLoading} readOnly={needsOption} onKeyDown={(event)=>{if(event.key==="Enter"&&!event.shiftKey&&!event.nativeEvent.isComposing&&event.keyCode!==229){event.preventDefault();void submit();}}}/>
+          <div className="chat-composer-actions"><span className="chat-input-hint">Enter 发送 · Shift + Enter 换行</span>{loading?<button className="chat-stop" type="button" onClick={()=>streamController.current?.abort()}><span/>停止生成</button>:<button className="chat-send" type="submit" disabled={!input.trim()||!source||sessionLoading||(needsOption&&!clarification?.clarification.options.includes(input.trim()))} aria-label={clarification?"确认回答并继续":"发送问题"}><span>{clarification?"确认并继续":"发送"}</span><Icon name="send" size={17}/></button>}</div>
+        </form>
+      </div>
+    </section>
   </div></div>;
 }
 
-function ClarificationCard({value,loading,onAnswer}:{value:QueryClarification;loading:boolean;onAnswer:(answer:string)=>Promise<void>}){
-  const [answer,setAnswer]=useState("");const prompt=value.clarification;
-  return <section className="clarification-card"><div className="clarification-heading"><span><Icon name="message" size={18}/></span><div><small>需要确认一次业务口径</small><h2>{prompt.question}</h2></div></div>{prompt.options.length?<div className="clarification-options">{prompt.options.map((option)=><button key={option} disabled={loading} onClick={()=>void onAnswer(option)}>{option}</button>)}</div>:null}{prompt.allowFreeText&&<form onSubmit={(event)=>{event.preventDefault();void onAnswer(answer);}}><input aria-label="补充业务口径" value={answer} disabled={loading} onChange={(event)=>setAnswer(event.target.value)} placeholder="补充你的业务口径…"/><button type="submit" disabled={loading||!answer.trim()}>{loading?<span className="mini-loader"/>:<Icon name="send" size={15}/>}继续分析</button></form>}<p>回复后会从当前分析步骤继续；不会重新执行已经完成的探索。</p></section>;
+function UserMessage({text}:{text:string}){return <article className="chat-user-message" aria-label="你的消息"><p>{text}</p></article>;}
+function AssistantMessage({children}:{children:ReactNode}){return <article className="chat-assistant-message" aria-label="OntoQuery 的回复"><div className="chat-assistant-avatar"><Icon name="spark" size={20}/></div><div className="chat-assistant-body"><div className="chat-author">OntoQuery</div>{children}</div></article>;}
+function ClarificationHistory({items}:{items?:Array<{question:string;answer:string}>}){return <>{items?.map((item,index)=><Fragment key={`${item.question}-${index}`}><AssistantMessage><span className="chat-ask-label">ASK · 补充确认</span><p className="chat-prose">{item.question}</p></AssistantMessage><UserMessage text={item.answer}/></Fragment>)}</>;}
+function ClarificationPrompt({value,answer,onSelect}:{value:QueryClarification;answer:string;onSelect:(answer:string)=>void}){
+  const prompt=value.clarification;
+  return <div className="chat-ask"><span className="chat-ask-label">ASK · 需要你确认</span><p className="chat-prose" id={`ask-${prompt.pendingId}`}>{prompt.question}</p>{prompt.options.length>0&&<div className="chat-ask-options" role="group" aria-labelledby={`ask-${prompt.pendingId}`}>{prompt.options.map((option,index)=><button type="button" key={option} aria-pressed={answer===option} onClick={()=>onSelect(option)}><span className="chat-option-index">{answer===option?<Icon name="check" size={14}/>:index+1}</span><span>{option}</span></button>)}</div>}</div>;
 }
 
-function QueryRefusalCard({refusal,role,onNavigate,onCreateKnowledge}:{refusal:QueryRefusal;role:string;onNavigate:(id:NavId)=>void;onCreateKnowledge:(prefill:KnowledgePrefill)=>void}){
+function QueryRefusalMessage({refusal,role,onNavigate,onCreateKnowledge}:{refusal:QueryRefusal;role:string;onNavigate:(id:NavId)=>void;onCreateKnowledge:(prefill:KnowledgePrefill)=>void}){
   const [copied,setCopied]=useState(false);
   const gaps=missingAssetLines(refusal.missingAssets);
   const canEdit=["editor","admin"].includes(role);
   const primaryGap=gaps[0];
   function copyGaps(){navigator.clipboard?.writeText(gaps.map((gap)=>gap.text).join("\n"));setCopied(true);window.setTimeout(()=>setCopied(false),1400);}
   function createFromGap(){if(!primaryGap)return;onCreateKnowledge({pageType:primaryGap.kind==="metric"?"metric":"term",title:primaryGap.label});}
-  return <><QueryTimeline trace={refusal.toolTrace}/><section className="refusal-card"><Icon name="shield" size={28}/><div><span className="section-kicker">安全拒答</span><h2>系统没有执行 SQL</h2><p>{refusal.reason}</p>{refusal.missingConfiguration&&<small>缺少配置：{refusal.missingConfiguration.join("、")}</small>}{gaps.length?<ul className="refusal-gap-list">{gaps.map((gap)=><li key={`${gap.kind}:${gap.label}`}>{gap.text}</li>)}</ul>:null}</div>{primaryGap&&canEdit?<button onClick={createFromGap}><Icon name="plus" size={14}/>补充『{primaryGap.label}』定义</button>:gaps.length?<button onClick={copyGaps}><Icon name={copied?"check":"copy"} size={14}/>{copied?"已复制缺口描述":"复制缺口描述"}</button>:<button onClick={()=>onNavigate("knowledge")}><Icon name="plus" size={14}/>补充知识</button>}</section></>;
+  return <AssistantMessage><QueryTimeline trace={refusal.toolTrace}/><p className="chat-prose">{refusal.reason}</p>{refusal.missingConfiguration&&<p className="chat-secondary">缺少配置：{refusal.missingConfiguration.join("、")}</p>}{gaps.length>0&&<ul className="chat-gap-list">{gaps.map((gap)=><li key={`${gap.kind}:${gap.label}`}>{gap.text}</li>)}</ul>}<div className="chat-message-actions">{primaryGap&&canEdit?<button onClick={createFromGap}><Icon name="plus" size={15}/>补充『{primaryGap.label}』定义</button>:gaps.length?<button onClick={copyGaps}><Icon name={copied?"check":"copy"} size={15}/>{copied?"已复制":"复制缺口描述"}</button>:<button onClick={()=>onNavigate("knowledge")}>查看业务知识<Icon name="arrow" size={15}/></button>}</div></AssistantMessage>;
 }
 
-function QueryAnswerCard({answer,onNavigate,defaultEvidenceOpen=false}:{answer:QueryAnswer;onNavigate:(id:NavId)=>void;defaultEvidenceOpen?:boolean}){
-  const [evidenceOpen,setEvidenceOpen]=useState(defaultEvidenceOpen);const [copied,setCopied]=useState(false);
+function QueryAnswerMessage({answer,onNavigate}:{answer:QueryAnswer;onNavigate:(id:NavId)=>void}){
+  const [copied,setCopied]=useState(false);
   function copySql(){navigator.clipboard?.writeText(answer.evidence.sql);setCopied(true);window.setTimeout(()=>setCopied(false),1400);}
-  function exportCsv(){const header=answer.columns.map((column)=>column.label).join(",");const body=answer.rows.map((row)=>answer.columns.map((column)=>JSON.stringify(row[column.key]??"")).join(",")).join("\n");const url=URL.createObjectURL(new Blob([`\ufeff${header}\n${body}`],{type:"text/csv;charset=utf-8"}));const link=document.createElement("a");link.href=url;link.download=`ontoquery-${answer.id}.csv`;link.click();URL.revokeObjectURL(url);}
+  function exportCsv(){const header=answer.columns.map((column)=>csvCell(column.label)).join(",");const body=answer.rows.map((row)=>answer.columns.map((column)=>csvCell(row[column.key])).join(",")).join("\r\n");const url=URL.createObjectURL(new Blob([`\ufeff${header}\r\n${body}`],{type:"text/csv;charset=utf-8"}));const link=document.createElement("a");link.href=url;link.download=`ontoquery-${answer.id}.csv`;link.click();URL.revokeObjectURL(url);}
   const resultSets=answer.resultSets?.length&&answer.resultSets.length>1?answer.resultSets:null;
   const executedSqls=answer.evidence.sqls?.length?answer.evidence.sqls:[{name:"最终执行 SQL",sql:answer.evidence.sql,tables:answer.evidence.tables,joins:answer.evidence.joins||[],scannedRows:answer.evidence.scannedRows,durationMs:answer.evidence.durationMs,rowCount:answer.rows.length}];
-  return <section className="answer-card"><div className="answer-header"><div className="assistant-badge"><Icon name="spark" size={18}/></div><div><small>分析结果</small><strong>{answer.question}</strong></div><span className="verified-pill"><Icon name="check" size={13}/>已通过 SQL 安全校验</span></div><QueryTimeline trace={answer.evidence.toolTrace}/><div className="conclusion-row"><div><span className="section-kicker">核心结论</span><h2>{answer.conclusion}</h2></div>{answer.delta&&<div className="delta-card"><small>关键变化</small><strong>{answer.delta}</strong><span>基于当前结果范围</span></div>}</div><div className={`result-grid ${answer.chart?"":"table-only"}`}>{answer.chart&&<div className="viz-panel"><div className="panel-heading"><span><Icon name="chart"/>数据趋势</span><em>{answer.rows.length} 个数据点</em></div><DataChart answer={answer}/></div>}<div className="table-panel"><div className="panel-heading"><span><Icon name="table"/>{resultSets?`${resultSets.length} 个结果集`:"明细数据"}</span><button onClick={exportCsv}><Icon name="download" size={15}/>CSV</button></div>{resultSets?resultSets.map((result)=><section className="query-result-set" key={result.name}><div className="panel-heading"><strong>{result.name}</strong><em>{result.rowCount} 行</em></div><ResultTable columns={result.columns} rows={result.rows}/></section>):<ResultTable columns={answer.columns} rows={answer.rows}/>}</div></div><div className="evidence-toggle"><button onClick={()=>setEvidenceOpen(!evidenceOpen)}><Icon name="shield" size={16}/><span>查询依据与可信度</span><em>{answer.evidence.pages.length} 个知识命中 · {answer.evidence.tables.length} 个数据表{answer.evidence.joins&&<> · {answer.evidence.joins.length} 个 JOIN</>} · {answer.evidence.durationMs} ms</em><span className={evidenceOpen?"chevron up":"chevron"}>⌄</span></button></div>{evidenceOpen&&<div className="evidence-panel"><div className="evidence-meta"><EvidenceGroup title="命中的知识页面" items={answer.evidence.pages} color="cyan" emptyText="未配置或未命中"/><EvidenceGroup title="已应用的业务规则" items={answer.evidence.rules} color="green" emptyText="未配置或未命中"/><EvidenceGroup title="实际使用的数据表" items={answer.evidence.tables} color="violet" emptyText="未记录"/><EvidenceGroup title="已校验的 JOIN" items={answer.evidence.joins||[]} color="amber" emptyText={answer.evidence.joins?"单表查询":"历史结果未记录"}/><div className="runtime-stats"><span><Icon name="database"/>扫描 {formatCompact(answer.evidence.scannedRows)} 行</span><span><Icon name="clock"/>查询 {answer.evidence.durationMs} ms</span><span>覆盖：{coverageLabel(answer.evidence.coverage)}</span></div></div>{answer.evidence.zeroResultProbe?.findings.length?<div className="probe-warning"><Icon name="shield" size={16}/><div><strong>口径疑点</strong><p>{answer.evidence.zeroResultProbe.findings.map((finding)=>`按 ${finding.table}.${finding.filterColumn} 过滤无结果，但同表字段 ${finding.siblingColumn} 中有 ${finding.matchCount} 行包含“${finding.value}”`).join("；")}。请确认业务口径应使用哪个字段，并在知识资产或业务对象建模中固化。</p></div></div>:null}<SemanticEvidence evidence={answer.evidence}/>{executedSqls.map((item,index)=><div className="sql-card" key={`${item.name}-${index}`}><div><span>{executedSqls.length>1?`${index+1}. ${item.name}`:"最终执行 SQL"}</span><em>MySQL · 只读 · {item.rowCount} 行</em>{index===0&&<button onClick={copySql}><Icon name={copied?"check":"copy"} size={14}/>{copied?"已复制全部":"复制全部"}</button>}</div><pre><code>{item.sql}</code></pre></div>)}<div className="feedback-row"><span>数字不符合预期？</span><button onClick={()=>onNavigate("knowledge")}><Icon name="plus" size={14}/>补充术语或反例</button></div></div>}</section>;
+  return <AssistantMessage>
+    <QueryTimeline trace={answer.evidence.toolTrace}/>
+    <p className="chat-prose">{answer.conclusion}</p>{answer.delta&&<p className="chat-prose chat-secondary">{answer.delta}</p>}
+    {answer.chart&&<div className="chat-chart"><DataChart answer={answer}/></div>}
+    {answer.columns.length>0&&<div className="chat-results"><div className="chat-result-heading"><span>{resultSets?`${resultSets.length} 个结果集`:`${answer.rows.length} 条结果`}</span><button onClick={exportCsv}><Icon name="download" size={15}/>导出 CSV</button></div>{resultSets?resultSets.map((result)=><section className="chat-result-set" key={result.name}><h3>{result.name}<span>{result.rowCount} 行</span></h3><ResultTable columns={result.columns} rows={result.rows}/></section>):<ResultTable columns={answer.columns} rows={answer.rows}/>}</div>}
+    <details className="chat-evidence"><summary><Icon name="book" size={15}/><span>查询依据</span><span className="chat-evidence-count">{answer.evidence.pages.length} 项知识 · {answer.evidence.tables.length} 张表</span></summary><div className="chat-evidence-body"><div className="evidence-meta"><EvidenceGroup title="业务知识" items={answer.evidence.pages} color="cyan" emptyText="未命中"/><EvidenceGroup title="业务规则" items={answer.evidence.rules} color="green" emptyText="未命中"/><EvidenceGroup title="数据表" items={answer.evidence.tables} color="violet" emptyText="未记录"/><EvidenceGroup title="关联关系" items={answer.evidence.joins||[]} color="amber" emptyText="单表查询"/></div>{answer.evidence.zeroResultProbe?.findings.length?<p className="chat-secondary">未查询到结果，相关字段可能存在口径差异，请核对业务定义。</p>:null}<SemanticEvidence evidence={answer.evidence}/>{executedSqls.map((item,index)=><div className="sql-card" key={`${item.name}-${index}`}><div><span>{item.name}</span><em>{item.rowCount} 行</em>{index===0&&<button onClick={copySql}><Icon name={copied?"check":"copy"} size={14}/>{copied?"已复制":"复制 SQL"}</button>}</div><pre><code>{item.sql}</code></pre></div>)}<div className="chat-message-actions"><button onClick={()=>onNavigate("knowledge")}><Icon name="plus" size={15}/>补充业务知识</button></div></div></details>
+  </AssistantMessage>;
 }
 
 type LiveQueryStep={step:number;thought:string;tool?:string;status:"thinking"|"running"|"succeeded"|"failed";summary?:string;durationMs?:number;sql?:string;detail?:string};
 function updateLiveSteps(current:LiveQueryStep[],event:Exclude<QueryStreamEvent,{type:"final"|"refused"|"clarification"}>){
-  const existing=current.find((item)=>item.step===event.step)||{step:event.step,thought:"正在安全分析。",status:"thinking" as const};
+  const existing=current.find((item)=>item.step===event.step)||{step:event.step,thought:"正在分析问题",status:"thinking" as const};
   let next={...existing};
   if(event.type==="step")next={...next,status:event.status==="started"?"thinking":event.status==="failed"?"failed":next.status==="failed"?"failed":"succeeded",durationMs:event.durationMs??next.durationMs};
   if(event.type==="thought")next={...next,thought:event.text,status:"thinking"};
-  if(event.type==="tool_call")next={...next,tool:event.tool,status:"running",sql:event.sql,detail:event.tables?.join("、")||(event.sample?`${event.sample.table} ${event.sample.columns.join("、")}`:undefined)};
-  if(event.type==="tool_result")next={...next,tool:event.tool,status:event.ok?"succeeded":"failed",summary:event.summary,durationMs:event.durationMs,sql:event.sql||next.sql,detail:event.pages?.join("、")||event.tables?.map((item)=>`${item.name}(${item.fieldCount})`).join("、")||(event.sample?`${event.sample.table} ${event.sample.columns.join("、")}`:next.detail)};
+  if(event.type==="tool_call")next={...next,tool:event.tool,thought:event.thought||next.thought,status:"running",sql:event.sql,detail:event.detail||event.tables?.join("、")||(event.sample?`${event.sample.table} ${event.sample.columns.join("、")}`:undefined)};
+  if(event.type==="tool_result")next={...next,tool:event.tool,thought:event.thought||next.thought,status:event.ok?"succeeded":"failed",summary:event.summary,durationMs:event.durationMs,sql:event.sql||next.sql,detail:event.detail||event.pages?.join("、")||event.tables?.map((item)=>`${item.name}(${item.fieldCount})`).join("、")||(event.sample?`${event.sample.table} ${event.sample.columns.join("、")}`:next.detail)};
   return [...current.filter((item)=>item.step!==event.step),next].sort((left,right)=>left.step-right.step);
 }
 
-function QueryTimeline({trace,liveSteps}:{trace?:QueryToolTrace[];liveSteps?:LiveQueryStep[]}){
-  const steps=liveSteps||trace?.map((item,index)=>({step:index+1,thought:item.thought,tool:item.tool,status:item.ok?"succeeded" as const:"failed" as const,summary:item.summary,durationMs:item.durationMs,sql:item.sql,detail:item.pages?.join("、")||item.tables?.map((table)=>`${table.name}(${table.fieldCount})`).join("、")||(item.sample?`${item.sample.table} ${item.sample.columns.join("、")}`:undefined)}))||[];
-  if(!steps.length&&!liveSteps)return null;
-  const duration=steps.reduce((sum,item)=>sum+Number(item.durationMs||0),0);const live=Boolean(liveSteps);
-  const content=<div className="query-timeline-list">{steps.length?steps.map((item)=><article className={`query-timeline-step ${item.status}`} key={item.step}><span className="timeline-status">{item.status==="thinking"||item.status==="running"?<i className="mini-loader"/>:<Icon name={item.status==="failed"?"shield":"check"} size={13}/>}</span><div><small>步骤 {item.step}{item.tool?` · ${toolLabel(item.tool)}`:""}</small><strong>{item.thought}</strong>{item.summary&&<p>{item.summary}</p>}{item.detail&&<em>{item.detail}</em>}{item.sql&&<details><summary>查看 SQL</summary><code>{item.sql}</code></details>}</div>{item.durationMs!=null&&<time>{item.durationMs} ms</time>}</article>):<div className="timeline-waiting"><span className="mini-loader"/>正在规划第一步…</div>}</div>;
-  if(live)return <section className="query-timeline live"><header><span className="mini-loader"/><strong>Agent 正在分析</strong><em>{steps.length} 步</em></header>{content}</section>;
-  return <details className="query-timeline"><summary><Icon name="graph" size={14}/><strong>共 {steps.length} 步，用时 {duration} ms</strong><span>查看分析过程</span></summary>{content}</details>;
+function traceSteps(trace:QueryToolTrace[]=[]):LiveQueryStep[]{
+  return trace.map((item,index)=>({step:item.step??index+1,thought:item.thought||toolLabel(item.tool),tool:item.tool,status:item.ok?"succeeded":"failed",summary:item.summary||item.errorCode,durationMs:item.durationMs,sql:item.sql,detail:item.detail||item.pages?.join("、")||item.tables?.map((table)=>`${table.name}(${table.fieldCount})`).join("、")||(item.sample?`${item.sample.table} ${item.sample.columns.join("、")}`:undefined)}));
 }
 
-function toolLabel(tool:string){return ({search_context:"检索知识",get_schema:"查看结构",sample_data:"采样数据",validate_semantic_plan:"校验语义计划",run_sql:"执行 SQL",ask_user:"澄清口径",submit_answer:"提交答案",refuse:"安全拒答"})[tool]||tool;}
+function QueryTimeline({trace,liveSteps,running=false}:{trace?:QueryToolTrace[];liveSteps?:LiveQueryStep[];running?:boolean}){
+  const steps=liveSteps||traceSteps(trace);
+  if(!steps.length)return running?<div className="timeline-waiting" role="status"><span className="mini-loader"/>正在理解问题，准备调用工具…</div>:null;
+  const duration=steps.reduce((sum,item)=>sum+Number(item.durationMs||0),0);
+  const busy=steps.some((item)=>item.status==="thinking"||item.status==="running");
+  return <details className={`query-timeline${running?" live":""}`} open><summary>{running?<i className="mini-loader"/>:<Icon name="graph" size={14}/>}<strong>{running?busy?"正在调用工具":"正在继续分析":liveSteps?"等待你补充":"执行过程"}</strong><span>{steps.length} 步{!running&&duration>0?` · 工具用时 ${(duration/1000).toFixed(1)} 秒`:""}<Icon name="arrow" size={14}/></span></summary>
+    <div className="query-timeline-list">{steps.map((item)=><article className={`query-timeline-step ${item.status}`} key={item.step}><span className="timeline-status">{item.status==="thinking"||item.status==="running"?<i className="mini-loader"/>:<Icon name={item.status==="failed"?"shield":"check"} size={13}/>}</span><div><small>步骤 {item.step}{item.tool?` · ${item.tool} · ${toolLabel(item.tool)}`:""} · {item.status==="failed"?"失败":item.status==="succeeded"?"完成":"进行中"}</small><strong>{item.thought}</strong>{item.detail&&<em>{item.detail}</em>}{item.sql&&<details open><summary>查询 SQL</summary><code>{item.sql}</code></details>}{item.summary&&<p>{item.summary}</p>}</div>{item.durationMs!=null&&<time>{item.durationMs} ms</time>}</article>)}</div>
+  </details>;
+}
+
+function toolLabel(tool:string){return ({ontology_read:"查阅业务定义",db_query:"查询数据",search_context:"检索知识",get_schema:"查看结构",sample_data:"采样数据",validate_semantic_plan:"校验语义计划",run_sql:"执行 SQL",ask_user:"澄清口径",submit_answer:"提交答案",refuse:"安全拒答"})[tool]||tool;}
 
 function isQueryResponse(content:QuerySessionDetail["messages"][number]["content"]):content is QueryAnswer|QueryRefusal{return Boolean(content&&typeof content==="object"&&("refused" in content||"conclusion" in content));}
 function sessionUserText(content:QuerySessionDetail["messages"][number]["content"]){return "text" in content?String(content.text||""):"";}
@@ -244,7 +321,7 @@ function DiscoveryWorkspace({source,discovery,tasks,snapshots,onRefresh}:{source
   const diff=task?.result&&"schemaDiff" in task.result?task.result.schemaDiff:undefined;
   const relationMeta=discovery?.relationDiscovery;
   const modelStatus=relationMeta?.modelStatus==="completed"?`模型已判断 ${relationMeta.judgedCount}`:relationMeta?.modelStatus==="not_configured"?"模型未配置":relationMeta?.modelStatus==="failed"?"模型判断失败":relationMeta?.modelStatus==="partial"?`模型部分完成 ${relationMeta.judgedCount}`:"尚未模型判断";
-  return <div className="content sub-page"><PageHeader eyebrow="数据库体检" title="数据探查与表分级" description={source?`当前数据源：${source.name} / ${source.dbName}`:"请先配置数据源"} action={<button className="primary-button" onClick={()=>setSelecting(true)} disabled={!source||scanning||(!source.isDemo&&source.lastTestOk!==1)}><Icon name="refresh" className={scanning?"spin":""}/>{scanning?"后台探查中…":"选择范围并探查"}</button>}/>{selecting&&source&&<TableSelectionPanel source={source} onLaunch={scan} onClose={()=>setSelecting(false)}/>}{failure&&<Notice tone="danger" title="探查失败" body={failure}/>} {!scanning&&relationMeta?.error&&<Notice tone="danger" title="上次关系模型未完整执行" body={relationMeta.error}/>} {scanning&&task&&<section className="task-progress panel"><div><span className="mini-loader"/><strong>{task.currentStep||"等待执行"}</strong><em>{task.progress}%</em></div><p>任务已持久化，可离开页面或重启本地服务；恢复后会从安全检查点重新执行。</p><span><i style={{width:`${task.progress}%`}}/></span></section>} {task?.status==="succeeded"&&diff&&<section className="schema-diff panel"><div><strong>Schema v{diff.currentVersion||snapshots[0]?.version||1}</strong><span>{diff.changed?"检测到结构变化":"结构无变化"}</span></div><p>新增表 {diff.addedTables.length} · 移除表 {diff.removedTables.length} · 变更表 {diff.changedTables.length} · 新增字段 {diff.addedColumns.length} · 移除字段 {diff.removedColumns.length}</p></section>}<div className="metric-grid"><MetricCard label="已发现表" value={String(discovery?.totalTables||0)} meta={`A ${discovery?.grades.A||0} · B ${discovery?.grades.B||0} · C ${discovery?.grades.C||0}`} tone="cyan"/><MetricCard label="敏感字段" value={String(discovery?.sensitiveFields||0)} meta="已在值探针前拦截" tone="amber"/><MetricCard label="关系" value={String(discovery?.relations||0)} meta={`显式 ${relationMeta?.explicit||0} · 模型建议 ${relationMeta?.modelSuggested||0} · ${modelStatus}`} tone="violet"/><MetricCard label="Schema 版本" value={String(snapshots[0]?.version||diff?.currentVersion||0)} meta={formatDate(source?.lastDiscoveryAt,"尚未探查")} tone="green"/></div><section className="panel"><div className="panel-title"><div><h2>表分级总览</h2><p>人工覆盖写入 grade_override，重跑探针后保留；失效结构保留历史但不进入检索。</p></div><div className="segmented">{["全部","A","B","C"].map((grade)=><button className={filter===grade?"active":""} onClick={()=>setFilter(grade)} key={grade}>{grade}</button>)}</div></div>{filtered.length?<div className="table-responsive"><table className="data-table"><thead><tr><th>表</th><th>级别</th><th>行数估算</th><th>最近活跃</th><th>最近探针</th><th>人工覆盖</th></tr></thead><tbody>{filtered.map((table)=><tr key={table.tableName}><td><strong>{table.tableName}</strong><small>{table.comment||"无表注释"}</small></td><td><span className={`grade grade-${table.grade.toLowerCase()}`}>{table.grade}</span></td><td>{formatInteger(table.rowEstimate)}</td><td>{table.daysSinceWrite==null?"未知":table.daysSinceWrite===0?"今天":`${table.daysSinceWrite} 天前`}</td><td>{formatDate(table.lastProbeAt,"未探针")}</td><td><select aria-label={`覆盖 ${table.tableName} 分级`} value={table.gradeOverride||table.grade} disabled={updating===table.tableName} onChange={(event)=>void changeGrade(table.tableName,event.target.value as "A"|"B"|"C")}><option value="A">A 核心</option><option value="B">B 辅助</option><option value="C">C 排除</option></select>{table.gradeOverride&&<small>已人工覆盖</small>}</td></tr>)}</tbody></table></div>:<EmptyState title="还没有探查结果" body="配置并验证真实 MySQL 后，点击“开始真实探查”。演示源也会从 SQLite 读取其真实样例结构。"/>}</section></div>;
+  return <div className="content sub-page"><PageHeader eyebrow="数据库体检" title="数据探查与表分级" description={source?`当前数据源：${source.name} / ${source.dbName}`:"请先配置数据源"} action={<button className="primary-button" onClick={()=>setSelecting(true)} disabled={!source||scanning||(!source.isDemo&&source.lastTestOk!==1)}><Icon name="refresh" className={scanning?"spin":""}/>{scanning?"后台探查中…":"选择范围并探查"}</button>}/>{selecting&&source&&<TableSelectionPanel source={source} onLaunch={scan} onClose={()=>setSelecting(false)}/>}{failure&&<Notice tone="danger" title="探查失败" body={failure}/>} {!scanning&&relationMeta?.error&&<Notice tone="danger" title="上次关系模型未完整执行" body={relationMeta.error}/>} {scanning&&task&&<section className="task-progress panel"><div><span className="mini-loader"/><strong>{task.currentStep||"等待执行"}</strong><em>{task.progress}%</em></div><p>任务已持久化，可离开页面或重启本地服务；恢复后会从安全检查点重新执行。</p><span><i style={{width:`${task.progress}%`}}/></span></section>} {task?.status==="succeeded"&&diff&&<section className="schema-diff panel"><div><strong>Schema v{diff.currentVersion||snapshots[0]?.version||1}</strong><span>{diff.changed?"检测到结构变化":"结构无变化"}</span></div><p>新增表 {diff.addedTables.length} · 移除表 {diff.removedTables.length} · 变更表 {diff.changedTables.length} · 新增字段 {diff.addedColumns.length} · 移除字段 {diff.removedColumns.length}</p></section>}<div className="metric-grid"><MetricCard label="已发现表" value={String(discovery?.totalTables||0)} meta={`A ${discovery?.grades.A||0} · B ${discovery?.grades.B||0} · C ${discovery?.grades.C||0}`} tone="cyan"/><MetricCard label="关系" value={String(discovery?.relations||0)} meta={`显式 ${relationMeta?.explicit||0} · 模型建议 ${relationMeta?.modelSuggested||0} · ${modelStatus}`} tone="violet"/><MetricCard label="Schema 版本" value={String(snapshots[0]?.version||diff?.currentVersion||0)} meta={formatDate(source?.lastDiscoveryAt,"尚未探查")} tone="green"/></div><section className="panel"><div className="panel-title"><div><h2>表分级总览</h2><p>人工覆盖写入 grade_override，重跑探针后保留；失效结构保留历史但不进入检索。</p></div><div className="segmented">{["全部","A","B","C"].map((grade)=><button className={filter===grade?"active":""} onClick={()=>setFilter(grade)} key={grade}>{grade}</button>)}</div></div>{filtered.length?<div className="table-responsive"><table className="data-table"><thead><tr><th>表</th><th>级别</th><th>行数估算</th><th>最近活跃</th><th>最近探针</th><th>人工覆盖</th></tr></thead><tbody>{filtered.map((table)=><tr key={table.tableName}><td><strong>{table.tableName}</strong><small>{table.comment||"无表注释"}</small></td><td><span className={`grade grade-${table.grade.toLowerCase()}`}>{table.grade}</span></td><td>{formatInteger(table.rowEstimate)}</td><td>{table.daysSinceWrite==null?"未知":table.daysSinceWrite===0?"今天":`${table.daysSinceWrite} 天前`}</td><td>{formatDate(table.lastProbeAt,"未探针")}</td><td><select aria-label={`覆盖 ${table.tableName} 分级`} value={table.gradeOverride||table.grade} disabled={updating===table.tableName} onChange={(event)=>void changeGrade(table.tableName,event.target.value as "A"|"B"|"C")}><option value="A">A 核心</option><option value="B">B 辅助</option><option value="C">C 排除</option></select>{table.gradeOverride&&<small>已人工覆盖</small>}</td></tr>)}</tbody></table></div>:<EmptyState title="还没有探查结果" body="配置并验证真实 MySQL 后，点击“开始真实探查”。演示源也会从 SQLite 读取其真实样例结构。"/>}</section></div>;
 }
 
 function QuestionsWorkspace({items,onRefresh}:{items:OntologyQuestion[];onRefresh:()=>Promise<void>}){const [answering,setAnswering]=useState<number|null>(null);const [failure,setFailure]=useState<string|null>(null);async function choose(item:OntologyQuestion,choice:string){setAnswering(item.id);setFailure(null);try{await answerQuestion(item.id,choice);await onRefresh();}catch(cause){setFailure(errorMessage(cause));}finally{setAnswering(null);}}return <div className="content sub-page"><PageHeader eyebrow="交互式消歧" title="只询问影响 SQL 正确性的歧义" description="每个问题必须携带探针证据；回答会写回关系、规则或枚举知识。"/>{failure&&<Notice tone="danger" title="回答未保存" body={failure}/>}<div className="question-progress"><div><strong>{items.length}</strong><span>个问题待确认</span></div><div><strong>{items.filter((item)=>item.scope==="global").length}</strong><span>个问题支持全局外推</span></div><div className="progress-copy"><span>{items.length?"按价值排序，C 级表不会提问":"本轮已完成"}</span><em><i style={{width:items.length?"18%":"100%"}}/></em></div></div><div className="question-list">{items.length===0?<EmptyState title="没有待决问题" body="探查产生的中低置信 JOIN、枚举、金额单位和废弃表判断会出现在这里。"/>:items.map((item,index)=><article className="question-card" key={item.id}><div className="question-number">{String(index+1).padStart(2,"0")}</div><div className="question-body"><div className="question-tags"><span>{item.kind}</span><em>{[item.tableName,item.columnName].filter(Boolean).join(".")||item.scope}</em></div><h2>{item.question}</h2><div className="evidence-note"><span>探针证据</span><p>{item.evidence}</p></div><div className="option-grid">{item.options.map((option,optionIndex)=><button key={option} className={optionIndex===0?"recommended":""} disabled={answering===item.id} onClick={()=>void choose(item,option)}><span>{optionIndex===0?"建议":"选项"}</span>{option}</button>)}</div></div></article>)}</div></div>;}
@@ -343,5 +420,4 @@ function formatDate(value:string|null|undefined,fallback:string){if(!value)retur
 function typeLabel(type:KnowledgePage["pageType"]){return ({term:"术语",metric:"指标",join:"JOIN",rule:"规则",table:"表"})[type];}
 function verdictLabel(value:string){return ({passed:"通过",refused:"已拒绝",failed:"失败"})[value]||value;}
 function planningModeLabel(value:string|null|undefined){return ({semantic:"语义计划",legacy:"兼容链路",agent:"Agent Loop",claude:"Claude Code",demo:"演示链路"})[value||""]||"未记录";}
-function coverageLabel(value:QueryAnswer["evidence"]["coverage"]){return ({semantic:"语义知识",structural:"表结构",session:"会话上下文",demo:"演示数据"})[value||""]||"未记录";}
 function csvCell(value:unknown){return `"${String(value??"").replaceAll('"','""')}"`;}

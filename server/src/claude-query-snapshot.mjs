@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { redactTypedLiterals } from "./query-column-semantics.mjs";
+import { buildQueryResultContract } from "./query-result-contract.mjs";
 
 /**
  * Version of the public, request-scoped ontology view exposed to Claude.
@@ -121,6 +122,7 @@ export function createClaudeQuerySnapshot(input = {}) {
   const enumValues = buildPublicEnums(catalog, columnsByTable);
   const queryIntent = sanitizeQueryIntent(input.queryIntent ?? input.context?.queryIntent);
   const retrieval = sanitizeRetrieval(input.retrievalEvidence ?? input.context?.retrieval);
+  const executionContract = publicExecutionContract(input.queryIntent ?? input.context?.queryIntent, input.retrievalEvidence ?? input.context?.retrieval);
   const schemaVersion = normalizeVersion(published?.version ?? input.ontologySchemaVersion);
   const schemaVersionId = normalizeVersion(published?.id ?? input.ontologySchemaVersionId);
   const publishedAt = safeText(published?.publishedAt ?? published?.published_at, 128);
@@ -146,6 +148,7 @@ export function createClaudeQuerySnapshot(input = {}) {
     rules,
     queryIntent,
     retrieval,
+    executionContract,
     allowedTableNames: [...tableNames].sort(),
     allowedColumnsByTable: objectFromSets(Object.fromEntries(
       [...tableNames].sort().map((tableName) => [tableName, new Set((columnsByTable[tableName] || []).map((item) => item.columnName))]),
@@ -189,11 +192,7 @@ export function createClaudeQuerySnapshot(input = {}) {
       const column = normalizeIdentifier(columnName);
       return (columnsByTable[key] || []).some((item) => item.columnName === column);
     },
-    isSensitiveColumn(tableName, columnName) {
-      const key = normalizeIdentifier(tableName);
-      const column = normalizeIdentifier(columnName);
-      return Boolean((columnsByTable[key] || []).find((item) => item.columnName === column)?.sensitive);
-    },
+    isSensitiveColumn() { return false; },
     toJSON() {
       return { ...payload, checksum, createdAt };
     },
@@ -397,7 +396,6 @@ function propertySemanticsForTable(schema, tableName) {
       prior.semanticKind ||= safeText(property.semanticKind, 80) || inferSemanticKind(property);
       prior.type ||= safeText(property.type, 80);
       prior.description ||= safeText(property.description, MAX_SNAPSHOT_TEXT);
-      prior.sensitive ||= Boolean(property.isSensitive || property.sensitive || /手机|电话|邮箱|email|phone|mobile|身份证|证件|银行卡/i.test(`${property.apiName || ""} ${property.displayName || ""}`));
       result.set(column, prior);
     }
   }
@@ -437,7 +435,7 @@ function buildPublicObjects(schema, columnsByTable, tableNames) {
         sensitive: Boolean(physical?.sensitive),
         selectable: Boolean(physical?.selectable),
         filterable: Boolean(physical?.filterable),
-        constraints: sanitizeConstraints(property.constraints, physical?.sensitive),
+        constraints: sanitizeConstraints(property.constraints),
       });
     }
     if (!properties.length) continue;
@@ -487,7 +485,6 @@ function buildPublicEnums(catalog, columnsByTable) {
   const result = {};
   for (const [tableName, columns] of Object.entries(columnsByTable)) {
     for (const column of columns) {
-      if (column.sensitive) continue;
       const values = enumValuesFor(catalog.enums, tableName, column.columnName);
       if (!values.length) continue;
       result[`${tableName}.${column.columnName}`] = values.slice(0, 200).map((item) => ({
@@ -518,7 +515,6 @@ function normalizeKnowledge(items, tableNames) {
       const names = normalizeNameSet(page.tables ?? parseJson(page.tablesJson, []));
       return !names.size || [...names].some((name) => tableNames.has(name));
     })
-    .slice(0, 200)
     .map((page) => ({
       id: page.id == null ? null : Number(page.id),
       pageType: safeText(page.pageType ?? page.page_type, 80),
@@ -530,6 +526,7 @@ function normalizeKnowledge(items, tableNames) {
       // content useful but bounded and explicitly tagged as untrusted data.
       content: safeText(page.content, MAX_SNAPSHOT_TEXT),
       sqlContent: safeText(page.sqlContent ?? page.sql_content, MAX_SNAPSHOT_TEXT),
+      antiExamples: safeText(page.antiExamples ?? page.anti_examples, MAX_SNAPSHOT_TEXT),
       untrustedData: true,
     }))
     .filter((page) => page.slug || page.title || page.content);
@@ -542,7 +539,6 @@ function normalizeRules(items, tableNames) {
       const names = normalizeNameSet(rule.appliesTo ?? rule.applies_to);
       return !names.size || [...names].some((name) => tableNames.has(name));
     })
-    .slice(0, 200)
     .map((rule) => ({
       id: rule.id == null ? null : Number(rule.id),
       name: safeText(rule.name, 500),
@@ -602,6 +598,25 @@ function sanitizeRetrieval(retrieval) {
   });
 }
 
+function publicExecutionContract(intent, retrieval) {
+  if (intent == null) return null;
+  // Derive from the same full evidence as the kernel. Generic prompt depth
+  // limits otherwise erase predicates nested under retrieval[].diagnostics.
+  const contract = buildQueryResultContract(intent, retrieval);
+  const fields = [
+    "id", "kind", "value", "values", "role", "required", "operator", "valueType", "attribution", "range",
+    "tables", "columns", "filterBindings", "labelColumns", "identityColumns",
+    "bindingTables", "bindingColumns", "bindingRelationIds", "bindingPaths",
+    "bindingValidityPredicates", "executionValidityPredicates",
+  ];
+  return {
+    version: contract.version,
+    shape: sanitizeData(contract.shape),
+    closedWorldRowDomain: contract.closedWorldRowDomain,
+    slots: contract.slots.map((slot) => sanitizeData(Object.fromEntries(fields.map((key) => [key, slot[key]])))),
+  };
+}
+
 function readSnapshot(snapshot, request = {}) {
   const operation = safeText(request.operation ?? request.op, 40).toLowerCase();
   if (!OPERATION_NAMES.has(operation)) {
@@ -617,6 +632,7 @@ function readSnapshot(snapshot, request = {}) {
       schemaVersion: snapshot.schemaVersion,
       schemaChecksum: snapshot.schemaChecksum,
       checksum: snapshot.checksum,
+      executionContract: snapshot.executionContract,
       tables: snapshot.tables,
       objects: snapshot.objects.map((object) => ({ apiName: object.apiName, displayName: object.displayName, propertyCount: object.properties.length })),
       relations: snapshot.relations,
@@ -631,8 +647,15 @@ function readSnapshot(snapshot, request = {}) {
   }
   if (operation === "get_objects") {
     const wanted = normalizeRequestedIds(request.ids ?? request.objectNames ?? request.objects);
-    const all = snapshot.objects.filter((object) => !wanted.size || wanted.has(object.apiName) || wanted.has(object.displayName));
-    return pagedResult(operation, all, offset, limit, { ids: [...wanted].sort() });
+    const all = snapshot.objects.filter((object) => !wanted.size || wanted.has(object.apiName.toLowerCase()) || wanted.has(object.displayName.toLowerCase()));
+    const page = pagedResult(operation, all, offset, limit, { ids: [...wanted].sort() });
+    return { ...page, items: page.items.map((object) => ({
+      ...object,
+      knowledge: snapshot.knowledge.filter((entry) => !entry.tables.length || object.properties.some((property) => entry.tables.includes(property.table))).map(({ slug, title, aliases }) => ({ slug, title, aliases })),
+      tables: [...new Set(object.properties.map((property) => property.table))].map((tableName) => ({
+        tableName, columns: publicColumnsWithEnums(snapshot, tableName),
+      })),
+    })) };
   }
   if (operation === "get_relations") {
     const wanted = normalizeRequestedIds(request.ids ?? request.relationIds ?? request.relations);
@@ -640,7 +663,7 @@ function readSnapshot(snapshot, request = {}) {
     return pagedResult(operation, all, offset, limit, { ids: [...wanted].sort() });
   }
   const wanted = normalizeRequestedIds(request.ids ?? request.slugs ?? request.knowledge);
-  const all = [...snapshot.knowledge, ...snapshot.rules].filter((item) => !wanted.size || wanted.has(item.slug) || wanted.has(item.name) || wanted.has(String(item.id)));
+  const all = [...snapshot.knowledge, ...snapshot.rules].filter((item) => !wanted.size || [item.slug, item.title, item.name, item.id].some((value) => value != null && wanted.has(String(value).toLowerCase())));
   return pagedResult(operation, all, offset, limit, { ids: [...wanted].sort() });
 }
 
@@ -650,11 +673,18 @@ function searchableItems(snapshot, query) {
     ...snapshot.tables.map((item) => ({ kind: "table", ...item })),
     ...snapshot.objects.map((item) => ({ kind: "object", ...item })),
     ...snapshot.objects.flatMap((object) => object.properties.map((property) => ({ kind: "property", object: object.apiName, ...property }))),
+    ...Object.keys(snapshot.columnsByTable).flatMap((table) => publicColumnsWithEnums(snapshot, table).map((column) => ({ kind: "column", table, ...column }))),
     ...snapshot.relations.map((item) => ({ kind: "relation", ...item })),
     ...snapshot.knowledge.map((item) => ({ kind: "knowledge", ...item })),
     ...snapshot.rules.map((item) => ({ kind: "rule", ...item })),
   ];
   return query ? items.filter((item) => haystack(item).includes(query)) : items;
+}
+
+function publicColumnsWithEnums(snapshot, table) {
+  return (snapshot.columnsByTable[table] || []).map((column) => ({
+    ...column, enumValues: snapshot.enumValues[`${table}.${column.columnName}`] || [],
+  }));
 }
 
 function pagedResult(operation, items, offset, limit, extra = {}) {
@@ -729,11 +759,11 @@ function inferSemanticKind(property) {
 }
 
 
-function sanitizeConstraints(value, sensitive) {
+function sanitizeConstraints(value) {
   if (!value || typeof value !== "object") return {};
   const result = {};
-  for (const key of ["minimum", "maximum", "minLength", "maxLength", "pattern"]) if (value[key] != null) result[key] = sensitive && key === "pattern" ? undefined : sanitizeScalar(value[key]);
-  if (Array.isArray(value.enumValues) && !sensitive) result.enumValues = normalizeTextArray(value.enumValues, 200, 500);
+  for (const key of ["minimum", "maximum", "minLength", "maxLength", "pattern"]) if (value[key] != null) result[key] = sanitizeScalar(value[key]);
+  if (Array.isArray(value.enumValues)) result.enumValues = normalizeTextArray(value.enumValues, 200, 500);
   return removeEmpty(result);
 }
 
@@ -791,7 +821,9 @@ function normalizeNameSet(value) {
 
 function normalizeRequestedIds(value) {
   const values = Array.isArray(value) ? value : value == null ? [] : [value];
-  return new Set(values.map((item) => safeText(item, 200).toLowerCase()).filter((item) => /^[a-z0-9][a-z0-9._:-]{0,199}$/.test(item)));
+  // Object display names and knowledge slugs may be Chinese. These values
+  // only select snapshot entries; physical SQL identifiers have a separate guard.
+  return new Set(values.map((item) => safeText(item, 200).toLowerCase()).filter(Boolean));
 }
 
 function normalizeTextArray(value, maxItems = 50, maxLength = 200) {

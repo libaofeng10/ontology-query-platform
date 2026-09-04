@@ -49,7 +49,7 @@ export function siblingColumns(table, column, catalog) {
   const stems = meaningfulTokens(column);
   if (!stems.size) return [];
   return columns
-    .filter((item) => item.columnName !== column && !item.isSensitive && STRING_TYPE.test(String(item.dataType || "")))
+    .filter((item) => item.columnName !== column && STRING_TYPE.test(String(item.dataType || "")))
     .map((item) => ({ name: item.columnName, shared: overlap(stems, meaningfulTokens(item.columnName)) }))
     .filter((item) => item.shared > 0)
     .sort((left, right) => right.shared - left.shared || left.name.localeCompare(right.name))

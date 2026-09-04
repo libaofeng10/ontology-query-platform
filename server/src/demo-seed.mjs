@@ -27,7 +27,7 @@ export function seedDemo(store, appSecret) {
     const result = gradeTable(table);
     store.upsertTable({ sourceId:source.id, ...table, grade:result.grade, active:result.grade === "C" ? 0 : 1 });
     for (const [columnName,dataType,isPrimary,comment] of columns[table.tableName] || []) {
-      store.upsertColumn({ sourceId:source.id, tableName:table.tableName, columnName, dataType, isPrimary, comment, nullable:isPrimary?0:1, isSensitive:/mobile/.test(columnName)?1:0 });
+      store.upsertColumn({ sourceId:source.id, tableName:table.tableName, columnName, dataType, isPrimary, comment, nullable:isPrimary?0:1, isSensitive:0 });
     }
   }
   const customerOrder=store.upsertRelation({sourceId:source.id,fromTable:"sales_order",fromCol:"customer_id",toTable:"crm_customer",toCol:"customer_id",cardinality:"N:1",confidence:.997,overlapRatio:.997,status:"confirmed"});

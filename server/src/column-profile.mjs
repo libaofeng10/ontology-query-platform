@@ -37,13 +37,12 @@ export function buildColumnProfile({values=[],dataType="",enums=[]}={}) {
   const rawNonNull=enumItems.length?enumItems.map((item)=>item?.value).filter((value)=>value!=null):normalizedValues.filter((value)=>value!=null);
   const serialized=rawNonNull.map(serializedValue);
   const sensitiveKinds=new Set(serialized.map((value)=>detectSensitiveValue(value)).filter((item)=>item.sensitive).map((item)=>item.kind));
-  const suppressValues=sensitiveKinds.size>0;
   const frequencies=new Map();
   if(enumItems.length)for(const item of enumItems){const value=serializedValue(item?.value);frequencies.set(value,(frequencies.get(value)||0)+Math.max(0,Number(item?.count)||0));}
   else for(const value of serialized)frequencies.set(value,(frequencies.get(value)||0)+1);
-  const sampleValues=suppressValues?[]:[...frequencies.entries()].sort((left,right)=>right[1]-left[1]||left[0].localeCompare(right[0])).slice(0,5).map(([value])=>truncate(value,64));
+  const sampleValues=[...frequencies.entries()].sort((left,right)=>right[1]-left[1]||left[0].localeCompare(right[0])).slice(0,5).map(([value])=>truncate(value,64));
   const nullCount=enumItems.length?0:normalizedValues.length-rawNonNull.length;
-  const minMax=suppressValues?null:profileMinMax(rawNonNull,dataType);
+  const minMax=profileMinMax(rawNonNull,dataType);
   return {
     profile:{
       sampleValues,
@@ -51,7 +50,7 @@ export function buildColumnProfile({values=[],dataType="",enums=[]}={}) {
       distinctCount:frequencies.size,
       nullRatio:sampleSize?Number((nullCount/sampleSize).toFixed(6)):0,
       minMax,
-      sensitiveValuesSuppressed:suppressValues,
+      sensitiveValuesSuppressed:false,
       ...(sensitiveKinds.size?{sensitiveKinds:[...sensitiveKinds].sort()}:{}),
     },
     sampleSize,

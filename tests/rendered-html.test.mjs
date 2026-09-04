@@ -14,7 +14,7 @@ test("server-renders the OntoQuery workspace", async () => {
   const html = await response.text();
   assert.match(html, /<title>OntoQuery · 本体驱动智能问数平台<\/title>/i);
   assert.match(html, /正在读取平台状态/);
-  assert.match(html, /问数工作台/);
+  assert.match(html, /AI 问答/);
   assert.match(html, /数据源/);
   assert.match(html, /本体图谱/);
   assert.match(html, /业务对象建模/);

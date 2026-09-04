@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { callLlmEmbedding } from "./embedding-client.mjs";
 import { validateSemanticSchema } from "./semantic-schema.mjs";
-import { detectSensitiveValue } from "./column-profile.mjs";
 
 export const ONTOLOGY_CANDIDATE_SCORING_VERSION="ontology-candidate-v3";
 export const ONTOLOGY_CANDIDATE_WEIGHTS=Object.freeze({
@@ -229,13 +228,13 @@ function forcedReview(candidate,{catalog,endpoints,baseSchema,warnings}) {
   return [...new Set(reasons)];
 }
 
-// 对象映射的字段数不足主表非敏感字段一半（且表足够宽）时，缺口需要人工确认，
+// 对象映射的字段数不足主表字段一半（且表足够宽）时，缺口需要人工确认，
 // 否则语义链路会在缺失字段上"合法地答错"。
 function lowFieldCoverage(candidate,catalog) {
   const properties=candidate.payload?.properties||[];
   const tables=[...new Set(properties.map((item)=>item?.mapping?.table).filter(Boolean))];
   if(tables.length!==1)return false;
-  const available=(catalog.columnsByTable?.[tables[0]]||[]).filter((column)=>!column.isSensitive).length;
+  const available=(catalog.columnsByTable?.[tables[0]]||[]).length;
   return available>=8&&properties.length/available<.5;
 }
 
@@ -283,7 +282,7 @@ function semanticTexts(candidate,{catalog,acceptedObjects=[]}) {
   const objectPayloads=candidate?.candidateType==="object"?[payload]:acceptedObjects.map((item)=>item?.payload).filter(Boolean);
   const safeProperties=objectPayloads.flatMap((object)=>(object.properties||[]).filter((property)=>{
     const column=(catalog?.columnsByTable?.[property?.mapping?.table]||[]).find((item)=>item.columnName===property?.mapping?.column);
-    return column&&!column.isSensitive;
+    return Boolean(column);
   }));
   const candidateText=[payload.apiName,payload.displayName,payload.description,...safeProperties.flatMap((item)=>[item.apiName,item.displayName,item.description]),payload.sourceLabel,payload.targetLabel,payload.relationKind].filter(Boolean).join("\n");
   const tables=objectPayloads.flatMap(mappedTables);
@@ -296,7 +295,7 @@ function semanticTexts(candidate,{catalog,acceptedObjects=[]}) {
   }
   if(evidence.join("\n").length<80)for(const tableName of new Set(tables)){
     const mappedColumns=new Set(safeProperties.filter((property)=>property?.mapping?.table===tableName).map((property)=>property.mapping.column));
-    for(const column of catalog?.columnsByTable?.[tableName]||[]){if(!mappedColumns.has(column.columnName)||column.isSensitive)continue;const profile=column.profile;if(profile?.formatPattern)evidence.push(`格式 ${profile.formatPattern}`);for(const value of (profile?.sampleValues||[]).filter((item)=>!detectSensitiveValue(item).sensitive).slice(0,5))evidence.push(`示例 ${value}`);for(const item of (catalog?.enumsByTable?.[tableName]||[]).filter((entry)=>entry.columnName===column.columnName&&!detectSensitiveValue(entry.value).sensitive).slice(0,10))evidence.push(`枚举 ${item.value}${item.meaning?`=${item.meaning}`:""}`);}
+    for(const column of catalog?.columnsByTable?.[tableName]||[]){if(!mappedColumns.has(column.columnName))continue;const profile=column.profile;if(profile?.formatPattern)evidence.push(`格式 ${profile.formatPattern}`);for(const value of (profile?.sampleValues||[]).slice(0,5))evidence.push(`示例 ${value}`);for(const item of (catalog?.enumsByTable?.[tableName]||[]).filter((entry)=>entry.columnName===column.columnName).slice(0,10))evidence.push(`枚举 ${item.value}${item.meaning?`=${item.meaning}`:""}`);}
   }
   const anchorByKey=new Map((catalog?.termAnchors||[]).map((anchor)=>[`${anchor.vocabulary}\u0000${anchor.canonicalId}`,anchor]));
   for(const entity of [payload,...safeProperties]){

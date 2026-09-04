@@ -343,7 +343,7 @@ test("ontology schema API enforces editor writes and returns 422 validation deta
     const anchorImport=await api(app,"/api/ontology/term-anchors/import","admin-token",{vocabulary:"corp",csv:"canonical_id,name_en,name_zh,category,kind,alt_labels\nCUST,Customer,客户,,object,客群|客户主体"});
     assert.equal(anchorImport.status,201);assert.equal(anchorImport.body.count,1);
     const sensitiveAnchor=await api(app,"/api/ontology/term-anchors/import","admin-token",{vocabulary:"corp",csv:"canonical_id,name_zh,kind,note\nPRIVATE,隐私术语,object,user@example.com"});
-    assert.equal(sensitiveAnchor.status,400);assert.match(sensitiveAnchor.body.error,/包含敏感值/);
+    assert.equal(sensitiveAnchor.status,201);assert.equal(sensitiveAnchor.body.items[0].note,"user@example.com");
     const catalog=await api(app,`/api/ontology/catalog?sourceId=${source.id}`,"viewer-token",null,"GET");
     assert.equal(catalog.status,200);
     assert.ok(catalog.body.columnsByTable.crm_customer.some((column)=>column.columnName==="customer_id"));

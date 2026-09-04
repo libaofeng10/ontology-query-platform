@@ -3,6 +3,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { createClaudeQueryBridge } from "../src/claude-query-bridge.mjs";
 import { createClaudeQueryMcpSession } from "../src/claude-query-mcp.mjs";
 import { createClaudeQuerySnapshot } from "../src/claude-query-snapshot.mjs";
 import { createQueryService } from "../src/query-service.mjs";
@@ -31,12 +32,93 @@ async function fixture() {
   return { store, source };
 }
 
+test("Claude discovers published objects even when phrasing has no platform retrieval or filter binding", async () => {
+  const { store, source } = await fixture();
+  const bridge = createClaudeQueryBridge({
+    model: "fake",
+    requireApiKey: false,
+    transport: async ({ session }) => {
+      assert.equal(session.snapshot.queryIntent, null);
+      assert.equal(session.snapshot.retrieval, null);
+      const objects = await session.callTool("ontology_read", { operation: "get_objects", ids: ["customer"] });
+      assert.equal(objects.ok, true);
+      const receipt = await session.callTool("db_query", { sql: "SELECT customer_id FROM crm_customer" });
+      assert.equal(receipt.ok, true, receipt.error);
+      return { status: "answered", execution_ids: [receipt.executionId], conclusion: "名单已查询。" };
+    },
+  });
+  try {
+    const service = createQueryService({
+      store,
+      connector: { explain: async () => [{ rows: 1 }], query: async () => [[{ customer_id: 7 }], [{ name: "customer_id" }]] },
+      claudeBridge: bridge,
+      claudeMcpFactory: async (options) => createClaudeQueryMcpSession({ ...options, listen: false }),
+      config: { llm: {}, queryMaxRows: 100, explainMaxRows: 1_000, claudeQuery: { mode: "required", model: "fake", maxBudgetUsd: 1, requireApiKey: false } },
+    });
+    const answer = await service.ask({ sourceId: source.id, question: "把名单拉出来", userName: "tester" });
+    assert.equal(answer.evidence?.planningMode, "claude", answer.reason);
+    assert.deepEqual(answer.rows, [{ customer_id: 7 }]);
+    assert.equal(store.listAudits(source.id, 1)[0].intentJson, null);
+  } finally {
+    await bridge.close();
+    store.close();
+  }
+});
+
+test("Claude owns missing-field clarification and resumes ASK with the original question and answer", async () => {
+  const { store, source } = await fixture();
+  let attempt = 0;
+  const prompts = [];
+  const bridge = createClaudeQueryBridge({
+    model: "fake", requireApiKey: false,
+    transport: async ({ prompt, session }) => {
+      prompts.push(prompt);
+      await session.callTool("ontology_read", { operation: "get_objects", ids: ["customer"] });
+      if (++attempt === 1) return { status: "clarification", question: "本体没有律所归属字段，是否查询全部客户？", options: ["查询全部客户"], allow_free_text: true };
+      const receipt = await session.callTool("db_query", { sql: "SELECT customer_id FROM crm_customer" });
+      assert.equal(receipt.ok, true, receipt.error);
+      return { status: "answered", execution_ids: [receipt.executionId], conclusion: "已按确认查询全部客户。" };
+    },
+  });
+  try {
+    const service = createQueryService({
+      store,
+      connector: { explain: async () => [{ rows: 1 }], query: async () => [[{ customer_id: 7 }], [{ name: "customer_id" }]] },
+      claudeBridge: bridge,
+      claudeMcpFactory: async (options) => createClaudeQueryMcpSession({ ...options, listen: false }),
+      config: { llm: {}, queryMaxRows: 100, explainMaxRows: 1_000, claudeQuery: { mode: "required", model: "fake", maxBudgetUsd: 1, requireApiKey: false } },
+    });
+    const question = "北京市百伦律师事务所的客户明细";
+    const pending = await service.ask({ sourceId: source.id, question, userName: "tester" });
+    assert.equal(pending.planningMode, "claude", pending.reason);
+    assert.ok(pending.clarification?.pendingId);
+    const answer = await service.ask({ sourceId: source.id, sessionId: pending.sessionId, pendingId: pending.clarification.pendingId, question: "查询全部客户", userName: "tester" });
+    assert.equal(answer.evidence?.planningMode, "claude", answer.reason);
+    assert.equal(answer.question, question);
+    assert.deepEqual(answer.rows, [{ customer_id: 7 }]);
+    assert.match(prompts[1], /北京市百伦律师事务所的客户明细/);
+    assert.match(prompts[1], /查询全部客户/);
+    assert.deepEqual(answer.evidence.clarifications.map(({ question, answer }) => ({ question, answer })), [{ question: pending.clarification.question, answer: "查询全部客户" }]);
+  } finally {
+    await bridge.close();
+    store.close();
+  }
+});
+
 test("query service routes a required Claude attempt through snapshot, MCP, kernel and the shared finalizer", async () => {
   const { store, source } = await fixture();
   const calls = [];
+  const events = [];
   const connector = {
     async explain(_source, sql) { calls.push({ kind: "explain", sql }); return [{ rows: 2 }]; },
-    async query(_source, sql) { calls.push({ kind: "query", sql }); return [[{ customer_id: 7, mobile: "13800138000" }], [{ name: "customer_id" }, { name: "mobile" }]]; },
+    async query(_source, sql) {
+      // The browser must receive the start event before the database finishes.
+      assert.equal(events.at(-1)?.type, "tool_call");
+      assert.equal(events.at(-1)?.tool, "db_query");
+      assert.equal(events.at(-1)?.sql, "SELECT customer_id FROM crm_customer");
+      calls.push({ kind: "query", sql });
+      return [[{ customer_id: 7, mobile: "13800138000" }], [{ name: "customer_id" }, { name: "mobile" }]];
+    },
   };
   const bridge = {
     async run({ mcp }) {
@@ -73,7 +155,8 @@ test("query service routes a required Claude attempt through snapshot, MCP, kern
         claudeQuery: { mode: "required", trafficPercent: 100, model: "fake", maxBudgetUsd: 1 },
       },
     });
-    const answer = await service.ask({ sourceId: source.id, question: "查询客户", userName: "tester" });
+    const answer = await service.ask({ sourceId: source.id, question: "查询客户", userName: "tester", onEvent: (event) => events.push(event) });
+    assert.ok(events.some((event) => event.type === "tool_call"), "Claude must stream tool calls to the query client");
     assert.equal(answer.evidence.planningMode, "claude");
     // 2026-09-04 敏感列逻辑已移除：驱动返回的 mobile 列原样保留在答案中。
     assert.deepEqual(answer.rows, [{ customer_id: 7, mobile: "13800138000" }]);
@@ -85,6 +168,17 @@ test("query service routes a required Claude attempt through snapshot, MCP, kern
     assert.equal(audit.promptVersion, "claude-query-test-v1");
     assert.equal(audit.ontologySchemaVersion, 1);
     assert.equal(audit.toolTrace[1].tool, "db_query");
+    assert.deepEqual(events.filter((event) => event.type.startsWith("tool_")).map(({ type, step, tool }) => ({ type, step, tool })), [
+      { type: "tool_call", step: 1, tool: "ontology_read" },
+      { type: "tool_result", step: 1, tool: "ontology_read" },
+      { type: "tool_call", step: 2, tool: "db_query" },
+      { type: "tool_result", step: 2, tool: "db_query" },
+    ]);
+    assert.equal(audit.toolTrace[0].operation, "overview");
+    assert.equal(audit.toolTrace[1].sql, answer.evidence.sql);
+    assert.match(audit.toolTrace[1].summary, /1 行/);
+    assert.deepEqual(answer.evidence.toolTrace, audit.toolTrace);
+    assert.doesNotMatch(JSON.stringify(events), /13800138000|previewRows/);
   } finally {
     store.close();
   }
@@ -126,6 +220,48 @@ test("Claude public responses and audits keep typed literals verbatim in model t
     assert.match(serialized, /alice@example\.com/);
     assert.doesNotMatch(serialized, /\[REDACTED\]/);
   } finally {
+    store.close();
+  }
+});
+
+test("Claude reads business definitions without a platform intent contract in its prompt or SQL execution", async () => {
+  const { store, source } = await fixture();
+  store.upsertColumn({ sourceId: source.id, tableName: "crm_customer", columnName: "is_valid", dataType: "tinyint", comment: "有效标记，1有效" });
+  store.upsertKnowledge({ sourceId: source.id, pageType: "term", slug: "unread", title: "未读取的定义", tablesJson: "[\"crm_customer\"]", content: "其他定义", verified: 1 });
+  let receivedPrompt;
+  let receivedOverview;
+  const bridge = createClaudeQueryBridge({
+    model: "fake",
+    requireApiKey: false,
+    transport: async ({ prompt, session }) => {
+      receivedPrompt = prompt;
+      assert.equal(session.snapshot.disclosedTables.size, 0);
+      receivedOverview = await session.callTool("ontology_read", { operation: "overview" });
+      const knowledge = await session.callTool("ontology_read", { operation: "get_knowledge", ids: ["客户"] });
+      assert.equal(knowledge.data.items[0].title, "客户");
+      const receipt = await session.callTool("db_query", { sql: "SELECT customer_id, mobile FROM crm_customer WHERE mobile = '13800138000' AND is_valid = 1" });
+      assert.equal(receipt.ok, true, receipt.error);
+      return { status: "answered", execution_ids: [receipt.executionId], conclusion: "查询完成" };
+    },
+  });
+  try {
+    const service = createQueryService({
+      store,
+      connector: { explain: async () => [{ rows: 1 }], query: async () => [[{ customer_id: 7, mobile: "13800138000" }], [{ name: "customer_id" }, { name: "mobile" }]] },
+      claudeBridge: bridge,
+      claudeMcpFactory: async (options) => createClaudeQueryMcpSession({ ...options, listen: false }),
+      config: { llm: {}, queryMaxRows: 100, explainMaxRows: 1_000, claudeQuery: { mode: "required", model: "fake", maxBudgetUsd: 1, requireApiKey: false } },
+    });
+    const answer = await service.ask({ sourceId: source.id, question: "查询手机号 13800138000 对应客户", userName: "tester" });
+    assert.equal(answer.evidence?.planningMode, "claude", answer.reason);
+    assert.equal(answer.evidence.toolTrace.at(-1).sql, answer.evidence.sql);
+    assert.doesNotMatch(receivedPrompt, /本轮执行合同：|已解析意图|当前检索证据/);
+    assert.match(receivedPrompt, /用户问题：查询手机号 13800138000 对应客户/);
+    assert.equal(receivedOverview.data.executionContract, null);
+    assert.equal(answer.evidence.queryIntent, null);
+    assert.deepEqual(answer.evidence.pages, ["客户"]);
+  } finally {
+    await bridge.close();
     store.close();
   }
 });

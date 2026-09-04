@@ -7,15 +7,15 @@ import { buildColumnProfile, detectSensitiveValue } from "../src/column-profile.
 import { createStore } from "../src/store.mjs";
 import { ontologyCatalogChecksum } from "../src/ontology-candidate-service.mjs";
 
-test("value profiling suppresses phone, identity, email and bank-card values",()=>{
+test("value profiling preserves typed values and their format hints",()=>{
   for(const value of ["13800138000","11010519491231002X","user@example.com","6222020202020202"])assert.equal(detectSensitiveValue(value).sensitive,true,value);
   for(const value of ["138-0013-8000","138 0013 8000","+1 (415) 555-2671","110105-19491231-002X","6222-0202-0202-0202","6222.0202.0202.0202"])assert.equal(detectSensitiveValue(value).sensitive,true,value);
   const profiled=buildColumnProfile({values:["user@example.com","normal","normal",null],dataType:"varchar(255)"});
-  assert.deepEqual(profiled.profile.sampleValues,[]);
+  assert.deepEqual(profiled.profile.sampleValues,["normal","user@example.com"]);
   assert.equal(profiled.profile.minMax,null);
-  assert.equal(profiled.profile.sensitiveValuesSuppressed,true);
+  assert.equal(profiled.profile.sensitiveValuesSuppressed,false);
   assert.match(profiled.profile.formatPattern,/<email>/);
-  assert.doesNotMatch(JSON.stringify(profiled),/user@example\.com|normal/);
+  assert.match(JSON.stringify(profiled),/user@example\.com/);
 });
 
 test("profiles infer bounded examples, format and numeric range",()=>{

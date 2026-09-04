@@ -62,6 +62,42 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
     // Claude 自带规划能力，不依赖 legacy/semantic 的 LLM provider。启用 Claude 时
     // 不能用 LLM 门禁提前拒答；Claude 失败并需要回退到 legacy 时再检查（见下）。
     if(!isLlmConfigured(config.llm)&&claudeRollout.effectiveMode==="off") return llmUnconfiguredRefusal({userName,sourceId,question,started,sessionId:session.id});
+    throwIfAborted(signal);
+
+    // Claude owns question interpretation and ontology discovery. Build the
+    // legacy intent/retrieval context only when that planner is selected.
+    let claudeTried=false,claudeFallbackReason=null,claudeToolTrace=null;
+    async function tryClaudeQuery() {
+      claudeTried=true;
+      const context=buildClaudeContext(store,sourceId,ontologySchemaVersionId);
+      let outcome;
+      try {
+        outcome=await runClaudeQueryBranch({store,connector,config,source,question,context,conversationHistory,deps,started,requestId:session.id,signal,onEvent});
+      } catch(error) {
+        if(signal?.aborted) throw error;
+        const errorCode=error?.code?String(error.code):null;
+        // bridge 关闭意味着进程正在停机，不是「这次 Claude 不可用、换个规划器重试」。
+        // 在停机窗口里启动 legacy 会新开一次查询，所以这类失败不允许回退。
+        outcome={status:"failed",reason:safeError(error),failureClass:errorCode==="BRIDGE_CLOSED"?"bridge_closed":"protocol_error",...(errorCode?{errorCode}:{}),iterations:0,toolTrace:[],durationMs:Date.now()-started};
+      }
+      const terminal=finalizeClaudeOutcome({outcome,source,session,userName,question,context,started,claudeRollout});if(terminal)return terminal;
+      claudeFallbackReason=outcome?.reason||"Claude 查询未在预算内收敛";
+      claudeToolTrace=outcome?.toolTrace||[];
+      // 失败无论是否回退都要留痕：回退后审计里只剩 legacy 一行的话，灰度期就看不到
+      // Claude 的真实失败率。
+      const auditId=store.addAudit({userName,sourceId:source.id,question:redactTypedLiterals(question),verdict:"failed",failReason:redactTypedLiterals(claudeFallbackReason),durationMs:outcome.durationMs??Date.now()-started,rowCount:0,planningMode:"claude",planningAttempts:outcome.iterations||0,iterations:outcome.iterations||0,clarificationCount:0,toolTraceJson:JSON.stringify(redactClaudeBoundaryValue(claudeToolTrace)),failureClass:outcome.failureClass||"execution_error",promptVersion:outcome.promptVersion||null,ontologySchemaVersion:outcome.ontologySchemaVersion??null,...auditContextFields({...context,queryIntent:outcome.queryIntent||context.queryIntent},claudeRollout,{})});
+      if(claudeRollout.effectiveMode==="required"||!claudeFailureCanFallback(outcome)) {
+        return {refused:true,reason:`系统没有执行不可靠的 Claude 查询：${redactTypedLiterals(claudeFallbackReason)}`,...(outcome?.errorCode?{errorCode:String(outcome.errorCode)}:{}),failureClass:outcome.failureClass||"execution_error",sessionId:session.id,planningMode:"claude",planningAttempts:outcome.iterations||0,toolTrace:redactClaudeBoundaryValue(claudeToolTrace),_auditId:auditId,_sessionQuestion:question};
+      }
+      return null;
+    }
+    if(claudeRollout.effectiveMode!=="off"&&!claudeTried) {
+      const terminal=await tryClaudeQuery();
+      if(terminal)return terminal;
+      // 走到这里表示 Claude 基础设施失败且允许回退，接下来是 legacy/semantic：
+      // 那条链路真的需要 LLM provider，所以门禁在这里才生效。
+      if(!isLlmConfigured(config.llm)) return llmUnconfiguredRefusal({userName,sourceId,question,started,sessionId:session.id});
+    }
 
     const context=await buildContext(store,sourceId,question,session.context,{embeddingIndex,retrieval:config.retrieval,conversationHistory,ontologySchemaVersionId});
     const configuredAgentMode=normalizeAgentMode(queryAgentMode??config.queryAgentMode);
@@ -112,37 +148,6 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
     }
     let agentFallbackReason=null;
     let agentTried=false;
-    let claudeTried=false,claudeFallbackReason=null,claudeToolTrace=null;
-    async function tryClaudeQuery() {
-      claudeTried=true;
-      let outcome;
-      try {
-        outcome=await runClaudeQueryBranch({store,connector,config,source,question,context,conversationHistory,deps,started,requestId:session.id,signal,onEvent});
-      } catch(error) {
-        if(signal?.aborted) throw error;
-        const errorCode=error?.code?String(error.code):null;
-        // bridge 关闭意味着进程正在停机，不是「这次 Claude 不可用、换个规划器重试」。
-        // 在停机窗口里启动 legacy 会新开一次查询，所以这类失败不允许回退。
-        outcome={status:"failed",reason:safeError(error),failureClass:errorCode==="BRIDGE_CLOSED"?"bridge_closed":"protocol_error",...(errorCode?{errorCode}:{}),iterations:0,toolTrace:[],durationMs:Date.now()-started};
-      }
-      const terminal=finalizeClaudeOutcome({outcome,source,session,userName,question,context,started,claudeRollout});if(terminal)return terminal;
-      claudeFallbackReason=outcome?.reason||"Claude 查询未在预算内收敛";
-      claudeToolTrace=outcome?.toolTrace||[];
-      // 失败无论是否回退都要留痕：回退后审计里只剩 legacy 一行的话，灰度期就看不到
-      // Claude 的真实失败率。
-      const auditId=store.addAudit({userName,sourceId:source.id,question:redactTypedLiterals(question),verdict:"failed",failReason:redactTypedLiterals(claudeFallbackReason),durationMs:outcome.durationMs??Date.now()-started,rowCount:0,planningMode:"claude",planningAttempts:outcome.iterations||0,iterations:outcome.iterations||0,clarificationCount:0,toolTraceJson:JSON.stringify(redactClaudeBoundaryValue(claudeToolTrace)),failureClass:outcome.failureClass||"execution_error",promptVersion:outcome.promptVersion||null,ontologySchemaVersion:outcome.ontologySchemaVersion??null,...auditContextFields({...context,queryIntent:outcome.queryIntent||context.queryIntent},claudeRollout,{})});
-      if(claudeRollout.effectiveMode==="required"||!claudeFailureCanFallback(outcome)) {
-        return {refused:true,reason:`系统没有执行不可靠的 Claude 查询：${redactTypedLiterals(claudeFallbackReason)}`,...(outcome?.errorCode?{errorCode:String(outcome.errorCode)}:{}),failureClass:outcome.failureClass||"execution_error",sessionId:session.id,planningMode:"claude",planningAttempts:outcome.iterations||0,toolTrace:redactClaudeBoundaryValue(claudeToolTrace),_auditId:auditId,_sessionQuestion:question};
-      }
-      return null;
-    }
-    if(claudeRollout.effectiveMode!=="off"&&!claudeTried) {
-      const terminal=await tryClaudeQuery();
-      if(terminal)return terminal;
-      // 走到这里表示 Claude 基础设施失败且允许回退，接下来是 legacy/semantic：
-      // 那条链路真的需要 LLM provider，所以门禁在这里才生效。
-      if(!isLlmConfigured(config.llm)) return llmUnconfiguredRefusal({userName,sourceId,question,started,sessionId:session.id});
-    }
     if(agentMode==="required"||(agentMode==="prefer"&&(context.queryIntent?.ambiguities||[]).some((item)=>item.blocking))) { const terminal=await tryAgent();if(terminal)return terminal; }
     async function tryAgent() {
       agentTried=true;
@@ -371,7 +376,7 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
       const pendingId=randomUUID();const ttl=Number(config.queryAgentPendingTtlMs)>0?Number(config.queryAgentPendingTtlMs):10*60_000;const expiresAt=Date.now()+ttl;
       const auditId=store.addAudit({userName,sourceId:source.id,question,verdict:"clarified",durationMs:outcome.durationMs??Date.now()-started,rowCount:0,planningMode:"claude",planningAttempts:outcome.iterations,iterations:outcome.iterations,clarificationCount:1,toolTraceJson:JSON.stringify(redactClaudeBoundaryValue(outcome.toolTrace||[]))});
       const response={clarification:{pendingId,question:outcome.clarification.question,options:outcome.clarification.options,allowFreeText:outcome.clarification.allowFreeText,expiresAt:new Date(expiresAt).toISOString()},sessionId:session.id,planningMode:"claude",planningAttempts:outcome.iterations,toolTrace:redactClaudeBoundaryValue(outcome.toolTrace||[]),tokenUsage:outcome.tokenUsage};
-      pendingLoops.set(pendingId,{id:pendingId,sourceId:source.id,sessionId:session.id,userName,question,context,started,claudeRollout,resume:outcome.resume,expiresAt,publicState:{question,response}});pendingBySession.set(session.id,pendingId);
+      pendingLoops.set(pendingId,{kind:"claude",id:pendingId,sourceId:source.id,sessionId:session.id,userName,question,context,started,claudeRollout,resume:outcome.resume,expiresAt,publicState:{question,response}});pendingBySession.set(session.id,pendingId);
       return {...response,_auditId:auditId,_sessionQuestion:question};
     }
     if(outcome.status==="answered") {
@@ -381,9 +386,9 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
       // 结论与增量是模型自由文本，可能把它在预览里看到的值原样带出来；出库前统一脱敏。
       const conclusion=redactTypedLiterals(analyticalConclusion||outcome.conclusion||'查询已完成。');
       const delta=analyticalConclusion?undefined:outcome.delta?redactTypedLiterals(outcome.delta):undefined;
-      const answer={id:`query-${Date.now()}`,sessionId:session.id,question,conclusion,delta,columns:combined.columns,rows:combined.rows,resultSets:combined.resultSets,chart:runs.length===1?inferChart(runs[0].rows,runs[0].fields):null,evidence:{pages:(context.knowledge||[]).map((page)=>page.title),rules:(context.rules||[]).map((rule)=>rule.name),tables:combined.tables,joins:combined.joins,sql:combined.sql,sqls:combined.sqls,durationMs:outcome.durationMs??Date.now()-started,scannedRows:combined.scannedRows,coverage:retrievalSnapshot(context).coverage||'none',retrievalMode:retrievalSnapshot(context).retrievalMode||'lexical',planningMode:'claude',planningAttempts:outcome.iterations,iterations:outcome.iterations,ontologySchemaVersion:outcome.ontologySchemaVersion??undefined,promptVersion:outcome.promptVersion||undefined,toolTrace:redactClaudeBoundaryValue(outcome.toolTrace||[]),stateTransitions:outcome.stateTransitions,budgetFallback:outcome.budgetFallback||undefined,resultDelivery:runs.some((run)=>run.resultDelivery==='direct')?'direct':'preview',clarifications:outcome.clarifications||[],tokenUsage:outcome.tokenUsage,queryIntent:context.queryIntent,resultContract:outcome.resultContract||buildQueryResultContract(context.queryIntent,[context.retrieval].filter(Boolean),null),resultContractFingerprint:outcome.resultContractFingerprint||hash(JSON.stringify(outcome.resultContract||{})),claudeRollout,resultCompleteness:combined.completeness}};
+      const answer={id:`query-${Date.now()}`,sessionId:session.id,question,conclusion,delta,columns:combined.columns,rows:combined.rows,resultSets:combined.resultSets,chart:runs.length===1?inferChart(runs[0].rows,runs[0].fields):null,evidence:{pages:outcome.readEvidence?.pages||[],rules:outcome.readEvidence?.rules||[],tables:combined.tables,joins:combined.joins,sql:combined.sql,sqls:combined.sqls,durationMs:outcome.durationMs??Date.now()-started,scannedRows:combined.scannedRows,coverage:'ontology',retrievalMode:'claude',planningMode:'claude',planningAttempts:outcome.iterations,iterations:outcome.iterations,ontologySchemaVersion:outcome.ontologySchemaVersion??undefined,promptVersion:outcome.promptVersion||undefined,toolTrace:redactClaudeBoundaryValue(outcome.toolTrace||[]),stateTransitions:outcome.stateTransitions,budgetFallback:outcome.budgetFallback||undefined,resultDelivery:runs.some((run)=>run.resultDelivery==='direct')?'direct':'preview',clarifications:outcome.clarifications||[],tokenUsage:outcome.tokenUsage,queryIntent:context.queryIntent,resultContract:outcome.resultContract||buildQueryResultContract(context.queryIntent,[context.retrieval].filter(Boolean),null),resultContractFingerprint:outcome.resultContractFingerprint||hash(JSON.stringify(outcome.resultContract||{})),claudeRollout,resultCompleteness:combined.completeness}};
       const auditId=store.addAudit({userName,sourceId:source.id,question:redactTypedLiterals(question),retrievedPages:JSON.stringify(answer.evidence.pages),sql:combined.sql,verdict:"passed",durationMs:answer.evidence.durationMs,rowCount:combined.rows.length,planningMode:"claude",planningAttempts:outcome.iterations,iterations:outcome.iterations,clarificationCount,toolTraceJson:JSON.stringify(answer.evidence.toolTrace),...auditContextFields({...context,queryIntent:outcome.queryIntent||context.queryIntent},claudeRollout,{}),promptVersion:outcome.promptVersion||null,ontologySchemaVersion:outcome.ontologySchemaVersion??null});
-      store.updateSession(session.id,nextSessionContext(session.context,combined.tables,[...new Set(answer.evidence.pages)],context.queryIntent));return {...answer,_auditId:auditId,_sessionQuestion:question};
+      store.updateSession(session.id,nextSessionContext({...session.context,queryIntent:null},combined.tables,[...new Set(answer.evidence.pages)]));return {...answer,_auditId:auditId,_sessionQuestion:question};
     }
     if(outcome.status==="refused") {
       const reason=redactTypedLiterals(outcome.reason);
@@ -442,6 +447,16 @@ export function createQueryService({store,connector,config,embeddingIndex,knowle
     if(pending.sourceId!==source.id||pending.sessionId!==session.id||pending.userName!==userName)throw httpError(403,"不能恢复其他用户、会话或数据源的 Agent Loop");
     deletePending(pending);
     if(pending.kind==="knowledge_proposal")return resumeProposalPending({pending,source,session,userName,answer,signal,onEvent});
+    if(pending.kind==="claude") {
+      let outcome;
+      try { outcome=await pending.resume(answer,{signal,onEvent}); }
+      catch(error) {
+        if(signal?.aborted)throw error;
+        outcome={status:"refused",reason:`Claude 续答失败：${safeError(error)}`,failureClass:"execution_error",toolTrace:[],clarifications:[],iterations:0};
+      }
+      if(outcome.status==="failed"||outcome.status==="cancelled")outcome={...outcome,status:"refused"};
+      return finalizeClaudeOutcome({outcome,source,session,userName,question:pending.question,context:pending.context,started:pending.started,claudeRollout:pending.claudeRollout});
+    }
     let outcome;
     try{outcome=await pending.resume(answer,{signal,onEvent});}catch(error){if(signal?.aborted)throw error;const snapshot=error?.queryAgentSnapshot&&typeof error.queryAgentSnapshot==="object"?error.queryAgentSnapshot:{};outcome={...snapshot,status:"failed",reason:`Agent Loop 恢复失败：${failureMessage(error)}`,iterations:snapshot.iterations||0,toolTrace:snapshot.toolTrace||[],clarifications:snapshot.clarifications||[],durationMs:snapshot.durationMs??Date.now()-pending.started};}
     const terminal=finalizeAgentOutcome({outcome,source,session,userName,question:pending.question,context:pending.context,started:pending.started,agentMode:pending.agentMode,agentRollout:pending.agentRollout});if(terminal)return terminal;
@@ -474,6 +489,23 @@ function buildSemanticRuntime(store,sourceId,ontologySchemaVersionId) {
   const validation=validateSemanticSchema(published.schema,catalog);
   if(!validation.ok) return {ok:false,reason:`已发布 Ontology Schema v${published.version} 与当前物理结构不兼容：${validation.errors[0]?.message||"校验失败"}`,published,catalog,validation};
   return {ok:true,published:{...published,schema:validation.schema},catalog,validation};
+}
+
+function buildClaudeContext(store,sourceId,ontologySchemaVersionId) {
+  const ontologyRecord=ontologySchemaVersionId?store.getOntologySchemaVersion(Number(ontologySchemaVersionId)):store.getPublishedOntologySchema(sourceId);
+  if(ontologySchemaVersionId&&!ontologyRecord)throw httpError(404,"指定的 Ontology Schema 版本不存在");
+  const tables=store.listTables(sourceId).filter((table)=>table.grade!=="C"&&table.active);
+  return {
+    tables,
+    columns:Object.fromEntries(tables.map((table)=>[table.tableName,store.listColumns(sourceId,table.tableName)])),
+    relations:store.listRelations(sourceId,true),
+    knowledge:store.listKnowledge(sourceId).filter((page)=>page.verified),
+    rules:store.listRules(sourceId).filter((rule)=>rule.verified),
+    enums:Object.fromEntries(tables.map((table)=>[table.tableName,store.listEnums(sourceId,table.tableName)])),
+    ontologyRecord,
+    queryIntent:null,
+    retrieval:null,
+  };
 }
 
 async function buildContext(store,sourceId,question,priorContext={},deps={}) {
@@ -937,7 +969,7 @@ function selectClaudeQueryRollout({mode,trafficPercent=0,cohortKey="",explicit=f
 const CLAUDE_NO_FALLBACK_FAILURES=new Set(["policy_block","protocol_error","auth_error","model_missing","budget_disabled","bridge_closed","sensitive_binding_unavailable","result_incomplete"]);
 function claudeFailureCanFallback(outcome) { return outcome?.status!=="refused"&&!CLAUDE_NO_FALLBACK_FAILURES.has(outcome?.failureClass); }
 
-async function runClaudeQueryBranch({store,connector,config,source,question,context,conversationHistory,deps,started,requestId,signal,onEvent}) {
+async function runClaudeQueryBranch({store,connector,config,source,question,context,conversationHistory,deps,started,requestId,signal,onEvent,clarifications=[]}) {
   const sourceId=source.id;
   const claudeConfig=config.claudeQuery||{};
   const refusal=(reason,failureClass,errorCode)=>({status:"refused",reason,failureClass,errorCode,iterations:0,toolTrace:[],durationMs:Date.now()-started});
@@ -951,18 +983,29 @@ async function runClaudeQueryBranch({store,connector,config,source,question,cont
   const runner=bridge&&(bridge.run||bridge.execute||bridge.invoke);
   if(typeof runner!=="function") return {status:"failed",reason:"Claude bridge 不可用",failureClass:"cli_unavailable",iterations:0,toolTrace:[],durationMs:Date.now()-started};
 
-  const snapshot=await deps.claudeSnapshotBuilder({...context,sourceId,source:snapshotSource(source),store});
+  const snapshot=await deps.claudeSnapshotBuilder({...context,context,sourceId,source:snapshotSource(source),store});
   if(!snapshot||typeof snapshot.read!=="function") throw new Error("Claude ontology snapshot 构造失败");
-  const kernelCatalog=buildKernelCatalog(context,config);
+  const kernelCatalog=buildKernelCatalog(snapshot,config);
   const kernel=createQueryExecutionKernel({connector,source,config,question,catalog:kernelCatalog,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),getDisclosedTables:()=>snapshot.disclosedTables||new Set(),signal,maxSqlCalls:claudeConfig.maxSqlCalls??config.queryAgentMaxSqlCalls,maxScannedRows:claudeConfig.maxScannedRows??config.queryAgentMaxScannedRows,preview:{maxRows:20,maxBytes:24*1024,maxCellChars:200}});
-  const produced=await deps.claudeMcpFactory({snapshot,kernel,source,sourceId,requestId,signal,listen:true,previewRows:20,previewBytes:24*1024,initialDisclosedTables:[]});
+  const produced=await deps.claudeMcpFactory({snapshot,kernel,source,sourceId,requestId,signal,onEvent,listen:true,previewRows:20,previewBytes:24*1024,initialDisclosedTables:[]});
   const mcpSession=produced?.session||produced;
   if(!mcpSession) throw new Error("Claude MCP session 构造失败");
   try {
     const outcome=await runner.call(bridge,{
-      requestId,question:question,context,conversationHistory,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),snapshot,kernel,mcp:mcpSession,mcpSession,signal,onEvent,closeMcp:false,requireApiKey:claudeConfig.requireApiKey??true,requireModel:claudeConfig.requireModel??false,binary:claudeConfig.binary,promptVersion:claudeConfig.promptVersion,timeoutMs:claudeConfig.timeoutMs,maxTurns:claudeConfig.maxTurns,maxBudgetUsd:claudeConfig.maxBudgetUsd,model:claudeConfig.model,mcpFactory:null,
+      requestId,question,context:{conversationHistory,clarifications,ontologySchemaVersion:snapshot.schemaVersion},conversationHistory,queryIntent:null,retrievalEvidence:[],snapshot,kernel,mcp:mcpSession,mcpSession,signal,onEvent,closeMcp:false,requireApiKey:claudeConfig.requireApiKey??true,requireModel:claudeConfig.requireModel??false,binary:claudeConfig.binary,promptVersion:claudeConfig.promptVersion,timeoutMs:claudeConfig.timeoutMs,maxTurns:claudeConfig.maxTurns,maxBudgetUsd:claudeConfig.maxBudgetUsd,model:claudeConfig.model,mcpFactory:null,
     });
-    return await settleClaudeBridgeOutcome({outcome,mcpSession,snapshot,claudeConfig,started});
+    const settled=await settleClaudeBridgeOutcome({outcome,mcpSession,snapshot,claudeConfig,started});
+    settled.readEvidence=mcpSession.getReadEvidence?.()||{pages:[],rules:[]};
+    settled.clarifications=clarifications;
+    if(settled.status==="clarification") {
+      // The completed CLI/MCP request is closed below. ASK starts a fresh
+      // request with the same ontology and explicit user clarification data.
+      settled.resume=async(answer,{signal:resumeSignal,onEvent:resumeEvent}={})=>{
+        if(settled.clarification.allowFreeText===false&&!settled.clarification.options?.includes(answer))throw httpError(400,"请选择提供的澄清选项");
+        return runClaudeQueryBranch({store,connector,config,source,question,context,conversationHistory,deps,started,requestId,signal:resumeSignal,onEvent:resumeEvent,clarifications:[...clarifications,{question:settled.clarification.question,answer}]});
+      };
+    }
+    return settled;
   } finally {
     // 请求级 listener 持有一个临时端口和 bearer token；无论成败都必须收口，
     // 否则一次失败的问数会把端口和凭据留到进程退出。
@@ -1026,11 +1069,9 @@ function claudeRunFields(run) {
 function safeError(error) { return String(error?.message||error).replace(/(password|token|api[_-]?key|authorization)\s*[=:]\s*[^\s,;]+/gi,"$1=[REDACTED]").slice(0,1_000); }
 
 function snapshotSource(source) { return {id:source.id}; }
-function buildKernelCatalog(context,config) {
-  const tables=context.tables||[];
-  return {tables,columnsByTable:context.columnsByTable||{},relations:context.relations||[],enums:context.enums||{},enumItemsByColumn:context.enumItemsByColumn||{},ontologySchema:context.ontologySchema||null,pages:context.knowledge||[],rules:context.rules||[],policy:{allowedTables:tables.map((table)=>table.tableName),allowedColumns:context.allowedColumns||{},columnKinds:context.columnKinds||{},valueKinds:context.valueKinds||[],allowedRelations:context.relations||[],maxRows:config.queryMaxRows||500,enums:{}}};
+function buildKernelCatalog(snapshot,config) {
+  return {tables:snapshot.tables,columnsByTable:snapshot.columnsByTable,relations:snapshot.relations,policy:{allowedTables:snapshot.allowedTableNames,allowedColumns:snapshot.allowedColumnsByTable,valueKinds:[],allowedRelations:snapshot.relations,maxRows:config.queryMaxRows||500,enums:{}}};
 }
-function retrievalSnapshot(context) { return {coverage:context.retrieval?.coverage,retrievalMode:context.retrieval?.retrievalMode}; }
 function redactClaudeBoundaryValue(value,depth=0,seen=new WeakSet()) {
   if(value==null)return value;
   // 边界函数的目标是「Claude/工具产出的自由文本不得携带 typed literal 出库」。

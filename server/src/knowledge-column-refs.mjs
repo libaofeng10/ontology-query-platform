@@ -9,7 +9,7 @@ export function extractKnowledgeColumnRefs(page, columnsByTable = {}) {
   // arbitrary short word from becoming a field binding.
   const tokens = new Set(text.match(/[a-z][a-z0-9_]{1,63}/g) || []);
   if (!tokens.size) return [];
-  const catalog=new Map(boundTables.map((table)=>[table.toLowerCase(),new Map((columnsByTable[table]||[]).filter((column)=>column.columnName&&!column.isSensitive).map((column)=>[String(column.columnName).toLowerCase(),String(column.columnName)]))]));
+  const catalog=new Map(boundTables.map((table)=>[table.toLowerCase(),new Map((columnsByTable[table]||[]).filter((column)=>column.columnName).map((column)=>[String(column.columnName).toLowerCase(),String(column.columnName)]))]));
   const refs=[];const seen=new Set();
   const add=(table,column)=>{const key=`${table}.${column}`.toLowerCase();if(seen.has(key))return;seen.add(key);refs.push({table,column});};
 
@@ -123,7 +123,8 @@ function knowledgePropertyConceptMatch(page,property) {
   let best=0;
   for(const left of pageLabels)for(const right of property.labels||[]) {
     if(left===right)best=Math.max(best,80+Math.min(left.length,20));
-    else if(Math.min(left.length,right.length)>=3&&(left.includes(right)||right.includes(left)))best=Math.max(best,40+Math.min(left.length,right.length));
+    // Containment is recall evidence, not proof of the same property: an
+    // object label such as “Alpha 用户” also prefixes its ID and name labels.
   }
   return best?{matchScore:best,matchKind:"title_or_alias_property_label"}:null;
 }

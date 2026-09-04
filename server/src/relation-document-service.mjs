@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { callLlmJson, isLlmConfigured } from "./llm-client.mjs";
-import { detectSensitiveValue } from "./column-profile.mjs";
 import { sampleRelationOverlap } from "./discovery-service.mjs";
 import { _internal as relationCandidateInternal } from "./relation-candidates.mjs";
 
@@ -23,8 +22,7 @@ export function createRelationDocumentService({store,connector,wikiDir,llm,fetch
     let assertions=deterministicAssertions(content);
     const extractionErrors=[];
     if(isLlmConfigured(llm)) {
-      const sensitiveTerms=store.listTables(source.id).flatMap((table)=>store.listColumns(source.id,table.tableName).filter((column)=>column.isSensitive).map((column)=>column.columnName));
-      for(const chunk of chunks(redactDocument(content,sensitiveTerms),CHUNK_CHARS)) {
+      for(const chunk of chunks(normalizeDocument(content),CHUNK_CHARS)) {
         try { const result=await callJson(llm,extractionMessages(chunk),{timeoutMs,fetchImpl,extraBody:/dashscope|\.maas\.aliyuncs\.com/i.test(String(llm?.baseUrl||""))?{enable_thinking:false}:{}});assertions.push(...normalizeExtraction(result)); }
         catch(error){extractionErrors.push(String(error?.message||error).slice(0,500));}
       }
@@ -65,7 +63,6 @@ async function validateAndPersist({store,connector,source,assertion,fileName,see
   const from=store.listColumns(source.id,assertion.fromTable).find((column)=>column.columnName===assertion.fromColumn);
   const to=store.listColumns(source.id,assertion.toTable).find((column)=>column.columnName===assertion.toColumn);
   if(!from||!to)return {...base,reason:"COLUMN_NOT_FOUND"};
-  if(from.isSensitive||to.isSensitive)return {...base,reason:"SENSITIVE_COLUMN"};
   if(!relationCandidateInternal.compatibleType(from.dataType,to.dataType))return {...base,reason:"TYPE_INCOMPATIBLE"};
   if(assertion.fromTable===assertion.toTable&&assertion.fromColumn===assertion.toColumn)return {...base,reason:"SELF_IDENTITY"};
   const key=relationKey(assertion);const reverse=reverseRelationKey(assertion);
@@ -73,7 +70,7 @@ async function validateAndPersist({store,connector,source,assertion,fileName,see
   if(store.getRelationByKey(source.id,assertion.fromTable,assertion.fromColumn,assertion.toTable,assertion.toColumn)||store.getRelationByKey(source.id,assertion.toTable,assertion.toColumn,assertion.fromTable,assertion.fromColumn))return {...base,reason:"RELATION_ALREADY_EXISTS"};
   seen.add(key);seen.add(reverse);
   const overlapRatio=await sampleRelationOverlap(connector,source,{tableName:assertion.fromTable,columnName:assertion.fromColumn},{tableName:assertion.toTable,columnName:assertion.toColumn},sampleLimit,{timeoutMs:overlapTimeoutMs});
-  const quote=redactDocument(metadataText(assertion.evidenceQuote,500),[]);const confidence=Math.max(0,Math.min(1,.5+(overlapRatio??0)*.3));
+  const quote=normalizeDocument(metadataText(assertion.evidenceQuote,500));const confidence=Math.max(0,Math.min(1,.5+(overlapRatio??0)*.3));
   const relation=store.upsertRelation({sourceId:source.id,fromTable:assertion.fromTable,fromCol:assertion.fromColumn,toTable:assertion.toTable,toCol:assertion.toColumn,cardinality:assertion.cardinality,confidence,overlapRatio,status:"review",inferenceSource:"document",modelDecision:"relation",modelConfidence:.5,modelReason:`文档 ${metadataText(fileName,160)}：${quote||"明确关系断言"}`,modelName:"relation-document-v1",structuralScore:null,structuralReason:"文档断言经目录与类型校验"});
   store.addQuestion({sourceId:source.id,kind:"JOIN 路径",scope:"table",tableName:relation.fromTable,columnName:relation.fromCol,relationId:relation.id,question:`${relation.fromTable}.${relation.fromCol} 是否关联 ${relation.toTable}.${relation.toCol}？`,evidence:`上传文档 ${metadataText(fileName,160)} 的关系断言：${quote||"无短引用"}；${overlapRatio==null?"未取得本地样本":`本地样本值域重叠 ${(overlapRatio*100).toFixed(2)}%`}。该关系必须经人工确认后才进入 JOIN 白名单。`,options:["确认该关联","保留候选","不允许关联"]});
   return {...base,accepted:true,relationId:relation.id,overlapRatio};
@@ -86,7 +83,7 @@ function validateUpload(input) {
   if(Buffer.byteLength(input.content,"utf8")>MAX_CONTENT_BYTES)throw httpError(413,"文档内容不能超过 256 KiB");
   return {fileName,extension,content:input.content};
 }
-function redactDocument(value,sensitiveTerms=[]) { let result=metadataText(value,MAX_CONTENT_BYTES)||"";for(const term of sensitiveTerms.filter(Boolean))result=result.replace(new RegExp(escapeRegExp(term),"gi"),"[REDACTED_SENSITIVE_FIELD]");return result.split(/(\s+|[,，;；:：()（）<>])/).map((token)=>detectSensitiveValue(token.trim()).sensitive?"[REDACTED_SENSITIVE_VALUE]":token).join(""); }
+function normalizeDocument(value) { return metadataText(value,MAX_CONTENT_BYTES)||""; }
 function dedupeAssertions(items){const seen=new Set();return items.filter((item)=>{const key=relationKey(item);if(seen.has(key))return false;seen.add(key);return true;});}
 function relationKey(item){return `${item.fromTable}.${item.fromColumn}>${item.toTable}.${item.toColumn}`;}
 function reverseRelationKey(item){return `${item.toTable}.${item.toColumn}>${item.fromTable}.${item.fromColumn}`;}
@@ -95,7 +92,6 @@ function identifier(value){const text=String(value||"").trim();return /^[A-Za-z0
 function metadataText(value,maxLength=300){return value==null?null:[...String(value)].map((character)=>{const code=character.charCodeAt(0);return code<32&&![9,10].includes(code)||code===127?" ":character;}).join("").slice(0,maxLength);}
 function chunks(value,size){const result=[];for(let index=0;index<value.length;index+=size)result.push(value.slice(index,index+size));return result;}
 function publicDoc(doc){const safe={...doc};delete safe.filePath;return safe;}
-function escapeRegExp(value){return String(value).replace(/[.*+?^${}()|[\]\\]/g,"\\$&");}
 function httpError(status,message){const error=new Error(message);error.status=status;return error;}
 
-export const relationDocumentInternal={validateUpload,redactDocument,validateAndPersist};
+export const relationDocumentInternal={validateUpload,normalizeDocument,validateAndPersist};

@@ -1,5 +1,4 @@
 import { callLlmJson, isLlmConfigured } from "./llm-client.mjs";
-import { detectSensitiveValue } from "./column-profile.mjs";
 
 export const ONTOLOGY_CRITIC_PROMPT_VERSION="ontology-critic-v1";
 
@@ -30,13 +29,13 @@ export function messagesFor(candidates) {
 function criticInput(candidate,catalog,candidateId,acceptedObjects=[]) {
   const payload=candidate?.payload||{};const objectPayloads=candidate?.candidateType==="object"?[payload]:linkEndpointPayloads(candidate,acceptedObjects);
   const properties=objectPayloads.flatMap((object)=>object?.properties||[]);const tables=[...new Set(properties.map((property)=>property?.mapping?.table).filter(Boolean))];
-  const physical=tables.map((tableName)=>{const table=(catalog?.tables||[]).find((item)=>item.tableName===tableName);const mapped=new Set(properties.filter((property)=>property?.mapping?.table===tableName).map((property)=>property.mapping.column));return {tableName,tableComment:text(table?.comment,300),columns:(catalog?.columnsByTable?.[tableName]||[]).filter((column)=>mapped.has(column.columnName)&&!column.isSensitive).map((column)=>({columnName:column.columnName,comment:text(column.comment,200),profile:profile(column.profile)}))};});
+  const physical=tables.map((tableName)=>{const table=(catalog?.tables||[]).find((item)=>item.tableName===tableName);const mapped=new Set(properties.filter((property)=>property?.mapping?.table===tableName).map((property)=>property.mapping.column));return {tableName,tableComment:text(table?.comment,300),columns:(catalog?.columnsByTable?.[tableName]||[]).filter((column)=>mapped.has(column.columnName)).map((column)=>({columnName:column.columnName,comment:text(column.comment,200),profile:profile(column.profile)}))};});
   const relationIds=new Set((payload.relationMappings||[]).map((mapping)=>Number(mapping?.relationId??mapping)).filter(Number.isInteger));
   const relations=(catalog?.relations||[]).filter((relation)=>relationIds.has(Number(relation.id))).map((relation)=>({id:relation.id,fromTable:relation.fromTable,fromCol:relation.fromCol,toTable:relation.toTable,toCol:relation.toCol,cardinality:relation.cardinality,status:relation.status,inferenceSource:relation.inferenceSource}));
   return {candidateId,candidateType:candidate.candidateType,displayName:text(payload.displayName,160),description:text(payload.description,600),relationKind:text(payload.relationKind,80),physical,relations};
 }
 function linkEndpointPayloads(candidate,acceptedObjects){const byStableKey=new Map(acceptedObjects.map((item)=>[item?.stableKey,item?.payload]));const byApiName=new Map(acceptedObjects.map((item)=>[item?.payload?.apiName,item?.payload]));return [...new Set([byStableKey.get(candidate?.sourceStableKey)||byApiName.get(candidate?.payload?.source),byStableKey.get(candidate?.targetStableKey)||byApiName.get(candidate?.payload?.target)].filter(Boolean))];}
-function profile(value){if(!value)return null;return {formatPattern:text(value.formatPattern,160),sampleValues:(value.sampleValues||[]).filter((item)=>!detectSensitiveValue(item).sensitive).slice(0,5).map((item)=>text(item,64))};}
+function profile(value){if(!value)return null;return {formatPattern:text(value.formatPattern,160),sampleValues:(value.sampleValues||[]).slice(0,5).map((item)=>text(item,64))};}
 function normalize(output,allowed){const byId=new Map((Array.isArray(output?.results)?output.results:[]).map((item)=>[String(item?.candidateId||""),item]));return [...allowed].map((candidateId)=>{const raw=byId.get(candidateId);return {candidateId,consistent:raw?.consistent!==false,issue:raw?.consistent===false?text(raw?.issue||"critic 标记物理语义不一致",500):null};});}
 function text(value,maxLength){return value==null?null:[...String(value)].map((character)=>{const code=character.charCodeAt(0);return code<32||code===127?" ":character;}).join("").slice(0,maxLength);}
 

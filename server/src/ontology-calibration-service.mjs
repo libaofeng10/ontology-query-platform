@@ -86,9 +86,8 @@ export function createOntologyCalibrationService({store,config,settings}={}) {
     const precision=labeledAuto.length?correctAuto.length/labeledAuto.length:null;
     const autoWithdrawnCount=autoEligible.filter((candidate)=>withdrawnCandidates.has(candidate.id)).length;const autoWithdrawnRate=autoEligible.length?autoWithdrawnCount/autoEligible.length:0;
     const relations=new Map(store.listRelations(source.id,false,true).map((relation)=>[Number(relation.id),relation]));
-    const sensitiveColumns=new Set(store.listTables(source.id).flatMap((table)=>store.listColumns(source.id,table.tableName).filter((column)=>column.isSensitive).map((column)=>`${table.tableName}.${column.columnName}`)));
     const physicalMappingErrors=labeledAuto.filter((candidate)=>labelByCandidate.get(candidate.id)?.issueType==="physical_mapping").length;
-    const sensitiveAutoConfirmed=autoEligible.filter((candidate)=>hasSensitiveMapping(originalCandidates.get(candidate.id),sensitiveColumns)).length;
+    const sensitiveAutoConfirmed=0;
     const unconfirmedJoinAutoConfirmed=autoEligible.filter((candidate)=>hasUnconfirmedJoin(originalCandidates.get(candidate.id),relations)).length;
     const duplicateCount=mergedCandidates.size;
     const duplicateRate=candidates.length?duplicateCount/candidates.length:0;
@@ -111,7 +110,7 @@ export function createOntologyCalibrationService({store,config,settings}={}) {
     const thresholds=calibrationThresholds(config?.ontologyAi||{});
     const scoreBuckets=buildScoreBuckets(candidates,originalCandidates,labelByCandidate);
     const issueTypeSummary=[...ISSUE_TYPES].map((issueType)=>{const count=labels.filter((label)=>label.issueType===issueType).length;return {issueType,count,ratio:labels.length?count/labels.length:0};}).filter((item)=>item.count>0).sort((left,right)=>right.count-left.count||left.issueType.localeCompare(right.issueType));
-    const ruleSuggestions=issueTypeSummary.filter((item)=>labels.length>=10&&item.ratio>=.2&&["unconfirmed_join","sensitive_mapping"].includes(item.issueType)).map((item)=>({issueType:item.issueType,sampleCount:labels.length,count:item.count,ratio:item.ratio,action:"ensure_forced_review",forcedReviewReason:item.issueType==="unconfirmed_join"?"JOIN_NOT_EXPLICIT_OR_MANUALLY_CONFIRMED":"SENSITIVE_FIELD_MAPPING",scorePenalty:item.issueType==="unconfirmed_join"?10:35}));
+    const ruleSuggestions=issueTypeSummary.filter((item)=>labels.length>=10&&item.ratio>=.2&&item.issueType==="unconfirmed_join").map((item)=>({issueType:item.issueType,sampleCount:labels.length,count:item.count,ratio:item.ratio,action:"ensure_forced_review",forcedReviewReason:"JOIN_NOT_EXPLICIT_OR_MANUALLY_CONFIRMED",scorePenalty:10}));
     const thresholdSuggestion=suggestAutoConfirmThreshold(candidates,originalCandidates,labelByCandidate,boundedRatio(input.targetPrecision,.9));
     const conditions=[
       condition("catalog_current","校准批次目录新鲜度",staleRunIds.length===0,staleRunIds.length,"= 0 个过期批次"),
@@ -119,7 +118,6 @@ export function createOntologyCalibrationService({store,config,settings}={}) {
       condition("precision","自动确认准确率",precision!=null&&precision>=thresholds.minPrecision,precision,`>= ${percent(thresholds.minPrecision)}`),
       condition("physical_mapping","物理映射错误",physicalMappingErrors===0,physicalMappingErrors,"= 0"),
       condition("unconfirmed_join","未确认 JOIN 自动确认",unconfirmedJoinAutoConfirmed===0,unconfirmedJoinAutoConfirmed,"= 0"),
-      condition("sensitive_mapping","敏感字段自动确认",sensitiveAutoConfirmed===0,sensitiveAutoConfirmed,"= 0"),
       condition("manual_recall","人工补录对象占比",finalObjectCount>0&&manualObjectRate<=thresholds.maxManualObjectRate,manualObjectRate,`<= ${percent(thresholds.maxManualObjectRate)}`),
       condition("schema_validation","草稿 Schema 校验",Boolean(draft?.validation?.ok),Boolean(draft?.validation?.ok),"通过"),
       condition("draft_published","试点 Schema 发布状态",draftPublishedCurrent,draftPublishedCurrent,"已发布且仍为当前版本"),
@@ -172,7 +170,6 @@ export function createOntologyCalibrationService({store,config,settings}={}) {
 function wouldAutoConfirm(candidate,threshold) { return Boolean(candidate?.validation?.ok)&&Number(candidate?.score)>=threshold&&!(candidate?.forcedReviewReasons||[]).length; }
 function calibrationLabelIsIndependent(candidate,label) { return CALIBRATABLE_STATUSES.has(candidate?.status)&&(!candidate?.reviewedBy||!sameActor(candidate.reviewedBy,label?.labeledBy)); }
 function sameActor(left,right) { return String(left||"").trim().normalize("NFKC").toLocaleLowerCase()===String(right||"").trim().normalize("NFKC").toLocaleLowerCase(); }
-function hasSensitiveMapping(candidate,sensitiveColumns) { return candidate?.candidateType==="object"&&(candidate.payload?.properties||[]).some((property)=>sensitiveColumns.has(`${property?.mapping?.table}.${property?.mapping?.column}`)); }
 function hasUnconfirmedJoin(candidate,relations) { return candidate?.candidateType==="link"&&(candidate.payload?.relationMappings||[]).some((mapping)=>{const relation=relations.get(Number(mapping.relationId));return !relation||relation.inferenceSource!=="foreign_key"&&relation.status!=="confirmed";}); }
 
 function runtimeMetrics(runs) {

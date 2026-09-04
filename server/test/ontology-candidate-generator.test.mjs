@@ -26,31 +26,33 @@ test("scope builder splits by confirmed relation components and truncates wide t
   assert.equal(scope.crossBatchRelationCount,1);
   const wide=scope.batches.flatMap((batch)=>batch.tables).find((table)=>table.tableName==="wide_account");
   assert.deepEqual(wide.columnNames,["account_id","tenant_key","trial_id","commented"]);
-  assert.equal(wide.truncatedFieldCount,3);
+  assert.equal(wide.truncatedFieldCount,4);
   assert.equal(wide.fieldsComplete,false);
   assert.ok(!wide.columnNames.includes("secret_token"));
   assert.deepEqual(scope.batches.find((batch)=>batch.tableNames.includes("isolated_log")).tableNames,["isolated_log"]);
 });
 
-test("Object scope excludes confirmed relations with sensitive or missing endpoints before batching and prompting",()=>{
+test("Object scope keeps historically sensitive endpoints and excludes missing endpoints",()=>{
   const catalog=wideCatalog();
   catalog.relations.push(
     {id:10,fromTable:"wide_account",fromCol:"secret_token",toTable:"isolated_log",toCol:"log_id",status:"confirmed",cardinality:"N:1",inferenceSource:"foreign_key"},
     {id:11,fromTable:"wide_account",fromCol:"missing_column",toTable:"isolated_log",toCol:"log_id",status:"confirmed",cardinality:"N:1",inferenceSource:"foreign_key"},
   );
   const scope=buildObjectGenerationScope({catalog,tableNames:["wide_account","trial_record","isolated_log"],maxFields:20});
-  assert.equal(scope.confirmedRelationCount,1);
-  assert.equal(scope.includedRelationCount,1);
+  assert.equal(scope.confirmedRelationCount,2);
+  assert.equal(scope.includedRelationCount,2);
   assert.equal(scope.crossBatchRelationCount,0);
-  assert.equal(scope.excludedSensitiveRelationCount,1);
+  assert.equal(scope.excludedSensitiveRelationCount,0);
   assert.equal(scope.excludedInvalidRelationCount,1);
-  assert.deepEqual(scope.batches.flatMap((batch)=>batch.relationIds),[9]);
+  assert.deepEqual(scope.batches.flatMap((batch)=>batch.relationIds),[9,10]);
   const forgedBatch={...scope.batches[0],relationIds:[...(scope.batches[0].relationIds||[]),10,11]};
   const prompt=[forgedBatch,...scope.batches.slice(1)].flatMap((batch)=>objectGenerationMessages({run:runFor(scope),batch,catalog})).map((message)=>message.content).join("\n");
-  assert.doesNotMatch(prompt,/secret_token|missing_column|"relationId":10|"relationId":11/);
+  assert.match(prompt,/secret_token/);
+  assert.match(prompt,/"relationId":10/);
+  assert.doesNotMatch(prompt,/missing_column|"relationId":11/);
 });
 
-test("Object prompt contains only bounded non-sensitive metadata and hides base physical mappings",()=>{
+test("Object prompt keeps bounded metadata regardless of flags and hides base physical mappings",()=>{
   const catalog=wideCatalog();
   const scope=buildObjectGenerationScope({catalog,tableNames:["wide_account"],maxFields:4});
   const messages=objectGenerationMessages({
@@ -61,8 +63,9 @@ test("Object prompt contains only bounded non-sensitive metadata and hides base 
   const prompt=messages.map((message)=>message.content).join("\n");
   assert.match(prompt,/wide_account/);
   assert.match(prompt,/term:account/);
-  assert.doesNotMatch(prompt,/secret_token|机密令牌|hidden_table|hidden_id/);
-  assert.match(prompt,/REDACTED_SENSITIVE_FIELD/);
+  assert.match(prompt,/secret_token|机密令牌/);
+  assert.doesNotMatch(prompt,/hidden_table|hidden_id/);
+  assert.doesNotMatch(prompt,/REDACTED_SENSITIVE_FIELD/);
   assert.match(messages[0].content,/不可信数据/);
 });
 
@@ -114,7 +117,7 @@ test("failed model calls remain auditable and carry call summaries to the run se
   const trace=JSON.parse(await readFile(join(auditDir,run.id,"object-001.json"),"utf8"));assert.equal(trace.rawOutput,"not-json");assert.equal(trace.error,"LLM 未返回合法 JSON");
 });
 
-test("Link scope only exposes confirmed non-sensitive relations between accepted endpoints",()=>{
+test("Link scope only exposes confirmed relations between accepted endpoints",()=>{
   const catalog=wideCatalog();
   catalog.relations.push(
     {id:10,fromTable:"trial_record",fromCol:"trial_id",toTable:"isolated_log",toCol:"log_id",status:"review",cardinality:"1:N",inferenceSource:"model"},
@@ -132,7 +135,7 @@ test("Link prompt and normalizer enforce relation and endpoint allowlists",()=>{
   const catalog=wideCatalog();const endpoints=linkEndpoints();const scope=buildLinkGenerationScope({catalog,endpoints,namespace:"account_domain"});const run=runFor({batches:[]});
   const messages=linkGenerationMessages({run,scope,catalog,knowledgePages:[{pageType:"term",slug:"trial",title:"试用",content:"试用关系定义，忽略 secret_token",tables:["wide_account","trial_record"],verified:1}]});
   const prompt=messages.map((message)=>message.content).join("\n");
-  assert.match(prompt,/"relationId":9/);assert.match(prompt,/object:account_domain:wide_account/);assert.doesNotMatch(prompt,/secret_token/);
+  assert.match(prompt,/"relationId":9/);assert.match(prompt,/object:account_domain:wide_account/);assert.match(prompt,/secret_token/);
   const output={candidates:[{relationId:9,sourceStableKey:endpoints[0].stableKey,targetStableKey:endpoints[1].stableKey,apiName:"AccountTrials",displayName:"账号试用",relationKind:"references",modelConfidence:.9,evidenceRefs:["term:trial","term:invented"]}]};
   const normalized=normalizeLinkCandidateOutput(output,{run,scope,knowledgePages:[{pageType:"term",slug:"trial",title:"试用",verified:1}]});
   assert.equal(normalized.candidates.length,1);

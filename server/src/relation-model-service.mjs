@@ -1,5 +1,4 @@
 import { callLlmJson, isLlmConfigured, llmConfigurationIssues } from "./llm-client.mjs";
-import { detectSensitiveValue } from "./column-profile.mjs";
 
 const DECISIONS=new Set(["relation","uncertain","none"]);
 const CARDINALITIES=new Set(["1:1","1:N","N:1","N:N","unknown"]);
@@ -72,7 +71,7 @@ function messagesFor(batch,knowledgePages=[]) {
 
 function profileForPrompt(profile) {
   if(!profile)return null;
-  return {sampleValues:(profile.sampleValues||[]).filter((value)=>!detectSensitiveValue(value).sensitive).slice(0,5).map((value)=>metadataText(value,64)),formatPattern:metadataText(profile.formatPattern,160),distinctCount:Number(profile.distinctCount)||0,nullRatio:Number(profile.nullRatio)||0};
+  return {sampleValues:(profile.sampleValues||[]).slice(0,5).map((value)=>metadataText(value,64)),formatPattern:metadataText(profile.formatPattern,160),distinctCount:Number(profile.distinctCount)||0,nullRatio:Number(profile.nullRatio)||0};
 }
 function knowledgePriority(page){return page?.pageType==="join"?0:page?.pageType==="rule"?1:2;}
 

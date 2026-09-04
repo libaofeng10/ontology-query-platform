@@ -1,4 +1,5 @@
-import { buildIntentRetrievalFacets } from "./query-intent.mjs";
+import { buildIntentRetrievalFacets, detectQueryProducts } from "./query-intent.mjs";
+import { extractKnowledgeColumnRefs } from "./knowledge-column-refs.mjs";
 
 const TYPE_BOOST={metric:5,term:4,rule:2.5,join:2,table:1};
 const NOISE_TABLE=/(?:^|_)(?:copy\d*|bak\d*|backup|archive|history|tmp|temp|test)(?:_|$)|_20\d{6}(?:_|$)/i;
@@ -74,7 +75,10 @@ export function retrieveKnowledge({question,pages,tables,columnsByTable,relation
     }:facet;
     const structuralCandidates=rankFacetTables(rankingFacet,tables,columnsByTable,authoritativeNames);
     const ontologyCandidates=ontologyIndex?rankOntologyFacetTables(facet,ontologyIndex,tableByName):[];
-    return {facet,authoritativeNames,authoritativePageKeys:authoritativePages.map(knowledgePageKey),candidates:mergeFacetCandidates(structuralCandidates,ontologyCandidates),selected:[],paths:[],productPaths:new Map(),attributionBinding:null,attributionSubjectTable:null};
+    const candidates=mergeFacetCandidates(structuralCandidates,ontologyCandidates)
+      .filter(({table})=>facet.kind!=="subject"||productScopeCompatible(table.comment||table.tableName,productScopeValues))
+      .map((candidate)=>bindVerifiedFilterColumn(facet,candidate,authoritativePages,columnsByTable));
+    return {facet,authoritativeNames,authoritativePageKeys:authoritativePages.map(knowledgePageKey),candidates,selected:[],paths:[],productPaths:new Map(),attributionBinding:null,attributionSubjectTable:null};
   });
   anchorMeasureCandidates(facetEntries,{columnsByTable,tableByName});
   const connectSubjectFacets=new Set(["aggregate","ranking","trend","comparison"]).has(intent?.shape?.kind)
@@ -98,6 +102,15 @@ export function retrieveKnowledge({question,pages,tables,columnsByTable,relation
   // that two named products were both covered.
   const productAssignments=assignProductFacetCandidates(facetEntries.filter((entry)=>entry.facet.kind==="product"&&entry.facet.required));
   for(const assignment of productAssignments.values())selectFacetCandidate(assignment.entry,assignment.candidate,{productScopeId:assignment.entry.facet.key});
+  // A single requested business object uses the already proven product root.
+  // Otherwise an alphabetically earlier generic account table can become the
+  // filter owner even though the product facet resolved a different table.
+  const subjectEntries=facetEntries.filter((entry)=>entry.facet.kind==="subject"&&entry.facet.required);
+  if(subjectEntries.length===1) {
+    const entry=subjectEntries[0];
+    const roots=[...productAssignments.values()].map(({candidate})=>entry.candidates.find((item)=>item.table.tableName===candidate.table.tableName)).filter(Boolean);
+    entry.candidates=[...roots,...entry.candidates.filter((candidate)=>!roots.includes(candidate))];
+  }
   let filterClosureSnapshot=null;
   // Build the requested capability closure before binding filters. A verified
   // filter may reuse this closure but must never enlarge it, so dimensions,
@@ -227,7 +240,9 @@ export function retrieveKnowledge({question,pages,tables,columnsByTable,relation
       }
       if(selectedPath)options.push({candidate,path:selectedPath});
     }
-    return options;
+    // Prefer the field on the declared business root. A similarly named
+    // field reached through a join cannot displace a direct local binding.
+    return options.sort((left,right)=>left.path.length-right.path.length);
   }
   const facetDiagnostics=facetEntries.map(({facet,authoritativeNames,authoritativePageKeys,candidates,selected,paths,productPaths,attributionBinding,attributionSubjectTable})=>{
     const authoritativeTables=candidates.filter((entry)=>authoritativeNames.has(entry.table.tableName)).map((entry)=>entry.table.tableName);
@@ -254,7 +269,7 @@ export function retrieveKnowledge({question,pages,tables,columnsByTable,relation
     // Verified evidence may narrow a single-domain facet, but it cannot erase
     // a separately proven product endpoint from an explicit multi-product
     // request. Keep all product-bound execution endpoints in the contract.
-    const executionTables=attributionSubjectTable?[attributionSubjectTable]:productScopedExecutionTables.length?[...new Set([...authoritativeTables,...productScopedExecutionTables])]:authoritativeTables.length?authoritativeTables:new Set(["subject","product"]).has(facet.kind)&&!facet.allowMultiple?selected.slice(0,1):facet.kind==="product"?selected.slice(0,1):selected;
+    const executionTables=facet.kind==="filter"?selected:attributionSubjectTable?[attributionSubjectTable]:productScopedExecutionTables.length?[...new Set([...authoritativeTables,...productScopedExecutionTables])]:authoritativeTables.length?authoritativeTables:new Set(["subject","product"]).has(facet.kind)&&!facet.allowMultiple?selected.slice(0,1):facet.kind==="product"?selected.slice(0,1):selected;
     // Attribution dimensions execute over both the business subject and the
     // displayed dimension object.  The bridge validity is carried separately
     // by bindingValidityPredicates; include current-row predicates for both
@@ -839,9 +854,9 @@ function rankFacetTables(facet,tables,columnsByTable,pageBoundNames=new Set()) {
 function productStructureEvidence(facet,table) {
   const values=[...new Set([...(facet.productScopeValues||[]),facet.value].filter(Boolean))];
   const current=String(facet.value||"");
-  const commentMatches=matchingProductValues(table.comment,values);
+  const commentMatches=[...new Set([...detectQueryProducts(table.comment),...matchingProductValues(table.comment,values)])];
   if(commentMatches.length)return commentMatches.length===1&&commentMatches[0]===current?{confidence:4,source:"comment"}:{confidence:-1,source:"comment_conflict"};
-  const nameMatches=matchingProductValues(table.tableName,values);
+  const nameMatches=[...new Set([...detectQueryProducts(table.tableName),...matchingProductValues(table.tableName,values)])];
   if(nameMatches.length)return nameMatches.length===1&&nameMatches[0]===current?{confidence:3,source:"table_name"}:{confidence:-1,source:"table_name_conflict"};
   return {confidence:0,source:"none"};
 }
@@ -849,6 +864,12 @@ function productStructureEvidence(facet,table) {
 function matchingProductValues(value,products) {
   const text=String(value||"");
   return products.filter((product)=>productMarkerPattern(product).test(text));
+}
+
+function productScopeCompatible(value,products) {
+  if(!products.length)return true;
+  const declared=[...new Set([...detectQueryProducts(value),...matchingProductValues(value,products)])];
+  return !declared.length||declared.some((product)=>products.includes(product));
 }
 
 function productMarkerPattern(value) {
@@ -942,6 +963,18 @@ function canonicalNumericValue(value) {
   return `${sign}${integer||"0"}${fraction?`.${fraction}`:""}`;
 }
 
+function bindVerifiedFilterColumn(facet,candidate,pages,columnsByTable) {
+  if(facet.kind!=="filter"||facet.valueBinding==="verified_knowledge")return candidate;
+  const table=candidate.table.tableName;
+  // A page can select a field only for its own table and matching concept.
+  // Prose and counterexamples may mention rejected sibling columns, so only
+  // the positive SQL definition resolves the catalog's broad field synonyms.
+  const refs=new Set(pages.flatMap((page)=>extractKnowledgeColumnRefs({...page,content:"",antiExamples:""},columnsByTable)).filter((ref)=>ref.table===table).map((ref)=>ref.column));
+  const matches=candidate.matchedColumns.filter((column)=>refs.has(column.name));
+  if(matches.length!==1)return candidate;
+  return {...candidate,matchedColumns:matches};
+}
+
 function unambiguousFilterExecutionColumns(entries) {
   const result=[];
   for(const entry of entries||[]) {
@@ -963,8 +996,13 @@ function facetAuthoritativePages(facet,pages,{productScopeValues=[]}={}) {
   for(const page of pages||[]) {
     if(!page.verified)continue;
     if(facet.kind==="measure"&&page.pageType!=="metric")continue;
+    // Physical names are not product labels: alpha_account_user stores
+    // AlphaGPT users, so its prefix must not make that page Alpha authority.
+    let productLabel=[page.title,...(page.aliases||[])].join(" ");
+    for(const table of page.tables||[])productLabel=productLabel.replace(new RegExp(escapeRegExp(table),"ig")," ");
+    if(!productScopeCompatible(productLabel,productScopeValues))continue;
     if(facet.kind==="product") {
-      const matches=matchingProductValues([page.title,...(page.aliases||[])].join(" "),productScopeValues);
+      const matches=[...new Set([...detectQueryProducts(productLabel),...matchingProductValues(productLabel,productScopeValues)])];
       if(matches.length!==1||matches[0]!==facet.value)continue;
     }
     // Body/SQL tokens and embedding similarity are recall signals only. They

@@ -75,13 +75,14 @@ export function parseQueryIntent(question,{now=new Date(),concepts=[],filterConc
   const normalizedQuestion=rawQuestion.replace(/\s+/g,"").replace(/[？?。！!，,；;：:]/g,"");
   const resolvedTimeZone=resolveBusinessTimeZone(timeZone);
   const organization=extractOrganizationEntity(normalizedQuestion);
+  const organizationSpan=organization?literalTextSpan(rawQuestion,organization.sourceText):null;
   const preliminarySubjects=detectSubjects(normalizedQuestion);
   const filterQuestion=rawQuestion.replace(/[？?。！；;：:]/g," ").replace(/!+(?!=)/g," ");
   const deletionResolution=detectDeletionScope(filterQuestion,{subjects:preliminarySubjects});
-  let filterInput=organization?.sourceText?filterQuestion.replace(organization.sourceText," ".repeat(organization.sourceText.length)):filterQuestion;
+  let filterInput=maskTextSpans(filterQuestion,organizationSpan?[organizationSpan]:[]);
   if(deletionResolution.span)filterInput=maskTextSpans(filterInput,[deletionResolution.span]);
   const filterResolution=detectBusinessFilters(filterInput,{subjects:preliminarySubjects,concepts:filterConcepts,protectedTermAliases:[...(protectedTermAliases||[]),...(rowDomainConcepts||[]).flatMap((item)=>item.aliases||[])]});
-  const rowDomainResolution=detectKnowledgeRowDomains(rawQuestion,rowDomainConcepts,{subjects:preliminarySubjects,excludedSpans:filterResolution.spans});
+  const rowDomainResolution=detectKnowledgeRowDomains(rawQuestion,rowDomainConcepts,{subjects:preliminarySubjects,excludedSpans:[...filterResolution.spans,...(organizationSpan?[organizationSpan]:[])]});
   const semanticRawQuestion=maskTextSpans(rawQuestion,[...filterResolution.spans,...rowDomainResolution.spans,...(deletionResolution.span?[deletionResolution.span]:[])]);
   const semanticQuestion=semanticRawQuestion.replace(/\s+/g,"").replace(/[？?。！!，,；;：:]/g,"");
   const detectedSubjects=detectSubjects(semanticQuestion);
@@ -96,14 +97,13 @@ export function parseQueryIntent(question,{now=new Date(),concepts=[],filterConc
   const timeRole=detectTimeRole(semanticQuestion,timeRange,measures,shape.kind==="trend");
   const allProductScope=/(?:所有|全部|完整|全量|不限)(?:的)?产品|全产品|取消产品限制/.test(normalizedQuestion);
   const exhaustive=/(?:所有|全部|完整|全量|各个).{0,12}(?:账号|账户)|(?:账号|账户).{0,12}(?:所有|全部|完整|全量)/.test(normalizedQuestion)||allProductScope;
-  const products=[];
-  if(/alpha/i.test(normalizedQuestion.replace(/alpha\s*gpt/ig,"")))products.push("alpha");
-  if(/alpha\s*gpt|alphagpt/i.test(normalizedQuestion))products.push("alphaGpt");
+  const products=detectQueryProducts(normalizedQuestion);
   const filterReset=detectFilterReset(normalizedQuestion,filterConcepts);
   const organizationLiteralUnsafe=Boolean(organization&&/[\\%_]/.test(organization.text));
   const organizationBinding=organizationFilterBinding(filterConcepts);
+  const systemIdResolution=organizationSystemIdFilter(rawQuestion,organization,filterConcepts,filterResolution.filters);
   const entities=organization?[organization]:[];
-  const normalizedFilters=[...filterResolution.filters,...rowDomainResolution.filters].map((filter)=>filter.attachesTo||subjects.length!==1?filter:{...filter,attachesTo:subjects[0]});
+  const normalizedFilters=[...filterResolution.filters,...rowDomainResolution.filters,...systemIdResolution.filters].map((filter)=>filter.attachesTo||subjects.length!==1?filter:{...filter,attachesTo:subjects[0]});
   const filters=[...(organization&&!organizationLiteralUnsafe?[{id:`filter:organization_name:0`,kind:"organization_name",field:"organization_name",fieldSurface:"机构名称",fieldTerms:["机构名称","律所名称","所属律所","组织名称","office_name","organization_name","org_name","firm_name",...(organizationBinding.terms||[])],physicalColumns:[...(organizationBinding.physicalColumns||[])],operator:"contains",value:organization.text,valueType:"string",attachesTo:subjects.length===1?subjects[0]:null,immutable:true,sourceText:organization.sourceText,...(organizationBinding.provenance?{provenance:organizationBinding.provenance}:{})}]:[]),...normalizedFilters,...(deletionResolution.filter?[{...deletionResolution.filter,attachesTo:deletionResolution.filter.attachesTo||(subjects.length===1?subjects[0]:null)}]:[])];
   const ambiguities=[];
   if(subjects.length===0)ambiguities.push({code:"SUBJECT_UNKNOWN",message:"未识别出明确的业务对象",blocking:false});
@@ -121,6 +121,7 @@ export function parseQueryIntent(question,{now=new Date(),concepts=[],filterConc
   if(shape.kind==="ranking"&&dimensions.some((item)=>item.value==="seller")&&measures.some((item)=>item.timeRole==="completion")&&!explicitAttribution(normalizedQuestion))ambiguities.push({code:"DIMENSION_ATTRIBUTION_AMBIGUOUS",message:"销售归属未说明是当前负责人还是事件发生时负责人，两种口径可能产生不同排行",blocking:true,options:["当前负责人","事件发生时负责人"]});
   ambiguities.push(...filterResolution.ambiguities);
   ambiguities.push(...rowDomainResolution.ambiguities);
+  ambiguities.push(...systemIdResolution.ambiguities);
   if(filterReset.ambiguity)ambiguities.push(filterReset.ambiguity);
   if(allProductScope)ambiguities.push({code:"PRODUCT_SCOPE_REGISTRY_REQUIRED",message:"问题要求覆盖所有产品，但当前意图中没有已发布且可穷举的产品注册表，系统不会把“所有产品”退化为任意单一产品",blocking:true,sourceText:matched(normalizedQuestion,/(?:所有|全部|完整|全量|不限)(?:的)?产品|全产品|取消产品限制/),options:["明确列出需要覆盖的产品","发布该业务对象的完整产品注册表"]});
   if(organizationLiteralUnsafe)ambiguities.push({code:"ENTITY_LITERAL_ESCAPE_UNSUPPORTED",message:`机构专名“${organization.text}”含有 LIKE 通配或转义字符，当前无法证明其字面包含语义`,blocking:true,sourceText:organization.sourceText,options:["去掉通配符并输入完整机构名称","发布带明确 ESCAPE 规则的机构匹配能力"]});
@@ -185,15 +186,11 @@ export function catalogFilterConcepts(tables=[],columnsByTable={},ontologySchema
   const tableByName=new Map((tables||[]).map((table)=>[table.tableName,table]));
   const subjectLabels={clue:"线索",account:"账号",customer:"客户",order:"订单",case:"案件",revenue:"收入"};
   const dictionaryByColumn=new Map(Object.entries(enumItemsByColumn||{}).map(([column,items])=>[String(column).toLowerCase(),items||[]]));
-  const add=(alias,column,{numeric=false,provenance="catalog",semanticKind=null,sensitive=false}={})=>{
+  const add=(alias,column,{numeric=false,provenance="catalog",semanticKind=null}={})=>{
     const surface=String(alias||"").trim();const physical=String(column||"").toLowerCase();
     if(!surface||surface.length>64||!physical.includes(".")||/^[\p{P}\p{S}\s]+$/u.test(surface))return;
     const key=normalizeText(surface);const group=groups.get(key)||{alias:surface,columns:new Set(),terms:new Set(),numericStates:new Set(),semanticKinds:new Set(),provenance:new Set(),memberValues:new Map()};
     group.columns.add(physical);group.terms.add(surface);group.terms.add(physical);group.terms.add(physical.split(".").at(-1));group.numericStates.add(Boolean(numeric));if(semanticKind)group.semanticKinds.add(semanticKind);group.provenance.add(provenance);groups.set(key,group);
-    // A dictionary harvested from a sensitive column would turn real personal
-    // values into parser vocabulary, so those columns contribute a field surface
-    // only — never members.
-    if(sensitive)return;
     for(const member of dictionaryMemberSurfaces(dictionaryByColumn.get(physical))) {
       const memberKey=normalizeText(member);
       if(memberKey&&!group.memberValues.has(memberKey)&&group.memberValues.size<MEMBER_VALUE_LIMIT)group.memberValues.set(memberKey,member);
@@ -206,13 +203,12 @@ export function catalogFilterConcepts(tables=[],columnsByTable={},ontologySchema
       const semanticKind=typedColumnKind(column);
       // 2026-09-04 应用户要求移除敏感列限制：所有列均登记为筛选概念。
       const physical=`${tableName}.${column.columnName}`;const numeric=numericDataType(column.dataType);
-      const sensitive=false;
-      add(column.columnName,physical,{numeric,semanticKind,sensitive});
-      for(const alias of typedKindAliases(semanticKind))add(alias,physical,{numeric:false,semanticKind,sensitive});
+      add(column.columnName,physical,{numeric,semanticKind});
+      for(const alias of typedKindAliases(semanticKind))add(alias,physical,{numeric:false,semanticKind});
       const comment=String(column.comment||"").trim();
       if(comment) {
-        add(comment,physical,{numeric,semanticKind,sensitive});
-        for(const subject of tableSubjects)if(subjectLabels[subject]&&!normalizeText(comment).startsWith(subjectLabels[subject]))add(`${subjectLabels[subject]}${comment}`,physical,{numeric,semanticKind,sensitive});
+        add(comment,physical,{numeric,semanticKind});
+        for(const subject of tableSubjects)if(subjectLabels[subject]&&!normalizeText(comment).startsWith(subjectLabels[subject]))add(`${subjectLabels[subject]}${comment}`,physical,{numeric,semanticKind});
       }
     }
   }
@@ -224,7 +220,7 @@ export function catalogFilterConcepts(tables=[],columnsByTable={},ontologySchema
     const aliases=[property.displayName,property.apiName];
     const binding=property.termBinding;const anchor=binding?anchors.get(`${binding.vocabulary}\u0000${binding.canonicalId}`):null;
     aliases.push(anchor?.prefLabelZh,anchor?.prefLabelEn,...(anchor?.altLabels||[]));
-    for(const alias of aliases.filter(Boolean))add(alias,`${table}.${column}`,{numeric:numericDataType(metadata?.dataType),semanticKind:typedColumnKind(metadata),provenance:"published_ontology_property",sensitive:false});
+    for(const alias of aliases.filter(Boolean))add(alias,`${table}.${column}`,{numeric:numericDataType(metadata?.dataType),semanticKind:typedColumnKind(metadata),provenance:"published_ontology_property"});
   }
   return [...groups.values()].map((group)=>{
     const fallback=`catalog_${safeConceptId(group.alias)}`;
@@ -313,6 +309,21 @@ function organizationFilterBinding(concepts=[]) {
   // datasources; multiple same-table siblings fail closed.
   if(!published.length&&physicalColumns.length!==1)return {physicalColumns:[],terms:[],provenance:null};
   return {physicalColumns,terms:[...new Set(selected.flatMap((item)=>item.terms||[]))],provenance:published.length?{kind:"published_ontology_property",sources:["published_ontology_property"]}:null};
+}
+
+function organizationSystemIdFilter(question,organization,concepts,explicitFilters=[]) {
+  const empty={filters:[],ambiguities:[]};
+  if(!organization||!/(?:律所|律师事务所)$/.test(organization.sourceText)||!/(?:这|该|此)(?:一)?(?:套|个)系统/.test(question))return empty;
+  const identifiers=[...question.matchAll(/\b(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\b/ig)].filter((match)=>!explicitFilters.some((filter)=>String(filter.value).toLowerCase()===match[0].toLowerCase()));
+  if(!identifiers.length)return empty;
+  // A pasted law-firm system record can omit the ID label. Bind its opaque
+  // identifier only to a published law-firm ID property, never to a user ID
+  // or another ID that merely happens to have the same physical type.
+  const candidates=(concepts||[]).filter((concept)=>(concept.provenance||[]).includes("published_ontology_property")&&(concept.aliases||[]).some((alias)=>/^(?:(?:alpha|alp))?(?:(?:所属)?律所(?:id|编号)|(?:office|lawfirm)id)$/i.test(String(alias).replace(/[\s_-]/g,""))));
+  const physicalColumns=[...new Set(candidates.flatMap((concept)=>concept.physicalColumns||[]))];
+  if(identifiers.length!==1||!physicalColumns.length)return {filters:[],ambiguities:[{code:"SYSTEM_ID_BINDING_UNKNOWN",blocking:true,message:"系统标识无法唯一绑定到已发布的律所 ID 属性，请明确 ID 字段",sourceText:identifiers.map((item)=>item[0]).join(" ")}]};
+  const value=identifiers[0][0];
+  return {filters:[{id:"filter:organization_id:0",kind:"business_filter",field:"organization_id",fieldSurface:"律所ID",fieldTerms:["律所ID","office_id"],physicalColumns,operator:"eq",value,valueType:"string",attachesTo:null,immutable:true,sourceText:value,provenance:{kind:"published_ontology_property",sources:["published_ontology_property"]}}],ambiguities:[]};
 }
 
 // A verified term/rule that defines a conjunction of direct physical
@@ -454,6 +465,12 @@ function compactTextMap(value) {
     text+=char.toLowerCase();map.push(index);
   }
   return {text,map};
+}
+
+function literalTextSpan(text,literal) {
+  const compact=compactTextMap(text);const needle=compactTextMap(literal).text;
+  const offset=needle?compact.text.indexOf(needle):-1;
+  return offset<0?null:{start:compact.map[offset],end:compact.map[offset+needle.length-1]+1};
 }
 
 function maskTextSpans(value,spans=[]) {
@@ -1128,10 +1145,18 @@ function filterValueType(value) {
 
 function escapeRegExp(value) {return String(value).replace(/[.*+?^${}()|[\]\\]/g,"\\$&");}
 
+export function detectQueryProducts(text) {
+  const products=[];
+  const value=String(text||"");
+  if(/(?:^|[^a-z0-9])alpha(?:$|[^a-z0-9])/i.test(value.replace(/alpha[\s_-]*gpt/ig,"")))products.push("alpha");
+  if(/(?:^|[^a-z0-9])alpha[\s_-]*gpt(?:$|[^a-z0-9])/i.test(value))products.push("alphaGpt");
+  return products;
+}
+
 function detectSubjects(text) {
   const subjects=[];
   if(/线索|进线|lead|clue/i.test(text))subjects.push("clue");
-  if(/账号|账户|account/i.test(text))subjects.push("account");
+  if(/账号|账户|用户|account|\busers?\b/i.test(text))subjects.push("account");
   if(/客户|customer/i.test(text))subjects.push("customer");
   if(/订单|order/i.test(text))subjects.push("order");
   if(/案件|案源|\bcase\b|matter/i.test(text))subjects.push("case");

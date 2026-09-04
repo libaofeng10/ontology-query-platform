@@ -32,7 +32,6 @@ import { createOntologyCandidateCritic } from "./ontology-candidate-critic.mjs";
 import { createOntologyDomainPlanner } from "./ontology-domain-plan.mjs";
 import { createOntologyDomainModelingService } from "./ontology-domain-modeling-service.mjs";
 import { createOntologyDomainDraftService } from "./ontology-domain-draft-service.mjs";
-import { detectSensitiveValue } from "./column-profile.mjs";
 import { createClaudeQueryBridge } from "./claude-query-bridge.mjs";
 import { dirname, join as joinPath } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -115,8 +114,8 @@ export function createApp(overrides={}) {
       if(req.method==="GET"&&url.pathname==="/api/ontology/schemas"){const sourceId=requiredSourceId(store,identity,url.searchParams.get("sourceId"));return send(res,200,semanticSchemas.list(sourceId));}
       if(req.method==="GET"&&url.pathname==="/api/ontology/catalog"){const sourceId=requiredSourceId(store,identity,url.searchParams.get("sourceId"));return send(res,200,semanticSchemas.catalog(sourceId));}
       if(req.method==="GET"&&url.pathname==="/api/ontology/term-anchors"){authorize(identity,"viewer");return send(res,200,store.listTermAnchors(url.searchParams.get("vocabulary")||null));}
-      if(req.method==="POST"&&url.pathname==="/api/ontology/term-anchors"){authorize(identity,"admin");const body=await readJson(req);const items=Array.isArray(body.items)?body.items:[body];if(!items.length||items.length>2_000)throw badRequest("术语锚点单次最多导入 2000 条");assertTermAnchorsSafe(items);return send(res,201,{count:items.length,items:items.map((item)=>store.upsertTermAnchor(item))});}
-      if(req.method==="POST"&&url.pathname==="/api/ontology/term-anchors/import"){authorize(identity,"admin");const body=await readJson(req);const items=parseTermAnchorCsv(body.csv,body.vocabulary);if(!items.length||items.length>2_000)throw badRequest("CSV 必须包含 1 到 2000 条术语锚点");assertTermAnchorsSafe(items);return send(res,201,{count:items.length,items:items.map((item)=>store.upsertTermAnchor(item))});}
+      if(req.method==="POST"&&url.pathname==="/api/ontology/term-anchors"){authorize(identity,"admin");const body=await readJson(req);const items=Array.isArray(body.items)?body.items:[body];if(!items.length||items.length>2_000)throw badRequest("术语锚点单次最多导入 2000 条");return send(res,201,{count:items.length,items:items.map((item)=>store.upsertTermAnchor(item))});}
+      if(req.method==="POST"&&url.pathname==="/api/ontology/term-anchors/import"){authorize(identity,"admin");const body=await readJson(req);const items=parseTermAnchorCsv(body.csv,body.vocabulary);if(!items.length||items.length>2_000)throw badRequest("CSV 必须包含 1 到 2000 条术语锚点");return send(res,201,{count:items.length,items:items.map((item)=>store.upsertTermAnchor(item))});}
       if(req.method==="GET"&&url.pathname==="/api/ontology/domain-plan"){const refresh=url.searchParams.get("refresh")==="1";const sourceId=requiredSourceId(store,identity,url.searchParams.get("sourceId"),refresh?"editor":"viewer");return send(res,200,await ontologyDomainPlanner.plan(sourceId,{refresh,actor:identity.name}));}
       if(req.method==="POST"&&url.pathname==="/api/ontology/domain-modeling"){const body=await readJson(req);const sourceId=requiredSourceId(store,identity,body.sourceId,"editor");const active=store.findActiveTask(sourceId,"ontology_domain_modeling");if(active)return send(res,202,active);ontologyDomainModeling.assertReady(sourceId);const orchestrationId=String(body.orchestrationId||"").trim()||null;if(orchestrationId){const original=store.getTask(orchestrationId);if(!original||original.taskType!=="ontology_domain_modeling"||Number(original.sourceId)!==Number(sourceId))throw badRequest("待恢复的全域建模任务不存在或不属于当前数据源");}return send(res,202,tasks.create({sourceId,taskType:"ontology_domain_modeling",payload:{refreshDomainPlan:body.refreshDomainPlan!==false,domainIds:Array.isArray(body.domainIds)?body.domainIds:[],orchestrationId,actor:identity.name}}));}
       const ontologyDomainWorkflowMatch=url.pathname.match(/^\/api\/ontology\/domain-modeling\/([^/]+)\/(summary|preview|apply|repair|retry-failed)$/);
@@ -235,18 +234,6 @@ function parseTermAnchorCsv(input,defaultVocabulary) {
     if(!vocabulary||!canonicalId)throw badRequest(`CSV 第 ${line+2} 行缺少 vocabulary 或 canonical_id`);
     return {vocabulary,canonicalId,prefLabelZh:zhIndex>=0?row[zhIndex]:null,prefLabelEn:enIndex>=0?row[enIndex]:null,kind:kindIndex>=0&&row[kindIndex]?row[kindIndex]:"object",broaderCanonicalId:broaderIndex>=0?row[broaderIndex]:null,altLabels:aliasesIndex>=0?String(row[aliasesIndex]||"").split(/[|；;]/).map((value)=>value.trim()).filter(Boolean):[],note:noteIndex>=0?row[noteIndex]:null};
   });
-}
-
-function assertTermAnchorsSafe(items) {
-  for(const [index,item] of items.entries())for(const value of termAnchorTextValues(item)) {
-    const finding=detectSensitiveValue(value);
-    if(finding.sensitive)throw badRequest(`术语锚点第 ${index+1} 条包含敏感值（${finding.kind}），已拒绝导入`);
-  }
-}
-
-function termAnchorTextValues(item) {
-  if(!item||typeof item!=="object")return [];
-  return Object.values(item).flatMap((value)=>Array.isArray(value)?value:value==null?[]:[value]).filter((value)=>typeof value==="string");
 }
 
 function parseCsvRows(value) {

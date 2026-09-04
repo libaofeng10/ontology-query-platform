@@ -2,6 +2,41 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { applyIntentClarification, buildIntentRetrievalQuestion, catalogFilterConcepts, DEFAULT_BUSINESS_TIME_ZONE, knowledgeIntentConcepts, knowledgeIntentRowDomains, mergeContextualQueryIntent, parseQueryIntent, queryIntentSqlErrors } from "../src/query-intent.mjs";
 
+test("Alpha 用户识别为账号，机构专名中的词不激活业务规则",()=>{
+  const rowDomainConcepts=knowledgeIntentRowDomains([
+    {pageType:"term",slug:"law-firm",title:"律师事务所",aliases:[],tables:["office"],verified:true,sqlContent:"organization_type = 1 OR organization_type = 2"},
+  ],{office:[{columnName:"organization_type",dataType:"int"}]});
+  for(const question of ["查询北京示例律师事务所的Alpha用户","查询 北京示例 律师事务所 的 Alpha 用户"]) {
+    const intent=parseQueryIntent(question,{rowDomainConcepts});
+    assert.deepEqual(intent.subjects,["account"]);
+    assert.equal(intent.filters[0]?.value,"北京示例");
+    assert.equal(intent.filters[0]?.attachesTo,"account");
+    assert.deepEqual(intent.ambiguities.filter((item)=>item.blocking),[]);
+  }
+  assert.ok(parseQueryIntent("查询律师事务所的账号",{rowDomainConcepts}).ambiguities.some((item)=>item.code==="KNOWLEDGE_FILTER_BINDING_UNSUPPORTED"),"独立业务术语仍需验证其谓词");
+});
+
+test("粘贴的律所系统标识绑定已发布律所 ID，不能丢弃或改绑用户 ID",()=>{
+  const tables=[{tableName:"account",comment:"Alpha用户"}];
+  const columns={account:[{columnName:"user_key",dataType:"varchar"},{columnName:"office_key",dataType:"varchar"}]};
+  const schema={objectTypes:[{apiName:"account",properties:[{apiName:"id",mapping:{table:"account",column:"user_key"}},{apiName:"office_id",displayName:"律所ID",mapping:{table:"account",column:"office_key"}}]}]};
+  const options={filterConcepts:catalogFilterConcepts(tables,columns,schema)};
+  const id="0123456789ABCDEF0123456789ABCDEF";
+  const question=`北京示例律师事务所 示例律师团队 ${id} 帮我查这套系统里面的Alpha用户`;
+  const intent=parseQueryIntent(question,options);
+  const filter=intent.filters.find((item)=>item.field==="organization_id");
+  assert.equal(filter.value,id);
+  assert.equal(filter.operator,"eq");
+  assert.deepEqual(filter.physicalColumns,["account.office_key"]);
+  assert.equal(filter.attachesTo,"account");
+  assert.ok(intent.requirements.some((item)=>item.id===filter.id));
+  assert.ok(parseQueryIntent(question).ambiguities.some((item)=>item.code==="SYSTEM_ID_BINDING_UNKNOWN"));
+  assert.ok(parseQueryIntent(`${question} FEDCBA9876543210FEDCBA9876543210`,options).ambiguities.some((item)=>item.code==="SYSTEM_ID_BINDING_UNKNOWN"));
+  const explicit=parseQueryIntent(`北京示例律师事务所这套系统的Alpha用户，account.user_key 等于 ${id}`,options);
+  assert.equal(explicit.filters.some((item)=>item.field==="organization_id"),false,"已明确字段的用户 ID 不能重新解释为律所 ID");
+  assert.ok(explicit.filters.some((item)=>item.physicalColumns?.includes("account.user_key")&&item.value===id));
+});
+
 test("relative calendar ranges use an explicit validated business time zone at the month boundary",()=>{
   const instant=new Date("2026-08-31T16:30:00.000Z");
   const original=process.env.BUSINESS_TIME_ZONE;

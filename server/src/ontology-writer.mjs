@@ -47,7 +47,7 @@ ${table.comment || "由数据库结构与探针结果自动生成，等待业务
 ## 字段
 | 字段 | 类型 | 说明 | 备注 |
 |---|---|---|---|
-${columns.map((column) => `| ${column.columnName} | ${column.dataType} | ${column.comment || "待补充"} | ${column.isSensitive ? "敏感字段，不采样" : column.isPrimary ? "主键" : ""} |`).join("\n")}
+${columns.map((column) => `| ${column.columnName} | ${column.dataType} | ${column.comment || "待补充"} | ${column.isPrimary ? "主键" : ""} |`).join("\n")}
 
 ## 枚举
 ${Object.entries(enumGroups).length ? Object.entries(enumGroups).map(([column, values]) => `### ${column}\n| 值 | 含义 | 占比 |\n|---|---|---|\n${values.map((value) => `| ${value.value} | ${value.meaning || "待确认"} | ${value.ratio == null ? "—" : `${(value.ratio * 100).toFixed(1)}%`} |`).join("\n")}`).join("\n\n") : "暂无安全可用的低基数枚举探针结果。"}

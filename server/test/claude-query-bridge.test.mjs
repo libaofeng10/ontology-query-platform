@@ -21,6 +21,8 @@ function session() {
 
 test("bridge accepts injected transport, validates execution IDs, and returns trusted runs", async () => {
   const mcp = session();
+  const sql = "SELECT COUNT(*) FROM t";
+  mcp.getTrace = () => [{ tool: "db_query", sql, thought: "执行只读查询", summary: "返回 1 行", ok: true, durationMs: 4, authorization: "private-token" }];
   const bridge = createClaudeQueryBridge({
     model: "claude-test",
     transport: async ({ args, prompt, mcpConfig }) => {
@@ -38,6 +40,32 @@ test("bridge accepts injected transport, validates execution IDs, and returns tr
   assert.deepEqual(outcome.runs[0].rows, [{ count: 2 }]);
   assert.deepEqual(outcome.tokenUsage, { promptTokens: 10, completionTokens: 4, totalTokens: 14, available: true });
   assert.equal(mcp.closed, 1);
+  assert.equal(outcome.toolTrace[0].sql, sql, "completed tool SQL must remain visible in chat history");
+  assert.equal(outcome.toolTrace[0].authorization, undefined);
+});
+
+test("bridge accepts compatible model execution IDs as an array, JSON array string, or single ID string", async () => {
+  for (const execution_ids of [["exec-1"], '["exec-1"]', "exec-1"]) {
+    const bridge = createClaudeQueryBridge({ transport: async () => ({ status: "answered", execution_ids, conclusion: "完成" }) });
+    const outcome = await bridge.run({ question: "x", mcp: session() });
+    assert.equal(outcome.status, "answered", JSON.stringify({ execution_ids, outcome }));
+    assert.deepEqual(outcome.executionIds, ["exec-1"]);
+    assert.deepEqual(outcome.runs[0].rows, [{ count: 2 }]);
+  }
+});
+
+test("execution ID normalization still rejects duplicates, malformed lists and unregistered scalar IDs", async () => {
+  for (const execution_ids of [[], ["exec-1", "exec-1"], '["exec-1","exec-1"]', "exec-1,exec-2", '{"id":"exec-1"}', ""]) {
+    const mcp = session();
+    mcp.resolveExecutions = () => { throw new Error("malformed IDs must fail before registry lookup"); };
+    const bridge = createClaudeQueryBridge({ transport: async () => ({ status: "answered", execution_ids, conclusion: "完成" }) });
+    const outcome = await bridge.run({ question: "x", mcp });
+    assert.equal(outcome.errorCode, "ANSWER_PROTOCOL_INVALID", JSON.stringify({ execution_ids, outcome }));
+  }
+  const mcp = session();
+  mcp.resolveExecutions = () => ({ ok: false, errorCode: "UNKNOWN_EXECUTION_ID", error: "not registered" });
+  const bridge = createClaudeQueryBridge({ transport: async () => ({ status: "answered", execution_ids: "not-registered", conclusion: "完成" }) });
+  assert.equal((await bridge.run({ question: "x", mcp })).errorCode, "UNKNOWN_EXECUTION_ID");
 });
 
 test("bridge fails closed when Claude fabricates an execution ID", async () => {

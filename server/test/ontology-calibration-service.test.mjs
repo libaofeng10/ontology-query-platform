@@ -133,7 +133,7 @@ test("calibration turns repeated issues into rule suggestions and adopts a sourc
   try{
     for(const [index,candidate] of fixture.candidates.entries()){if(index<2){rejectCandidate(fixture.store,candidate,"reviewer-a");fixture.service.label(candidate.id,{verdict:"incorrect",issueType:"sensitive_mapping"},"reviewer-b");}else{confirmCandidate(fixture.store,candidate,"reviewer-a");fixture.service.label(candidate.id,{verdict:"correct"},"reviewer-b");}}
     const report=fixture.service.report(fixture.source.id,{targetPrecision:.9});
-    assert.deepEqual(report.ruleSuggestions.map((item)=>item.forcedReviewReason),["SENSITIVE_FIELD_MAPPING"]);assert.equal(report.thresholdSuggestion.suggestedScore,81);assert.equal(report.autoConfirmScoreSource,"global");
+    assert.deepEqual(report.ruleSuggestions,[],"historical sensitivity labels cannot reintroduce a review rule");assert.equal(report.thresholdSuggestion.suggestedScore,81);assert.equal(report.autoConfirmScoreSource,"global");
     const adopted=fixture.service.adoptThreshold(fixture.source.id,{runIds:[fixture.run.id],targetPrecision:.9,autoConfirmScore:81},"admin-a");assert.equal(adopted.autoConfirmScore,81);assert.equal(adopted.updatedBy,"admin-a");
     const refreshed=fixture.service.report(fixture.source.id,{runIds:[fixture.run.id]});assert.equal(refreshed.autoConfirmScore,81);assert.equal(refreshed.autoConfirmScoreSource,"source");assert.equal(refreshed.sourceSetting.audit[0].oldValue,null);assert.equal(refreshed.sourceSetting.audit[0].newValue,81);
   }finally{fixture.store.close();}

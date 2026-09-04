@@ -70,6 +70,39 @@ test("snapshot only exposes published mapped tables/columns; sensitive metadata 
   assert.doesNotMatch(JSON.stringify(snapshot), /ignore|不要传给模型的原句/);
 });
 
+test("object reads and search disclose allowed physical state fields and enum meanings without an intent contract", () => {
+  const snapshot = fixture({ queryIntent: null, retrievalEvidence: null });
+  const objects = snapshot.read({ operation: "get_objects", ids: ["客户"] });
+  assert.deepEqual(objects.items[0].knowledge.map(({ slug, title }) => ({ slug, title })), [{ slug: "active-customers", title: "有效客户" }]);
+  const table = objects.items[0].tables.find((table) => table.tableName === "crm_customer");
+  const deleted = table.columns.find((column) => column.columnName === "is_deleted");
+  assert.equal(deleted.comment, "逻辑删除");
+  assert.deepEqual(deleted.enumValues, [{ value: "0", meaning: "有效", meaningSource: null }]);
+  assert.equal(table.columns.some((column) => column.columnName === "internal_note"), false);
+  const found = snapshot.read({ operation: "search", query: "is_deleted" });
+  assert.ok(found.items.some((item) => item.kind === "column" && item.table === "crm_customer" && item.columnName === "is_deleted"));
+  assert.equal(snapshot.read({ operation: "search", query: "password_hash" }).total, 0);
+});
+
+test("ontology search reaches verified definitions beyond the first 200 without preselecting by question", () => {
+  const snapshot = fixture({
+    queryIntent: null,
+    retrievalEvidence: null,
+    knowledge: Array.from({ length: 205 }, (_, index) => ({
+      slug: `definition-${index}`, title: `定义 ${index}`, verified: 1, tables: ["crm_customer"],
+      content: index === 204 ? "当前所属律所" : "普通定义", antiExamples: "开通时律所不能代表当前归属",
+    })),
+  });
+  const result = snapshot.read({ operation: "search", query: "当前所属律所" });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].slug, "definition-204");
+  assert.equal(result.items[0].antiExamples, "开通时律所不能代表当前归属");
+  const first = snapshot.read({ operation: "get_knowledge", limit: 50 });
+  assert.equal(first.total, 205);
+  assert.equal(first.items.length, 50);
+  assert.ok(first.nextCursor);
+});
+
 test("snapshot read operations paginate and disclose only returned tables", () => {
   const snapshot = fixture();
   assert.deepEqual(snapshot.disclose(["crm_customer", "unmodeled_secret"]), ["crm_customer"]);
@@ -83,6 +116,25 @@ test("snapshot read operations paginate and disclose only returned tables", () =
   const next = snapshot.read({ operation: "search", query: "客户", cursor: page.nextCursor, limit: 50 });
   assert.equal(next.items.length, page.total - 1);
   assert.ok(snapshot.read({ operation: "get_objects", ids: ["customer"] }).items.length);
+});
+
+test("snapshot overview retains required execution evidence without copying arbitrary retrieval data", () => {
+  const snapshot = fixture({
+    queryIntent: { requirements: [{ id: "subject:customer", kind: "subject", value: "customer", required: true }] },
+    retrievalEvidence: [{ diagnostics: {
+      apiKey: "private-provider-key",
+      facets: [{ key: "subject:customer", executionTables: ["crm_customer"], executionColumns: ["crm_customer.customer_id"],
+        executionValidityPredicates: [{ column: "crm_customer.is_deleted", operator: "eq", value: 0 }],
+        candidates: [{ prompt: "injected-instruction" }],
+      }],
+    } }],
+  });
+  const contract = snapshot.read("overview").executionContract;
+  assert.ok(contract);
+  assert.deepEqual(contract.slots[0].tables, ["crm_customer"]);
+  assert.deepEqual(contract.slots[0].executionValidityPredicates, [{ column: "crm_customer.is_deleted", operator: "eq", value: 0 }]);
+  assert.equal(snapshot.disclosedTables.size, 0);
+  assert.doesNotMatch(JSON.stringify(snapshot), /private-provider-key|injected-instruction/);
 });
 
 test("snapshot exposes only relations explicitly mapped by the published schema", () => {

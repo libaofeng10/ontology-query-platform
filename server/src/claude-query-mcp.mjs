@@ -117,6 +117,10 @@ export async function createClaudeQueryMcpSession(options = {}) {
     sdkTransport: null,
     runs: new Map(),
     trace: [],
+    readPages: new Set(),
+    readRules: new Set(),
+    toolSequence: 0,
+    onEvent: typeof options.onEvent === "function" ? options.onEvent : null,
     server: null,
     serverClosePromise: null,
     sockets: new Set(),
@@ -292,6 +296,7 @@ function makeSession(state) {
     get registry() { return makeRegistry(state); },
     get snapshot() { return state.snapshot; },
     get trace() { return state.trace.map((item) => ({ ...item })); },
+    getReadEvidence() { return { pages: [...state.readPages], rules: [...state.readRules] }; },
     get mcpConfig() {
       if (!session.url) return null;
       return {
@@ -352,7 +357,7 @@ function makeSession(state) {
   });
   Object.defineProperty(session, "getTrace", {
     enumerable: false,
-    value() { return state.trace.map((item) => ({ ...item })); },
+    value() { return state.trace.map((item) => ({ ...item })).sort((a, b) => (a.step ?? Infinity) - (b.step ?? Infinity)); },
   });
   Object.defineProperty(session, "getRun", {
     enumerable: false,
@@ -385,6 +390,9 @@ async function dispatchTool(state, name, args) {
   if (!state.active || state.closed) return failureResult("SESSION_CLOSED", "MCP session 已关闭");
   const started = Date.now();
   const normalizedName = String(name || "").trim();
+  // Allocate before awaiting: concurrent MCP calls must keep distinct steps.
+  const call = { step: ++state.toolSequence, tool: normalizedName, requestId: state.requestId, ...toolCallDetails(normalizedName, args) };
+  emitToolEvent(state, { type: "tool_call", ...call });
   let result;
   try {
     if (normalizedName === "ontology_read") result = await ontologyRead(state, args);
@@ -394,16 +402,52 @@ async function dispatchTool(state, name, args) {
     result = failureResult(error?.code || "TOOL_ERROR", safeMessage(error), { retryable: false });
   }
   const trace = {
-    tool: normalizedName,
-    requestId: state.requestId,
+    ...call,
     durationMs: Date.now() - started,
     ok: result?.ok !== false,
+    ...toolResultDetails(state, call, result),
     ...(normalizedName === "db_query" ? { sqlHash: hashSql(args?.sql), executionId: result?.executionId || null } : {}),
     ...(result?.errorCode ? { errorCode: result.errorCode } : {}),
   };
   state.trace.push(trace);
   if (state.trace.length > 100) state.trace.splice(0, state.trace.length - 100);
+  emitToolEvent(state, { type: "tool_result", ...trace });
   return result;
+}
+
+const ONTOLOGY_OPERATION_LABELS = Object.freeze({
+  overview: "读取业务概览",
+  search: "检索业务定义",
+  get_objects: "读取对象与字段",
+  get_relations: "读取关联关系",
+  get_knowledge: "读取业务知识",
+});
+
+function toolCallDetails(name, args) {
+  if (name === "ontology_read") {
+    const operation = safeText(args?.operation, 50).toLowerCase();
+    const query = safeText(args?.query, 500);
+    const ids = Array.isArray(args?.ids) ? args.ids.slice(0, 50).map((id) => safeText(id, 200)).join("、") : "";
+    return { operation, thought: ONTOLOGY_OPERATION_LABELS[operation] || "查阅业务定义", detail: query ? `检索：${query}` : ids ? `对象：${ids}` : operation };
+  }
+  if (name === "db_query") return { thought: "校验并执行只读查询", sql: String(args?.sql ?? "").trim().slice(0, 100_000), detail: safeText(args?.name, 200) };
+  return { thought: "校验工具调用" };
+}
+
+function toolResultDetails(state, call, result) {
+  if (result?.ok === false) return { summary: safeMessage(result.error || result.errorCode) };
+  if (call.tool === "db_query") {
+    const run = state.runs.get(result.executionId);
+    return { sql: run?.sql || call.sql, summary: `查询完成，返回 ${result.rowCount} 行、${result.columns.length} 列` };
+  }
+  const tables = collectTablesFromRead(result?.data);
+  return { summary: `${call.thought}完成${tables.length ? `，涉及 ${tables.length} 张表` : ""}`, detail: [call.detail, tables.join("、")].filter(Boolean).join(" · ") };
+}
+
+function emitToolEvent(state, event) {
+  if (!state.active || state.closed || !state.onEvent) return;
+  // A disconnected observer must never change the query's execution verdict.
+  try { state.onEvent(event)?.catch?.(() => {}); } catch { /* best effort */ }
 }
 
 async function ontologyRead(state, args = {}) {
@@ -417,12 +461,17 @@ async function ontologyRead(state, args = {}) {
   } catch (error) {
     return failureResult(error?.code || "INVALID_OPERATION", safeMessage(error));
   }
-  const tableNames = collectTablesFromRead(result);
+  const data = boundJson(result, state.maxBodyBytes);
+  const tableNames = collectTablesFromRead(data);
   if (tableNames.length && state.snapshot.disclose) state.snapshot.disclose(tableNames);
+  for (const item of data.items || []) {
+    if (item.slug && item.title) state.readPages.add(item.title);
+    if (item.appliesTo && item.name) state.readRules.add(item.name);
+  }
   return {
     ok: true,
     operation,
-    data: boundJson(result, state.maxBodyBytes),
+    data,
     disclosedTables: state.snapshot.disclosedTables ? [...state.snapshot.disclosedTables].sort() : tableNames,
   };
 }
@@ -482,11 +531,6 @@ async function dbQuery(state, args = {}) {
   const sourceRun = kernelRun || receipt.result || receipt;
   const fullRows = Array.isArray(sourceRun.rows) ? structuredClone(sourceRun.rows) : Array.isArray(sourceRun.result?.rows) ? structuredClone(sourceRun.result.rows) : structuredClone(tupleRows);
   const fields = normalizeFields(sourceRun.fields || sourceRun.columns || sourceRun.result?.fields || sourceRun.result?.columns || receipt.fields || receipt.columns || tupleFields, fullRows);
-  const sensitiveNames = new Set(tableNames.flatMap((tableName) => (state.snapshot?.columnsByTable?.[tableName] || [])
-    .filter((column) => isSensitiveFlag(column?.sensitive) || isSensitiveFlag(column?.isSensitive) || isSensitiveFlag(column?.is_sensitive))
-    .map((column) => String(column.columnName ?? column.name ?? column.fieldName ?? "").toLowerCase())
-    .filter(Boolean)));
-  const sensitiveColumns = fields.filter((field) => sensitiveNames.has(normalizePreviewFieldName(field)));
   const run = {
     executionId,
     requestId: state.requestId,
@@ -497,7 +541,7 @@ async function dbQuery(state, args = {}) {
     rows: fullRows,
     fields,
     columns: fields,
-    sensitiveColumns,
+    sensitiveColumns: [],
     rowCount: Number.isFinite(Number(sourceRun.rowCount ?? receipt.rowCount)) ? Number(sourceRun.rowCount ?? receipt.rowCount) : fullRows.length,
     scannedRows: finiteNumber(sourceRun.scannedRows ?? receipt.scannedRows ?? receipt.explainRows ?? receipt.result?.scannedRows),
     durationMs: finiteNumber(sourceRun.durationMs ?? receipt.durationMs ?? receipt.result?.durationMs),
@@ -665,31 +709,6 @@ function makePreview(run, maxRows, maxBytes, snapshot) {
     rows.push(row);
   }
   return { columns, rows, truncated };
-}
-
-function isSensitiveFlag(value) {
-  if (value === true || (typeof value === "number" && value > 0)) return true;
-  if (typeof value !== "string") return false;
-  const normalized = value.trim().toLowerCase();
-  // Unknown non-empty textual flags fail closed; only explicit false-like
-  // values are considered safe to display.
-  return normalized !== "" && !["0", "false", "no", "off", "null", "undefined"].includes(normalized);
-}
-
-// Drivers differ on whether a projected field is reported as `phone`,
-// `customer.phone`, or `` `customer`.`phone` ``.  Normalize only for the
-// sensitivity comparison; preserve the original field label in the preview
-// so result formatting remains driver-compatible.
-function normalizePreviewFieldName(value) {
-  return String(value ?? "")
-    .replaceAll("`", "")
-    .replaceAll('"', "")
-    .replaceAll("[", "")
-    .replaceAll("]", "")
-    .split(".")
-    .at(-1)
-    .trim()
-    .toLowerCase();
 }
 
 function normalizeFields(value, rows) {

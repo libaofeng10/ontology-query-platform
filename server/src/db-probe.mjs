@@ -80,7 +80,7 @@ function isEnumDictionary(columnName,distinctCount,estimatedRows,sampleLimit,max
 
 async function attachProfiles(connector,source,table,columns,{sampleLimit,timeoutMs}={}) {
   const safeLimit=Math.max(1,Math.min(1000,Math.floor(Number(sampleLimit)||1000)));
-  const sampled=columns.filter((column)=>!column.isSensitive&&!column.enums?.length);
+  const sampled=columns.filter((column)=>!column.enums?.length);
   let rows=[];
   let sampledOk=sampled.length===0;
   if(sampled.length) {
@@ -93,7 +93,6 @@ async function attachProfiles(connector,source,table,columns,{sampleLimit,timeou
     finally { clearTimeout(timer); }
   }
   for(const column of columns) {
-    if(column.isSensitive){column.profile=null;continue;}
     if(!column.enums?.length&&!sampledOk){column.profile=null;continue;}
     const values=column.enums?.length?[]:rows.map((row)=>row?.[column.columnName]);
     column.profile=buildColumnProfile({values,dataType:column.dataType,enums:column.enums});
