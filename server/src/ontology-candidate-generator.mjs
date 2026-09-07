@@ -7,13 +7,14 @@ import { createLinkStableKey } from "./ontology-candidate-score.mjs";
 export const ONTOLOGY_OBJECT_PROMPT_VERSION="ontology-object-v3";
 
 export function createOntologyCandidateGenerator({llm,fetchImpl=globalThis.fetch,timeoutMs=90_000,auditDir,callJson=callLlmJsonWithTrace}={}) {
-  async function generateObjects({run,catalog,knowledgePages=[],baseSchema=null,onCandidate=async()=>{},onCandidates=null,onProgress=()=>{}}) {
+  async function generateObjects({run,catalog,knowledgePages=[],baseSchema=null,feedback=null,phase="auto",onCandidate=async()=>{},onCandidates=null,onProgress=()=>{}}) {
     const batches=Array.isArray(run?.scope?.batches)?run.scope.batches:[];
     const stored=[];const calls=[];const normalizationIssues=[];
     const tokenUsage={promptTokens:0,completionTokens:0,totalTokens:0};
     for(const [index,batch] of batches.entries()) {
       onProgress({progress:10+Math.round((index/Math.max(1,batches.length))*65),total:100,currentStep:`识别 Object 候选（${index+1}/${batches.length}）`});
       const messages=objectGenerationMessages({run,batch,catalog,knowledgePages,baseSchema});
+      if(feedback)messages.push({role:"user",content:`根据检查反馈修正本轮定义；保留有依据的内容，不得修改系统评分或编造证据。请沿用相同 JSON 格式。\n<check_feedback>${JSON.stringify(feedback)}</check_feedback>`});
       const started=Date.now();let traced;
       try {
         const extraBody=/dashscope|\.maas\.aliyuncs\.com/i.test(String(llm?.baseUrl||""))?{enable_thinking:false}:{};
@@ -21,14 +22,14 @@ export function createOntologyCandidateGenerator({llm,fetchImpl=globalThis.fetch
         const runLlm={baseUrl:llm?.baseUrl,apiKey:llm?.apiKey,model:run.modelName||llm?.model};
         traced=await callJson(runLlm,messages,{timeoutMs:requestTimeout,fetchImpl,extraBody});
       } catch(error) {
-        const callSummary=await persistTrace({auditDir,run,batch,index,messages,rawContent:error?.rawContent??null,usage:error?.usage??null,durationMs:Date.now()-started,error:String(error?.message||error)});
+        const callSummary=await persistTrace({auditDir,run,batch,index,messages,rawContent:error?.rawContent??null,usage:error?.usage??null,durationMs:Date.now()-started,error:String(error?.message||error),phase});
         calls.push(callSummary);
         addUsage(tokenUsage,error?.usage);
         error.generationCalls=calls;
         error.generationTokenUsage=tokenUsage;
         throw error;
       }
-      const callSummary=await persistTrace({auditDir,run,batch,index,messages,rawContent:traced.rawContent,usage:traced.usage,durationMs:Date.now()-started,error:null});
+      const callSummary=await persistTrace({auditDir,run,batch,index,messages,rawContent:traced.rawContent,usage:traced.usage,durationMs:Date.now()-started,error:null,phase});
       calls.push(callSummary);addUsage(tokenUsage,traced.usage);
       const normalized=normalizeObjectCandidateOutput(traced.value,{run,batch,catalog,knowledgePages});
       normalizationIssues.push(...normalized.issues.map((issue)=>({...issue,batchId:batch.id})));
@@ -38,11 +39,12 @@ export function createOntologyCandidateGenerator({llm,fetchImpl=globalThis.fetch
     return {candidates:stored,calls,tokenUsage,normalizationIssues};
   }
 
-  async function generateLinks({run,catalog,endpoints,knowledgePages=[],phase="auto",existingStableKeys=[],onCandidate=async()=>{},onCandidates=null,onProgress=()=>{}}) {
+  async function generateLinks({run,catalog,endpoints,knowledgePages=[],phase="auto",feedback=null,existingStableKeys=[],onCandidate=async()=>{},onCandidates=null,onProgress=()=>{}}) {
     const scope=buildLinkGenerationScope({catalog,endpoints,existingStableKeys,namespace:run.scope.namespace});
     if(!scope.relations.length)return {candidates:[],calls:[],tokenUsage:{promptTokens:0,completionTokens:0,totalTokens:0},normalizationIssues:[],eligibleRelationCount:0};
     onProgress({progress:82,total:100,currentStep:phase==="supplemental"?"补充识别 Link 候选":"识别 Link 候选"});
     const messages=linkGenerationMessages({run,scope,catalog,knowledgePages});const started=Date.now();let traced;
+    if(feedback)messages.push({role:"user",content:`根据检查反馈修正关系，保留相同 JSON 格式，不改变物理关系与评分规则。\n<check_feedback>${JSON.stringify(feedback)}</check_feedback>`});
     try {
       const requestTimeout=runTimeout(run,timeoutMs);
       const runLlm={baseUrl:llm?.baseUrl,apiKey:llm?.apiKey,model:run.modelName||llm?.model};
@@ -312,7 +314,7 @@ async function persistTrace({auditDir,run,batch,index,messages,rawContent,usage,
   const summary={batchId:batch.id,promptHash:createHash("sha256").update(prompt).digest("hex"),outputHash:output?createHash("sha256").update(output).digest("hex"):null,durationMs,usage:usage||null,error:error||null,traceStored:false};
   if(!auditDir)return summary;
   const directory=join(auditDir,String(run.id));await mkdir(directory,{recursive:true,mode:0o700});
-  const file=join(directory,`${kind}${kind==="link"?`-${phase}`:""}-${String(index+1).padStart(3,"0")}.json`);
+  const file=join(directory,`${kind}${kind==="link"||phase!=="auto"?`-${phase}`:""}-${String(index+1).padStart(3,"0")}.json`);
   await writeFile(file,JSON.stringify({runId:run.id,batchId:batch.id,modelName:run.modelName,promptVersion:run.promptVersion,messages,rawOutput:rawContent??null,usage:usage||null,durationMs,error:error||null},null,2),{encoding:"utf8",mode:0o600});
   summary.traceStored=true;return summary;
 }

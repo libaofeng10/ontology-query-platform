@@ -39,7 +39,7 @@ export function createSemanticSchemaService({store}) {
     return {...record,validation:withoutSchema(validation)};
   }
 
-  function publish(id,userName) {
+  function preflight(id) {
     const record=store.getOntologySchemaVersion(id);
     if(!record) return null;
     if(record.status!=="draft") { const error=new Error("只有草稿版本可以执行普通发布；历史发布版请使用回滚操作");error.status=409;throw error; }
@@ -67,8 +67,14 @@ export function createSemanticSchemaService({store}) {
         if(impact.uncoveredChanges.length||missingSets.length||subtypeRootCoverageMissing) return {...compact,ok:false,gateRequired:true,record:store.getOntologySchemaVersion(record.id),evaluationImpact:{summary:{...impact.summary,hierarchyChanged,subtypeRootCoverageMissing},affectedCases:impact.affectedCases,affectedSets:impact.affectedSets,uncoveredChanges:impact.uncoveredChanges,missingSets,subtypeRootCoverage}};
       }
     }
-    const published=store.publishOntologySchemaVersion(record.id,userName);
-    return {ok:true,record:published,...compact};
+    return {ok:true,record,...compact};
+  }
+
+  function publish(id,userName,options={}) {
+    const checked=preflight(id);
+    if(!checked||!checked.ok)return checked;
+    const published=store.publishOntologySchemaVersion(id,userName,"publish",options);
+    return {...checked,record:published};
   }
 
   function rollback(id,userName) {
@@ -90,6 +96,7 @@ export function createSemanticSchemaService({store}) {
     catalog,
     saveDraft,
     publish,
+    preflight,
     rollback,
     list:(sourceId)=>store.listOntologySchemaVersions(sourceId),
     get:(id)=>store.getOntologySchemaVersion(id),

@@ -1,7 +1,7 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 
-const TRACE_FILE=/^(?:object|link-(?:auto|supplemental))-\d{3}\.json$/;
+const TRACE_FILE=/^(?:object(?:-repair-\d+)?|link-(?:auto|supplemental|repair-\d+))-\d{3}\.json$/;
 const MAX_TRACE_BYTES=5*1024*1024;
 
 export function createOntologyGenerationAuditService({auditDir}={}) {

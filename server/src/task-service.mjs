@@ -45,10 +45,21 @@ export function createTaskService({store,discovery,handlers={}}) {
     for(const task of store.listRecoverableTasks()) schedule(task.id);
   }
 
+  async function resume(id,payload) {
+    // Finish the previous runner before scheduling the same durable task again.
+    if(active.has(id))await active.get(id);
+    const task=store.getTask(id);
+    if(!task)throw new Error("待继续的任务不存在");
+    if(['queued','running'].includes(task.status))return task;
+    const queued=store.resumeTask(id,payload||task.payload);
+    schedule(id);
+    return queued;
+  }
+
   async function close() {
     closing=true;
     await Promise.allSettled([...active.values()]);
   }
 
-  return {create,createDiscoveryTask,get:(id)=>store.getTask(id),list:(sourceId)=>store.listTasks(sourceId),recover,close};
+  return {create,resume,createDiscoveryTask,get:(id)=>store.getTask(id),list:(sourceId)=>store.listTasks(sourceId),recover,close};
 }

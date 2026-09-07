@@ -173,11 +173,11 @@ export function SettingsWorkspace({sourceId,role,onRefresh}:{sourceId?:number;ro
       </section>
 
       <section className="panel settings-panel">
-        <div className="panel-title"><div><h2>Claude Code 问数</h2><p>Claude 依据本体和业务知识生成 SQL、调用查询工具并回答；最大轮数和请求超时在此配置。</p></div></div>
+        <div className="panel-title"><div><h2>智能问数</h2><p>依据本体和业务知识生成 SQL、调用查询工具并回答；最大轮数和请求超时在此配置。</p></div></div>
         <div className="form-grid">
-          <Field label="Claude 模式"><select value={claudeQuery.mode} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,mode:event.target.value as ClaudeQueryForm["mode"]})}><option value="off">off · 不调用 Claude</option><option value="prefer">prefer · 灰度调用，基础链路可回退</option><option value="required">required · 强制 Claude，失败即拒答</option></select></Field>
-          <Field label="Claude 灰度比例（%）"><input type="number" min={0} max={100} value={claudeQuery.trafficPercent} disabled={!isAdmin||claudeQuery.mode!=="prefer"} onChange={(event)=>setClaudeQuery({...claudeQuery,trafficPercent:event.target.value})}/></Field>
-          <Field label="模型精确 ID（部署固定）"><input value={claudeQuery.model} disabled readOnly placeholder="通过 CLAUDE_QUERY_MODEL 配置"/></Field>
+          <Field label="智能问数模式"><select value={claudeQuery.mode} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,mode:event.target.value as ClaudeQueryForm["mode"]})}><option value="off">off · 不调用</option><option value="prefer">prefer · 灰度调用，基础链路可回退</option><option value="required">required · 强制，失败即拒答</option></select></Field>
+          <Field label="灰度比例（%）"><input type="number" min={0} max={100} value={claudeQuery.trafficPercent} disabled={!isAdmin||claudeQuery.mode!=="prefer"} onChange={(event)=>setClaudeQuery({...claudeQuery,trafficPercent:event.target.value})}/></Field>
+          <Field label="模型精确 ID（部署固定）"><input value={claudeQuery.model} disabled readOnly placeholder="通过QUERY_MODEL 配置"/></Field>
           <Field label="CLI 路径（部署固定）"><input value={claudeQuery.binary} disabled readOnly/></Field>
           <Field label="Prompt 契约版本（部署固定）"><input value={claudeQuery.promptVersion} disabled readOnly/></Field>
           <Field label="单请求超时（ms）"><input type="number" min={1000} max={600000} value={claudeQuery.timeoutMs} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,timeoutMs:event.target.value})}/></Field>
@@ -187,7 +187,7 @@ export function SettingsWorkspace({sourceId,role,onRefresh}:{sourceId?:number;ro
           <Field label="排队超时（ms）"><input type="number" min={0} max={120000} value={claudeQuery.queueTimeoutMs} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,queueTimeoutMs:event.target.value})}/></Field>
           <Field label="CLI 输出上限（bytes）"><input type="number" min={65536} max={16777216} value={claudeQuery.maxStdioBytes} disabled={!isAdmin} onChange={(event)=>setClaudeQuery({...claudeQuery,maxStdioBytes:event.target.value})}/></Field>
         </div>
-        <p className="settings-help">API Key 仅从部署环境注入，不在页面显示。CLI 路径、模型和契约版本显示部署值，变更需重新部署。</p>
+        <p className="settings-help">   API Key 仅从部署环境注入，不在页面显示。CLI 路径、模型和契约版本显示部署值，变更需重新部署。</p>
       </section>
 
       <section className="panel settings-panel ontology-build-settings">

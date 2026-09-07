@@ -2,7 +2,7 @@ import { normalizeOntologyNamespace } from "./ontology-candidate-score.mjs";
 
 const APPLICABLE_STATUSES=new Set(["auto_confirmed","confirmed"]);
 
-export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCandidateIds=[],conflictResolutions={},applicableStatuses=APPLICABLE_STATUSES}={}) {
+export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCandidateIds=[],conflictResolutions={},applicableStatuses=APPLICABLE_STATUSES,incremental=false}={}) {
   const excluded=new Set(excludeCandidateIds||[]);const conflicts=[];const includedCandidates=[];
   const schema=baseSchema?structuredClone(baseSchema):{name:normalizeOntologyNamespace(run?.scope?.namespace||run?.scope?.domainName),displayName:String(run?.scope?.domainName||"AI 生成业务本体").trim()||"AI 生成业务本体",description:String(run?.scope?.domainDescription||"").trim(),objectTypes:[],linkTypes:[]};
   schema.objectTypes=Array.isArray(schema.objectTypes)?schema.objectTypes:[];schema.linkTypes=Array.isArray(schema.linkTypes)?schema.linkTypes:[];
@@ -11,9 +11,14 @@ export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCan
   const objects=eligible.filter((candidate)=>candidate.candidateType==="object").sort(byStableKey);const links=eligible.filter((candidate)=>candidate.candidateType==="link").sort(byStableKey);
   const objectByApi=new Map(schema.objectTypes.map((object)=>[object.apiName,object]));const objectByTable=new Map();
   for(const object of schema.objectTypes)for(const table of mappedTables(object))if(!objectByTable.has(table))objectByTable.set(table,object);
+  const objectAliases=new Map();
   for(const candidate of objects) {
     const payload=structuredClone(candidate.payload);const table=mappedTables(payload)[0]||null;const byApi=objectByApi.get(payload.apiName);const byTable=table?objectByTable.get(table):null;const existing=byApi||byTable;
     if(existing) {
+      if(incremental&&!conflictResolutions[candidate.id]) {
+        const merged=mergeAdditiveObject(existing,payload);
+        if(merged){objectAliases.set(payload.apiName,existing.apiName);replaceItem(schema.objectTypes,existing,merged);rebuildObjectIndexes(schema.objectTypes,objectByApi,objectByTable);includedCandidates.push(candidate);continue;}
+      }
       if(equalJson(objectCore(existing),objectCore(payload))){includedCandidates.push(candidate);continue;}
       const collisions=[...new Set([byApi,byTable].filter(Boolean))];const allowedResolutions=collisions.length===1?["keep_existing","use_candidate"]:["keep_existing"];
       const conflict=resolvedConflict({candidate,candidateType:"object",reason:collisions.length>1?"object_multiple_conflicts":byApi?"object_api_name_exists":"object_physical_mapping_exists",existingApiName:existing.apiName,allowedResolutions,conflictResolutions});conflicts.push(conflict);
@@ -27,9 +32,11 @@ export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCan
   for(const link of schema.linkTypes)for(const id of relationIds(link))if(!linkByRelation.has(id))linkByRelation.set(id,link);
   for(const candidate of links) {
     const payload=structuredClone(candidate.payload);
+    if(incremental){payload.source=objectAliases.get(payload.source)||payload.source;payload.target=objectAliases.get(payload.target)||payload.target;}
     if(!objectByApi.has(payload.source)||!objectByApi.has(payload.target)){conflicts.push(resolvedConflict({candidate,candidateType:"link",reason:"link_endpoint_missing",source:payload.source,target:payload.target,allowedResolutions:["keep_existing"],conflictResolutions}));continue;}
     const relationId=relationIds(payload)[0]||null;const byApi=linkByApi.get(payload.apiName);const byRelation=relationId?linkByRelation.get(relationId):null;const existing=byApi||byRelation;
     if(existing) {
+      if(incremental&&!conflictResolutions[candidate.id]&&equalJson([existing.source,existing.target,existing.cardinality,relationIds(existing)],[payload.source,payload.target,payload.cardinality,relationIds(payload)])){includedCandidates.push(candidate);continue;}
       if(equalJson(linkCore(existing),linkCore(payload))){includedCandidates.push(candidate);continue;}
       const collisions=[...new Set([byApi,byRelation].filter(Boolean))];const allowedResolutions=collisions.length===1?["keep_existing","use_candidate"]:["keep_existing"];
       const conflict=resolvedConflict({candidate,candidateType:"link",reason:collisions.length>1?"link_multiple_conflicts":byApi?"link_api_name_exists":"link_physical_relation_exists",existingApiName:existing.apiName,allowedResolutions,conflictResolutions});conflicts.push(conflict);
@@ -41,6 +48,22 @@ export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCan
   const renamedLinks=ensureUniqueLinkNames(schema.linkTypes);
   const baseObjectCount=baseSchema?.objectTypes?.length||0;const baseLinkCount=baseSchema?.linkTypes?.length||0;const basePropertyCount=propertyCount(baseSchema?.objectTypes);
   return {schema,includedCandidates,conflicts,renamedLinks,excludedCandidateIds:[...excluded],summary:{objectsAdded:Math.max(0,schema.objectTypes.length-baseObjectCount),propertiesAdded:Math.max(0,propertyCount(schema.objectTypes)-basePropertyCount),linksAdded:Math.max(0,schema.linkTypes.length-baseLinkCount),renamedLinkCount:renamedLinks.length,candidateCount:includedCandidates.length,conflictCount:conflicts.length,resolvedConflictCount:conflicts.filter((item)=>item.resolution!=="unresolved").length,unresolvedConflictCount:conflicts.filter((item)=>item.resolution==="unresolved").length,excludedCount:excluded.size}};
+}
+
+// Regeneration adds evidence-backed fields while retaining established names,
+// explanations and mappings. A conflicting key/type/mapping needs a decision.
+function mergeAdditiveObject(existing,candidate) {
+  if(!equalJson(mappedTables(existing),mappedTables(candidate)))return null;
+  const key=(property)=>JSON.stringify([property?.mapping?.table,property?.mapping?.column]);
+  if(key(existing.properties?.find((p)=>p.apiName===existing.primaryKey))!==key(candidate.properties?.find((p)=>p.apiName===candidate.primaryKey)))return null;
+  const properties=structuredClone(existing.properties||[]);
+  for(const property of candidate.properties||[]) {
+    const previous=properties.find((item)=>key(item)===key(property));
+    if(previous){if(previous.type!==property.type||Boolean(previous.required)!==Boolean(property.required))return null;continue;}
+    if(properties.some((item)=>item.apiName===property.apiName))return null;
+    properties.push(structuredClone(property));
+  }
+  return {...structuredClone(existing),properties};
 }
 
 function ensureUniqueLinkNames(links) {

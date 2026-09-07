@@ -13,7 +13,7 @@ export function createOntologyDomainDraftService({store,candidates,semanticSchem
     const task=store.getTask(id);
     if(!task||task.taskType!=="ontology_domain_modeling")throw httpError(404,"全域建模任务不存在");
     const allRuns=store.listOntologyGenerationRuns(task.sourceId,500).filter((run)=>run.scope?.orchestrationId===id);
-    const declared=Array.isArray(task.result?.domains)?task.result.domains:[];
+    const declared=task.payload?.sourceBuild?.generation?.domains||task.result?.domains||[];
     const domainDefinitions=declared.length?declared.map((item,index)=>({
       id:String(item.domainId||item.runId||`domain-${index+1}`),name:String(item.domainName||`业务域 ${index+1}`),declared:item,
     })):uniqueDomains(allRuns);
@@ -62,16 +62,16 @@ export function createOntologyDomainDraftService({store,candidates,semanticSchem
 
   function summary(orchestrationId) { return inspect(orchestrationId).summary; }
 
-  function preview(orchestrationId,input={}) {
-    const prepared=prepare(orchestrationId,input);
-    assertDraftable(prepared.state.summary,input);
+  function preview(orchestrationId,input={},options={}) {
+    const prepared=prepare(orchestrationId,input,options);
+    assertDraftable(prepared.state.summary,input,options);
     return {schema:prepared.validation.schema,validation:withoutSchema(prepared.validation),diff:prepared.diff,conflicts:prepared.conflicts,excludedCandidateIds:prepared.excludedCandidateIds,summary:prepared.draftSummary,workflow:prepared.state.summary};
   }
 
-  function apply(orchestrationId,input={},actor="system") {
-    const prepared=prepare(orchestrationId,input);
+  function apply(orchestrationId,input={},actor="system",options={}) {
+    const prepared=prepare(orchestrationId,input,options);
     const workflow=prepared.state.summary;
-    assertDraftable(workflow,input);
+    assertDraftable(workflow,input,options);
     if(prepared.draftSummary.unresolvedConflictCount)throw httpError(409,"仍有未处理的 Schema 冲突，请完成冲突选择并重新预览");
     if(!prepared.includedCandidates.length)throw httpError(409,"没有可应用的已确认候选");
     assertLosslessOntologyDraft(prepared.assembledSchema,prepared.validation);
@@ -149,7 +149,7 @@ export function createOntologyDomainDraftService({store,candidates,semanticSchem
       const runItems=state.runCandidates.get(run.id)||[];
       const eligibleItems=options.repairDraftId?runItems.filter((candidate)=>(candidate.status==="applied"&&Number(candidate.appliedSchemaVersionId)===Number(options.repairDraftId))||ACCEPTED_STATUSES.has(candidate.status)):runItems;
       const repairResolutions=options.repairDraftId?Object.fromEntries(eligibleItems.map((candidate)=>[candidate.id,candidate.status==="applied"?"use_candidate":"keep_existing"])):conflictResolutions;
-      const assembled=assembleOntologyDraft({run,candidates:eligibleItems,baseSchema:schema,excludeCandidateIds:excludedCandidateIds,conflictResolutions:repairResolutions,...(options.repairDraftId?{applicableStatuses:new Set(["applied",...ACCEPTED_STATUSES])}:{})});
+      const assembled=assembleOntologyDraft({run,candidates:eligibleItems,baseSchema:schema,excludeCandidateIds:excludedCandidateIds,conflictResolutions:repairResolutions,incremental:Boolean(options.build),...(options.repairDraftId?{applicableStatuses:new Set(["applied",...ACCEPTED_STATUSES])}:{})});
       schema=assembled.schema;includedCandidates.push(...assembled.includedCandidates);conflicts.push(...assembled.conflicts);renamedLinkCount+=assembled.renamedLinks?.length||0;
     }
     const validation=semanticSchemas.validate(state.task.sourceId,schema);const diff=diffSemanticSchemas(validation.schema,originalBase);
@@ -164,10 +164,16 @@ export function createOntologyDomainDraftService({store,candidates,semanticSchem
     return {state,baseSchemaVersionId,expectedPublishedId,includedCandidates,conflicts,excludedCandidateIds,assembledSchema:schema,validation,diff,draftSummary};
   }
 
-  return {summary,preview,apply,repair,failedDomainIds};
+  return {summary,preview,apply,repair,failedDomainIds,
+    previewBuild:(id,input={})=>preview(id,input,{build:true}),
+    applyBuild:(id,input,actor)=>apply(id,input,actor,{build:true}),
+  };
 
-  function assertDraftable(workflow,input) {
-    if(workflow.activeTask)throw httpError(409,"全域建模或失败域重试仍在进行，请完成后再创建合并草稿");
+  function assertDraftable(workflow,input,options={}) {
+    const task=options.build?store.getTask(workflow.orchestrationId):null;
+    const ownedBuild=task?.payload?.sourceBuild?.workflowVersion===2&&task.payload.sourceBuild.generation&&workflow.activeTask?.id===task.id;
+    if(workflow.activeTask&&!ownedBuild)throw httpError(409,"全域建模或失败域重试仍在进行，请完成后再创建合并草稿");
+    if(options.build&&workflow.blockedCount)throw httpError(409,"仍有业务定义未通过检查，自动整理不能忽略这些内容");
     if(workflow.activeDomainCount)throw httpError(409,"仍有业务域正在生成，请完成后再创建合并草稿");
     if(workflow.failedDomainCount&&!input?.allowFailedDomains)throw httpError(409,`仍有 ${workflow.failedDomainCount} 个业务域失败；如需生成部分草稿，请明确允许跳过失败域`);
     if(workflow.reviewRequiredCount)throw httpError(409,`仍有 ${workflow.reviewRequiredCount} 个候选待审核，请完成集中审核`);

@@ -561,6 +561,7 @@ export function createStore(dbPath) {
     completeTask(id,result) { db.prepare(`UPDATE ds_task SET status='succeeded',progress=total,current_step='已完成',result_json=?,error=NULL,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(JSON.stringify(result??null),id); return this.getTask(id); },
     failTask(id,error) { db.prepare(`UPDATE ds_task SET status='failed',current_step='执行失败',error=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(String(error),id); return this.getTask(id); },
     requeueInterruptedTasks() { return db.prepare(`UPDATE ds_task SET status='queued',current_step='服务重启，等待恢复',started_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE status='running'`).run().changes; },
+    resumeTask(id,payload) { db.prepare(`UPDATE ds_task SET status='queued',payload_json=?,error=NULL,finished_at=NULL,current_step='等待继续',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('succeeded','failed')`).run(JSON.stringify(payload),id); return this.getTask(id); },
     addSchemaSnapshot(sourceId,checksum,schema) { const current=db.prepare(`SELECT COALESCE(MAX(version),0) AS version FROM ds_schema_snapshot WHERE source_id=?`).get(sourceId); const version=Number(current.version)+1; db.prepare(`INSERT INTO ds_schema_snapshot(source_id,version,checksum,schema_json) VALUES(?,?,?,?)`).run(sourceId,version,checksum,JSON.stringify(schema)); return this.getLatestSchemaSnapshot(sourceId); },
     getLatestSchemaSnapshot(sourceId) { const row=db.prepare(`SELECT id,source_id AS sourceId,version,checksum,schema_json AS schemaJson,created_at AS createdAt FROM ds_schema_snapshot WHERE source_id=? ORDER BY version DESC LIMIT 1`).get(sourceId); return row?{...row,schema:safeJson(row.schemaJson,{tables:[],columns:[],foreignKeys:[]})}:null; },
     listSchemaSnapshots(sourceId,limit=20) { return db.prepare(`SELECT id,source_id AS sourceId,version,checksum,created_at AS createdAt FROM ds_schema_snapshot WHERE source_id=? ORDER BY version DESC LIMIT ?`).all(sourceId,limit); },
@@ -630,11 +631,12 @@ export function createStore(dbPath) {
     listOntologySchemaVersions(sourceId,limit=50) { return db.prepare(`SELECT id,source_id AS sourceId,version,status,schema_name AS schemaName,checksum,validation_json AS validationJson,created_by AS createdBy,created_at AS createdAt,published_by AS publishedBy,published_at AS publishedAt FROM ds_ontology_schema_version WHERE source_id=? ORDER BY version DESC LIMIT ?`).all(sourceId,limit).map((row)=>parseOntologySchemaVersion(row,false)); },
     getPublishedOntologySchema(sourceId) { const row=db.prepare(`SELECT id,source_id AS sourceId,version,status,schema_name AS schemaName,schema_json AS schemaJson,checksum,validation_json AS validationJson,created_by AS createdBy,created_at AS createdAt,published_by AS publishedBy,published_at AS publishedAt FROM ds_ontology_schema_version WHERE source_id=? AND status='published' ORDER BY version DESC LIMIT 1`).get(sourceId); return row?parseOntologySchemaVersion(row):null; },
     updateOntologySchemaValidation(id,validation) { return db.prepare(`UPDATE ds_ontology_schema_version SET validation_json=? WHERE id=?`).run(JSON.stringify(validation),id).changes; },
-    publishOntologySchemaVersion(id,publishedBy,action="publish") {
+    publishOntologySchemaVersion(id,publishedBy,action="publish",options={}) {
       db.transaction((versionId,userName,publicationAction)=>{
         const selected=db.prepare(`SELECT source_id AS sourceId FROM ds_ontology_schema_version WHERE id=?`).get(versionId);
         if(!selected) return;
         const previous=db.prepare(`SELECT id FROM ds_ontology_schema_version WHERE source_id=? AND status='published' AND id<>?`).get(selected.sourceId,versionId);
+        if(Object.hasOwn(options,"expectedPublishedId")&&(previous?.id??null)!==options.expectedPublishedId){const error=new Error("当前可用版本已变化，请重新检查此次更新");error.status=409;throw error;}
         db.prepare(`UPDATE ds_ontology_schema_version SET status='deprecated' WHERE source_id=? AND status='published' AND id<>?`).run(selected.sourceId,versionId);
         db.prepare(`UPDATE ds_ontology_schema_version SET status='published',published_by=?,published_at=CURRENT_TIMESTAMP WHERE id=?`).run(userName,versionId);
         db.prepare(`INSERT INTO ds_ontology_publication(source_id,schema_version_id,previous_schema_version_id,action,user_name) VALUES(?,?,?,?,?)`).run(selected.sourceId,versionId,previous?.id||null,publicationAction,userName);
@@ -657,6 +659,9 @@ export function createStore(dbPath) {
       return db.prepare(`SELECT id,source_id AS sourceId,task_id AS taskId,mode,scope_json AS scopeJson,catalog_checksum AS catalogChecksum,base_schema_version_id AS baseSchemaVersionId,model_name AS modelName,prompt_version AS promptVersion,scoring_version AS scoringVersion,status,progress,summary_json AS summaryJson,token_usage_json AS tokenUsageJson,error,created_by AS createdBy,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt,updated_at AS updatedAt FROM ds_ontology_generation_run WHERE source_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`).all(sourceId,Math.max(1,Math.min(500,Number(limit)||50)),Math.max(0,Number(offset)||0)).map(parseOntologyGenerationRun);
     },
     countOntologyGenerationRuns(sourceId) { return Number(db.prepare(`SELECT COUNT(*) AS count FROM ds_ontology_generation_run WHERE source_id=?`).get(sourceId)?.count||0); },
+    listOntologyGenerationRunsForBuild(sourceId,orchestrationId) {
+      return db.prepare(`SELECT id FROM ds_ontology_generation_run WHERE source_id=? AND json_extract(scope_json,'$.orchestrationId')=? ORDER BY created_at,id`).all(sourceId,orchestrationId).map((row)=>this.getOntologyGenerationRun(row.id));
+    },
     transitionOntologyGenerationRun(item) {
       return db.transaction((input)=>{
         const before=this.getOntologyGenerationRun(input.id);
@@ -697,7 +702,8 @@ export function createStore(dbPath) {
       return db.transaction((input)=>{
         const before=this.getOntologyCandidate(input.id);
         if(!before||before.status!==input.expectedStatus)return {ok:false,reason:before?"status_conflict":"not_found",candidate:before};
-        if(!candidateTransitionAllowed(before.status,input.status))throw new Error(`不允许候选从 ${before.status} 转为 ${input.status}`);
+        const rescored=input.eventType==="model_repair"&&["review_required","blocked"].includes(before.status)&&["auto_confirmed","review_required","blocked"].includes(input.status)&&input.validation&&Number.isFinite(input.score)&&(input.status!=="auto_confirmed"||input.validation.ok);
+        if(!rescored&&!candidateTransitionAllowed(before.status,input.status))throw new Error(`不允许候选从 ${before.status} 转为 ${input.status}`);
         const next={
           payload:input.payload??before.payload,evidence:input.evidence??before.evidence,modelConfidence:input.modelConfidence??before.modelConfidence,
           score:input.score??before.score,scoreBreakdown:input.scoreBreakdown??before.scoreBreakdown,validation:input.validation??before.validation,

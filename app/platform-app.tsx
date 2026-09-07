@@ -10,7 +10,7 @@ import { Icon, type IconName } from "./icons";
 import { OntologyGraphWorkspace } from "./ontology-graph";
 import { KnowledgeWorkspace, AuditIssues, type KnowledgePrefill } from "./knowledge-workspace";
 import { CatalogReview } from "./catalog-review";
-import { SemanticModelingWorkspace } from "./semantic-modeling";
+import { OntologyResultWorkspace } from "./ontology-result-workspace";
 import { SettingsWorkspace } from "./settings-workspace";
 import { RelationDocumentPanel } from "./relation-document-panel";
 import type { AuditRecord, BackgroundTask, BootstrapData, DataSource, DiscoverySummary, EvalCase, EvalInput, EvalRun, EvaluationGate, EvaluationSummary, NavId, OntologyQuestion, QueryAnswer, QueryClarification, QueryRefusal, QuerySession, QuerySessionDetail, QueryStreamEvent, QueryToolTrace, SchemaSnapshot, SourceInput, SourceOntologyBuildStatus, TableSelectionRow } from "./types";
@@ -63,7 +63,7 @@ export function PlatformApp(){
         {(active==="sources"||active==="questions")&&<SourceWorkspace key={`${selectedSourceId}:${active}`} initialTab={active==="questions"?"review":undefined} questions={data?.questions||[]} source={selectedSource} sources={data?.sources||[]} role={data?.identity.role||"viewer"} discovery={data?.discovery||null} tasks={data?.tasks||[]} snapshots={data?.schemaSnapshots||[]} onSelect={selectSource} onRefresh={refresh} onQuery={()=>setActive("query")}/>}
         {active==="knowledge"&&<KnowledgeWorkspace key={selectedSourceId} sourceId={selectedSourceId} tables={data?.discovery?.tables||[]} onNavigate={setActive} pages={data?.knowledge||[]} role={data?.identity?.role||"viewer"} prefill={knowledgePrefill} onPrefillConsumed={()=>setKnowledgePrefill(null)} onRefresh={refresh}/>}
         {active==="graph"&&<OntologyGraphWorkspace key={selectedSourceId} graph={data?.graph||null} source={selectedSource} onNavigate={setActive}/>}
-        {active==="evaluation"&&<EvaluationWorkspace key={selectedSourceId} source={selectedSource} cases={data?.evalCases||[]} runs={data?.evalRuns||[]} gates={data?.evalGates||[]} tasks={data?.tasks||[]} onRefresh={refresh}/>} 
+        {active==="evaluation"&&<EvaluationWorkspace key={selectedSourceId} source={selectedSource} cases={data?.evalCases||[]} runs={data?.evalRuns||[]} gates={data?.evalGates||[]} tasks={data?.tasks||[]} onRefresh={refresh}/>}
         {active==="audit"&&<AuditWorkspace key={selectedSourceId} sourceId={selectedSourceId} role={data?.identity.role||"viewer"} onNavigate={setActive} rows={data?.audits||[]} stats={data?.auditStats||null}/>}
         {active==="settings"&&<SettingsWorkspace key={selectedSourceId} sourceId={selectedSourceId} role={data?.identity.role||"viewer"} onRefresh={refresh}/>}
       </>}
@@ -286,23 +286,24 @@ function SourceWorkspace({source,sources,role,discovery,tasks,snapshots,question
   const [failure,setFailure]=useState<string|null>(null);
   const canEdit=role==="editor"||role==="admin";
   const building=task?.status==="queued"||task?.status==="running";
+  const sourceId=source?.id;
   const catalogBusy=building||tasks.some((item)=>["discovery","ontology_domain_modeling","ontology_generation","ontology_link_generation"].includes(item.taskType)&&["queued","running"].includes(item.status));
   useEffect(()=>{
-    if(!source)return;
+    if(!sourceId)return;
     let cancelled=false;
-    void getSourceOntologyBuild(source.id).then((next)=>{if(!cancelled){setStatus(next);setTask(next.task);}}).catch((cause)=>{if(!cancelled)setFailure(errorMessage(cause));});
+    void getSourceOntologyBuild(sourceId).then((next)=>{if(!cancelled){setStatus(next);setTask(next.task);}}).catch((cause)=>{if(!cancelled)setFailure(errorMessage(cause));});
     return()=>{cancelled=true;};
-  },[source]);
+  },[sourceId]);
   useEffect(()=>{
     if(!task||!building)return;
     let cancelled=false,polling=false;
     const timer=window.setInterval(()=>{
       if(polling)return;
       polling=true;
-      void getTask(task.id).then(async(next)=>{
+      void getSourceOntologyBuild(task.sourceId).then(async(next)=>{
         if(cancelled)return;
-        setTask(next);setFailure(null);
-        if(!["queued","running"].includes(next.status)){window.clearInterval(timer);await onRefresh();}
+        setStatus(next);setTask(next.task);setFailure(null);
+        if(!next.update?.busy){window.clearInterval(timer);await onRefresh();}
       }).catch((cause)=>{if(!cancelled)setFailure(errorMessage(cause));}).finally(()=>{polling=false;});
     },1500);
     return()=>{cancelled=true;window.clearInterval(timer);};
@@ -310,22 +311,22 @@ function SourceWorkspace({source,sources,role,discovery,tasks,snapshots,question
   async function build(selections:Array<{tableName:string;included:boolean}>){
     if(!source)return;
     const next=await buildSourceOntology(source.id,selections);
-    setTask(next);setFailure(null);setTab("ontology");
+    setTask(next);setStatus(await getSourceOntologyBuild(source.id));setFailure(null);setTab("ontology");
   }
-  const completed=task&&!building;
+  async function refreshBuild(){if(source){const next=await getSourceOntologyBuild(source.id);setStatus(next);setTask(next.task);}await onRefresh();}
   return <div className="content sub-page source-workspace">
-    <PageHeader eyebrow="数据接入" title="数据源与本体" description={source?`${source.name} · ${source.dbName}。选定数据表后，系统连续完成结构探查和本体生成。`:"先连接数据源，再选择用于问答的数据表。"} action={<div className="header-actions"><button className="secondary-button" onClick={()=>setTab("connection")}>管理连接</button><button className="primary-button" disabled={!source||!canEdit||catalogBusy||!status?.modelingEnabled||(!source.isDemo&&source.lastTestOk!==1)} onClick={()=>setSelecting(true)}><Icon name="spark" size={15}/>{catalogBusy?"构建进行中…":"选择表并构建本体"}</button></div>}/>
+    <PageHeader eyebrow="数据接入" title="数据源与本体" description={source?`${source.name} · ${source.dbName}。选择数据，AI 整理业务含义，检查通过后自动用于问数。`:"先连接数据源，再选择用于问答的数据表。"} action={<div className="header-actions"><button className="secondary-button" onClick={()=>setTab("connection")}>管理连接</button>{tab!=="ontology"&&<button className="secondary-button" disabled={!source||!canEdit||catalogBusy||!status?.modelingEnabled||(!source.isDemo&&source.lastTestOk!==1)} onClick={()=>setSelecting(true)}><Icon name="spark" size={15}/>{catalogBusy?"正在整理…":status?.activeVersion?"更新数据范围":"选择数据表"}</button>}</div>}/>
     {selecting&&source&&<TableSelectionPanel source={source} mode="build" onLaunch={build} onClose={()=>setSelecting(false)}/>}
     {failure&&<Notice tone="danger" title="状态读取失败" body={failure}/>}
     {source&&!source.isDemo&&source.lastTestOk!==1&&<Notice tone="warning" title="先验证连接" body="在连接设置中完成只读连接测试后，即可选表构建。"/>}
     {status&&!status.modelingEnabled&&<Notice tone="warning" title="AI 本体生成未开启" body="请在设置中心开启 AI 本体生成，已有本体仍可查看和使用。"/>}
-    <div className="source-flow-path" aria-label="数据接入流程"><span><b>1</b>选择数据表</span><i>→</i><span><b>2</b>自动探查与生成</span><i>→</i><span><b>3</b>启用本体，开始问答</span></div>
-    {status&&<p className="source-input-note">构建依据：表结构、表与字段注释、已登记的业务知识。{status.profilingEnabled?"数据画像已开启，将按配置限额采集样本统计。":"数据画像已关闭，本次配置不采集字段画像。"}</p>}
-    {building&&task&&<section className="task-progress panel" role="status"><div><span className="mini-loader"/><strong>{task.currentStep||"等待执行"}</strong><em>{task.progress}%</em></div><p>可离开页面，后台会继续完成探查和生成；完成后在这里查看结果。</p><span><i style={{width:`${task.progress}%`}}/></span></section>}
-    {task?.status==="failed"&&<Notice tone="danger" title="本体构建未完成" body={task.error||"请检查连接或模型配置，然后重新构建。"}/>}
+    <div className="source-flow-path" aria-label="数据接入流程"><span><b>1</b>选择数据表</span><i>→</i><span><b>2</b>AI 整理与检查</span><i>→</i><span><b>3</b>开始问数</span></div>
+    {status&&<details className="source-input-details"><summary>查看整理依据</summary><p className="source-input-note">表结构、表与字段注释、已登记的业务知识。{status.profilingEnabled?"按配置限额补充样本统计。":"数据画像已关闭。"}</p></details>}
+
+
     <div className="source-workspace-tabs" role="tablist" aria-label="数据源内容">{([['ontology','本体结果'],['tables','数据表'],['review',`关系与枚举${questions.length?` · ${questions.length}`:''}`],['connection','连接设置']] as const).map(([id,label])=><button role="tab" aria-selected={tab===id} aria-controls={`source-tab-${id}`} id={`source-tab-button-${id}`} key={id} className={tab===id?"active":""} onClick={()=>setTab(id)}>{label}</button>)}</div>
     <section role="tabpanel" id={`source-tab-${tab}`} aria-labelledby={`source-tab-button-${tab}`}>
-      {tab==="ontology"&&<SemanticModelingWorkspace key={completed?`${task.id}:${task.status}`:"current"} sourceId={source?.id} role={role} embedded generationId={completed?(task.payload?.orchestrationId||task.id):undefined} onPublished={onRefresh} onQuery={onQuery}/>}
+      {tab==="ontology"&&<OntologyResultWorkspace key={source?.id} sourceId={source?.id} status={status} role={role} onRefresh={refreshBuild} onQuery={onQuery} onSelectTables={()=>setSelecting(true)}/>}
       {tab==="tables"&&<DiscoveryWorkspace source={source} discovery={discovery} tasks={tasks} snapshots={snapshots} onRefresh={onRefresh} canEdit={canEdit} catalogBusy={catalogBusy}/>}
       {tab==="review"&&<><CatalogReview items={questions} role={role} onRefresh={onRefresh}/><RelationDocumentPanel sourceId={source?.id} role={role} onRefresh={onRefresh}/></>}
       {tab==="connection"&&<SourcesWorkspace sources={sources} selectedId={source?.id} onSelect={onSelect} onRefresh={onRefresh}/>}
@@ -354,15 +355,15 @@ function TableSelectionPanel({source,mode="discover",onLaunch,onClose}:{source:D
     catch(cause){setFailure(errorMessage(cause));}
     finally{setSaving(false);}
   }
-  return <div className="editor-backdrop" role="presentation" onMouseDown={(event)=>{if(event.target===event.currentTarget&&!saving)onClose();}}><section className="knowledge-editor table-selection-modal" role="dialog" aria-modal="true" aria-labelledby="table-selection-title"><div className="editor-header"><div><span className="section-kicker">探查范围</span><h2 id="table-selection-title">{mode==="build"?"选择用于构建本体的数据表":"选择要探查的表"}</h2></div><button aria-label="关闭" disabled={saving} onClick={onClose}><Icon name="close"/></button></div><div className="editor-body">
-    {mode==="build"&&<p className="selection-hint">保存后自动探查选中表并生成业务对象、属性和关系。完成后直接确认生成结果，无需再次选择建模范围。</p>}
+  return <div className="editor-backdrop" role="presentation" onMouseDown={(event)=>{if(event.target===event.currentTarget&&!saving)onClose();}}><section className="knowledge-editor table-selection-modal" role="dialog" aria-modal="true" aria-labelledby="table-selection-title"><div className="editor-header"><div><span className="section-kicker">探查范围</span><h2 id="table-selection-title">{mode==="build"?"选择用于问数的数据表":"选择要探查的表"}</h2></div><button aria-label="关闭" disabled={saving} onClick={onClose}><Icon name="close"/></button></div><div className="editor-body">
+    {mode==="build"&&<p className="selection-hint">开始后自动读取结构、整理业务含义并检查。检查通过后自动用于问数，已有定义和人工说明会保留。改变已有业务含义时会展示一次变化摘要。</p>}
     <p className="selection-hint">未勾选的表不会被探查，也不会出现在本体、图谱、消歧队列和问数中；已探查过的表取消勾选后，其结构、枚举与待确认项会立即移除。</p>
     {failure&&<Notice tone="danger" title="操作失败" body={failure}/>}
     {!rows?<p className="selection-loading"><span className="mini-loader"/>正在读取数据库表清单…</p>:<>
       <div className="knowledge-tools"><div className="search-input"><Icon name="search"/><input aria-label="搜索表" value={search} onChange={(event)=>setSearch(event.target.value)} placeholder="按表名或注释过滤…"/></div><span>共 {rows.length} 张表 · 已选 {includedCount}</span><div className="selection-bulk"><button className="secondary-button" onClick={()=>setAll(true)}>全选可见</button><button className="secondary-button" onClick={()=>setAll(false)}>排除可见</button></div></div>
       <div className="table-responsive selection-scroll"><table className="data-table"><thead><tr><th>探查</th><th>表</th><th>行数估算</th><th>状态</th></tr></thead><tbody>{visible.map((row)=><tr key={row.tableName}><td><input type="checkbox" aria-label={`探查 ${row.tableName}`} checked={choices.get(row.tableName)!==false} onChange={(event)=>setChoices((previous)=>new Map(previous).set(row.tableName,event.target.checked))}/></td><td><strong>{row.tableName}</strong><small>{row.comment||"无表注释"}</small></td><td>{formatInteger(row.rowEstimate)}</td><td>{row.probed?`已探查${row.grade?` · ${row.grade}`:""}`:"未探查"}{row.decidedBy?` · ${row.decidedBy} 决定`:""}</td></tr>)}</tbody></table></div>
     </>}
-  </div><div className="editor-actions"><button className="secondary-button" onClick={onClose} disabled={saving}>取消</button><button className="primary-button" onClick={()=>void confirm()} disabled={saving||!rows||includedCount===0}>{saving?"保存并启动中…":mode==="build"?`开始构建（${includedCount} 张表）`:`保存范围并探查 ${includedCount} 张表`}</button></div></section></div>;
+  </div><div className="editor-actions"><button className="secondary-button" onClick={onClose} disabled={saving}>取消</button><button className="primary-button" onClick={()=>void confirm()} disabled={saving||!rows||includedCount===0}>{saving?"保存并启动中…":mode==="build"?`开始整理（${includedCount} 张表）`:`保存范围并探查 ${includedCount} 张表`}</button></div></section></div>;
 }
 
 function DiscoveryWorkspace({source,discovery,tasks,snapshots,onRefresh,canEdit=true,catalogBusy=false}:{source:DataSource|null;discovery:DiscoverySummary|null;tasks:BackgroundTask[];snapshots:SchemaSnapshot[];onRefresh:()=>Promise<void>;canEdit?:boolean;catalogBusy?:boolean}){

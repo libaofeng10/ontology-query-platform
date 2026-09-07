@@ -1,3 +1,5 @@
+import { classifyBuildError } from "./ontology-build-issues.mjs";
+
 export function createOntologyDomainModelingService({domainPlanner,candidates}={}) {
   if(!domainPlanner?.plan)throw new Error("全域自动建模需要业务域规划服务");
   if(!candidates?.createRun||!candidates?.runGeneration||!candidates?.listRuns)throw new Error("全域自动建模需要候选生成服务");
@@ -11,7 +13,11 @@ export function createOntologyDomainModelingService({domainPlanner,candidates}={
     const actor=String(payload?.actor||"system");
     const orchestrationId=String(payload?.orchestrationId||task.id);
     onProgress({progress:1,total:100,currentStep:"正在自动划分业务域"});
-    const plan=payload?.domainPlanSnapshot||await domainPlanner.plan(source.id,{refresh:payload?.refreshDomainPlan!==false,actor});
+    let plan=payload?.domainPlanSnapshot||await domainPlanner.plan(source.id,{refresh:payload?.refreshDomainPlan!==false,actor});
+    if(!payload?.domainPlanSnapshot&&Array.isArray(payload?.generationTableNames)){
+      const changed=new Set(payload.generationTableNames);
+      plan={...plan,domains:plan.domains.filter((domain)=>domain.tables.some((table)=>changed.has(table.tableName)))};
+    }
     onPlan(plan);
     const selectedIds=new Set(Array.isArray(payload?.domainIds)?payload.domainIds.map(String):[]);
     const domains=(plan.domains||[]).filter((domain)=>!selectedIds.size||selectedIds.has(String(domain.id)));
@@ -44,12 +50,12 @@ export function createOntologyDomainModelingService({domainPlanner,candidates}={
         }});
         results.push({domainId:domain.id,domainName:domainLabel,runId:runRecord.id,status:"succeeded",objectCount:Number(summary.objectCount||0),linkCount:Number(summary.linkCount||0),autoConfirmedCount:Number(summary.autoConfirmedCount||0),reviewRequiredCount:Number(summary.reviewRequiredCount||0),blockedCount:Number(summary.blockedCount||0)});
       } catch(error) {
-        results.push({domainId:domain.id,domainName:domainLabel,runId:runRecord?.id||null,status:"failed",error:String(error?.message||error),objectCount:0,linkCount:0,autoConfirmedCount:0,reviewRequiredCount:0,blockedCount:0});
+        results.push({domainId:domain.id,domainName:domainLabel,runId:runRecord?.id||null,status:"failed",error:String(error?.message||error),errorKind:classifyBuildError(error).kind,retryable:classifyBuildError(error).retryable,objectCount:0,linkCount:0,autoConfirmedCount:0,reviewRequiredCount:0,blockedCount:0});
       }
     }
 
     const succeeded=results.filter((item)=>item.status==="succeeded");
-    if(!succeeded.length)throw new Error(`全部 ${domains.length} 个业务域建模失败：${results.map((item)=>`${item.domainName}：${item.error}`).join("；")}`);
+    if(!succeeded.length&&!payload?.collectFailures)throw new Error(`全部 ${domains.length} 个业务域建模失败：${results.map((item)=>`${item.domainName}：${item.error}`).join("；")}`);
     const aggregate=(key)=>succeeded.reduce((sum,item)=>sum+Number(item[key]||0),0);
     const result={
       sourceId:source.id,orchestrationId,domainCount:domains.length,succeededDomainCount:succeeded.length,failedDomainCount:domains.length-succeeded.length,

@@ -88,7 +88,20 @@ export type BackgroundTask = {
   result:DiscoverySummary|EvaluationSummary|EvaluationGateSummary|OntologyDomainModelingResult|null; createdAt:string; startedAt:string|null; finishedAt:string|null;
 };
 export type SchemaSnapshot = { id:number; sourceId:number; version:number; checksum:string; createdAt:string };
-export type SourceOntologyBuildStatus={task:BackgroundTask|null;modelingEnabled:boolean;profilingEnabled:boolean};
+export type OntologyBuildIssue={id:string;kind:string;title:string;detail:string;tables:string[];retryable:boolean;domains?:string[];definitions?:Array<{name:string;description:string;reasons?:string[]}>;options?:Array<{value:"keep_existing"|"use_candidate";label:string}>};
+export type OntologyBuildAnswer={questionId:string;text?:string;resolution?:"keep_existing"|"use_candidate"};
+export type OntologyBuildRecord={
+  id:string;phase:string;busy:boolean;legacy:boolean;createdAt:string;finishedAt:string|null;progress:number;currentStep:string|null;
+  summary:string|null;error:string|null;questions:OntologyBuildIssue[];events:Array<{phase:string;label:string;at:string}>;tableNames:string[];versionId:number|null;
+  runs:Array<{id:string;name:string;tableNames:string[];status:OntologyGenerationRun["status"];progress:number;objectCount:number;linkCount:number;modelName:string|null;error:string|null;startedAt:string|null;finishedAt:string|null}>;
+};
+export type SourceOntologyBuildStatus={
+  task:BackgroundTask|null;modelingEnabled:boolean;profilingEnabled:boolean;activeVersion:SemanticSchemaVersion|null;
+  availability:{canQuery:boolean;tableNames:string[];objectCount:number};
+  update:{id:string;phase:string;busy:boolean;questions:OntologyBuildIssue[];changes:SemanticSchemaDiff|null;changeChecksum:string|null;draftVersionId:number|null;summary:string|null;events:Array<{phase:string;label:string;at:string}>;canResume:boolean;error:{kind:string;message:string;retryable:boolean}|null}|null;
+  history:Array<{id:string;createdAt:string;finishedAt:string|null;phase:string;summary:string|null;versionId:number|null;selectedTableCount:number|null}>;
+  versions:SemanticSchemaVersion[];
+};
 
 export type OntologyQuestion = {
   id:number; kind:string; scope:"column"|"table"|"global"; tableName:string|null;
