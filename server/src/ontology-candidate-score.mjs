@@ -104,7 +104,7 @@ export function scoreOntologyCandidate(candidate,options={}) {
   const knowledge=evidenceScore(candidate?.evidence,["knowledge","knowledge_page","gold_sql","query","business_rule"],ONTOLOGY_CANDIDATE_WEIGHTS.knowledgeEvidence);
   const template=evidenceScore(candidate?.evidence,["template"],ONTOLOGY_CANDIDATE_WEIGHTS.templateMatch);
   const rawScore=Math.max(0,Math.min(100,Math.round(physical.score+semantic.score+structural.score+knowledge.score+template.score)));
-  const threshold=validThreshold(options.autoConfirmScore,80);
+  const threshold=validThreshold(options.autoConfirmScore,85);
   // 风险信号不再形成第二套“高分但强制人工”的路由规则，而是统一折算到阈值以下。
   // 因而在 auto_draft 模式中，人工队列始终可以解释为“分数低于本批阈值”。
   const score=forcedReviewReasons.length?Math.min(rawScore,Math.max(0,threshold-1)):rawScore;
@@ -128,8 +128,8 @@ export function scoreOntologyCandidate(candidate,options={}) {
   };
 }
 
-export function routeOntologyCandidateScore({score,validationErrors=[],forcedReviewReasons=[],mode="auto_draft",autoConfirmScore=80}={}) {
-  const threshold=validThreshold(autoConfirmScore,80);
+export function routeOntologyCandidateScore({score,validationErrors=[],forcedReviewReasons=[],mode="auto_draft",autoConfirmScore=85}={}) {
+  const threshold=validThreshold(autoConfirmScore,85);
   const normalizedMode=["off","review","auto_draft"].includes(mode)?mode:"auto_draft";
   if(validationErrors.length)return {status:"blocked",routeReason:"validation_error"};
   // 防御直接调用者绕过风险降分；标准评分链路会先把这些候选的展示分降到阈值以下。

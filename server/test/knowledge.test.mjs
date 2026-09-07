@@ -79,11 +79,14 @@ test("knowledge service persists validated term pages to SQLite and Markdown", a
   store.close();
 });
 
-test("verified knowledge requires an owner and SQL-bearing types require SQL", async()=>{
+test("verified knowledge requires an owner while prose definitions can be saved without SQL", async()=>{
   const dir=await mkdtemp(join(tmpdir(),"ontoquery-knowledge-"));
   const store=createStore(join(dir,"store.sqlite"));
   const service=createKnowledgeService({store,wikiDir:join(dir,"wiki")});
-  await assert.rejects(()=>service.save(1,{pageType:"term",title:"客户",content:"定义",sqlContent:"",verified:false}),/必须提供 SQL/);
+  const prose=await service.save(1,{pageType:"term",title:"客户",content:"定义",sqlContent:"",verified:false});
+  assert.equal(prose.content,"定义");
+  assert.equal(prose.sqlContent,null);
+  await assert.rejects(()=>service.save(1,{pageType:"term",title:"空知识",content:"",sqlContent:"",verified:false}),/请填写业务说明/);
   await assert.rejects(()=>service.save(1,{pageType:"rule",title:"规则",content:"定义",sqlContent:"x=1",verified:true}),/owner/);
   store.close();
 });

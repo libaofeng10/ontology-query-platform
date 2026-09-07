@@ -5,6 +5,16 @@ const parser = new Parser();
 const DANGEROUS_FUNCTIONS = new Set(["sleep","benchmark","load_file","get_lock","release_lock","sys_exec","sys_eval"]);
 
 export function guardSql(sql, policy = {}) {
+  return guardSqlInternal(sql, policy, true);
+}
+
+// Claude chooses tables, columns and relationships. This entry point keeps
+// read-only/source/resource checks without treating ontology as SQL permission.
+export function guardReadOnlySql(sql, { maxRows, databaseName } = {}) {
+  return guardSqlInternal(sql, { maxRows, databaseName }, false);
+}
+
+function guardSqlInternal(sql, policy, enforceSchema) {
   if (typeof sql !== "string" || !sql.trim()) return denied("SQL 为空",{code:"EMPTY_SQL"});
   let ast;
   try { ast = parser.astify(sql, { database:"MySQL" }); }
@@ -39,48 +49,57 @@ export function guardSql(sql, policy = {}) {
   // an unconfirmed JOIN from bypassing both column and relation allowlists.
   // CTEs remain supported because their direct-column lineage is validated by
   // buildCteInfo below.
-  if(collectSelects(statement).some((select)=>(select.from||[]).some((source)=>source.expr?.ast?.type==="select")))return denied("暂不支持 FROM/JOIN 派生表；请改写为 CTE 或已确认关系的直接 JOIN",{code:"UNSUPPORTED_DERIVED_TABLE"});
-  const hasIntoTarget = statement.into && Object.values(statement.into).some((value)=>value != null);
-  if (hasIntoTarget || statement.lock || statement.for_update || /\b(?:INTO\s+(?:OUTFILE|DUMPFILE)|FOR\s+UPDATE|LOCK\s+IN\s+SHARE\s+MODE)\b/i.test(sql)) return denied("禁止写文件或加锁查询");
+  if(enforceSchema&&collectSelects(statement).some((select)=>(select.from||[]).some((source)=>source.expr?.ast?.type==="select")))return denied("暂不支持 FROM/JOIN 派生表；请改写为 CTE 或已确认关系的直接 JOIN",{code:"UNSUPPORTED_DERIVED_TABLE"});
+  const hasWriteOrLock = collectSelects(statement).some((select) => (select.into && Object.values(select.into).some((value)=>value != null)) || select.lock || select.for_update);
+  if (hasWriteOrLock || /\b(?:INTO\s+(?:OUTFILE|DUMPFILE)|FOR\s+UPDATE|LOCK\s+IN\s+SHARE\s+MODE)\b/i.test(sql)) return denied("禁止写文件或加锁查询");
 
   const functionNames = collectFunctionNames(statement);
   const dangerous = functionNames.find((name)=>DANGEROUS_FUNCTIONS.has(name));
   if (dangerous) return denied(`禁止危险函数 ${dangerous}`);
 
-  const cte = buildCteInfo(statement);
+  const cte = enforceSchema ? buildCteInfo(statement) : {
+    names: new Set(collectSelects(statement).flatMap((select) => (select.with || []).map((item) => normalizeName(item.name?.value ?? item.name)))),
+  };
   if (cte.error) return denied(cte.error);
 
   const tableNames = getTableNames(sql).filter((table)=>!cte.names.has(normalizeName(table)));
   const allowedTables = new Set((policy.allowedTables || []).map(normalizeName));
   const unknownTables = tableNames.filter((table)=>allowedTables.size && !allowedTables.has(normalizeName(table)));
-  if (unknownTables.length) return denied(`表不在白名单：${unknownTables.join(", ")}`, { code:"UNKNOWN_TABLE",tables:tableNames,details:{unknownTables} });
+  if (enforceSchema && unknownTables.length) return denied(`表不在白名单：${unknownTables.join(", ")}`, { code:"UNKNOWN_TABLE",tables:tableNames,details:{unknownTables} });
 
-  const aliasContext = buildAliasContext(statement, cte);
-  if (aliasContext.error) return denied(aliasContext.error, { tables:tableNames });
+  let joinVerdict = {
+    ok: true,
+    joins: [...new Set(collectJoinComparisons(statement).map(({ left, right }) => `${left.table}.${left.column} = ${right.table}.${right.column}`))],
+    joinRelationIds: [],
+  };
+  if (enforceSchema) {
+    const aliasContext = buildAliasContext(statement, cte);
+    if (aliasContext.error) return denied(aliasContext.error, { tables:tableNames });
 
-  const joinVerdict = validateJoins(statement, policy.allowedRelations || [], aliasContext, cte);
-  if (!joinVerdict.ok) return { ...joinVerdict, tables:tableNames };
+    joinVerdict = validateJoins(statement, policy.allowedRelations || [], aliasContext, cte);
+    if (!joinVerdict.ok) return { ...joinVerdict, tables:tableNames };
 
-  const columnVerdict = validateColumns(
-    statement,
-    policy.allowedColumns || {},
-    policy.forbiddenColumns || [],
-    aliasContext,
-    cte,
-    policy.forbiddenOutputColumns || [],
-  );
-  if (!columnVerdict.ok) return { ...columnVerdict, tables:tableNames };
+    const columnVerdict = validateColumns(
+      statement,
+      policy.allowedColumns || {},
+      policy.forbiddenColumns || [],
+      aliasContext,
+      cte,
+      policy.forbiddenOutputColumns || [],
+    );
+    if (!columnVerdict.ok) return { ...columnVerdict, tables:tableNames };
 
-  let enumVerdict;
-  try { enumVerdict = validateEnums(statement, policy.enums || {}, aliasContext, cte); }
-  catch (error) { if (error instanceof EnumValidationError||error instanceof EnumOwnershipError) return denied(error.message,{code:error.code,tables:tableNames,details:error.details}); throw error; }
-  if (!enumVerdict.ok) return { ...enumVerdict, tables:tableNames };
+    let enumVerdict;
+    try { enumVerdict = validateEnums(statement, policy.enums || {}, aliasContext, cte); }
+    catch (error) { if (error instanceof EnumValidationError||error instanceof EnumOwnershipError) return denied(error.message,{code:error.code,tables:tableNames,details:error.details}); throw error; }
+    if (!enumVerdict.ok) return { ...enumVerdict, tables:tableNames };
 
-  const mandatoryVerdict=validateMandatoryFilters(statement,policy.mandatoryFilters||[],aliasContext,cte);
-  if(!mandatoryVerdict.ok)return {...mandatoryVerdict,tables:tableNames};
+    const mandatoryVerdict=validateMandatoryFilters(statement,policy.mandatoryFilters||[],aliasContext,cte);
+    if(!mandatoryVerdict.ok)return {...mandatoryVerdict,tables:tableNames};
 
-  const semanticVerdict=validateValueSemantics(statement,policy.valueKinds||[],policy.columnKinds||{},policy.allowedColumns||{},aliasContext,cte);
-  if(!semanticVerdict.ok)return {...semanticVerdict,tables:tableNames};
+    const semanticVerdict=validateValueSemantics(statement,policy.valueKinds||[],policy.columnKinds||{},policy.allowedColumns||{},aliasContext,cte);
+    if(!semanticVerdict.ok)return {...semanticVerdict,tables:tableNames};
+  }
 
   const maxRows = Math.max(1, Number(policy.maxRows || 500));
   const requestedAst=statement;

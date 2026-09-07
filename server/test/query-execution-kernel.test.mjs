@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createQueryExecutionKernel } from "../src/query-execution-kernel.mjs";
-import { guardSql } from "../src/sql-guard.mjs";
+import { guardSql, guardReadOnlySql } from "../src/sql-guard.mjs";
 
 function fixture({ rows = [{ id: 1, label: "ok" }], explainRows = [{ rows: 2 }], policy = {}, disclosedTables = ["demo_table"], config = {} } = {}) {
   const calls = [];
@@ -21,6 +21,56 @@ function fixture({ rows = [{ id: 1, label: "ok" }], explainRows = [{ rows: 2 }],
   const kernel = createQueryExecutionKernel({ source: { id: 1 }, connector, catalog, config: { queryMaxRows: 10, explainMaxRows: 100, queryAgentMaxSqlCalls: 3, queryAgentMaxScannedRows: 100, ...config }, question: "", disclosedTables });
   return { kernel, calls };
 }
+
+test("database schema mode accepts unlisted columns and joins without disclosure while preserving execution limits", async () => {
+  const calls = [];
+  const kernel = createQueryExecutionKernel({ source: { id: 1 }, schemaMode: "database",
+    connector: { explain: async () => { calls.push("explain"); return [{ rows: 1 }]; }, query: async () => { calls.push("query"); return [[{ phone: "13800138000" }], [{ name: "phone" }]]; } },
+    catalog: { policy: { allowedTables: ["legacy"], allowedColumns: { legacy: ["id"] }, allowedRelations: [] } },
+    config: { queryMaxRows: 2, queryAgentMaxSqlCalls: 1, explainMaxRows: 10 },
+  });
+  const receipt = await kernel.execute({ sql: "SELECT a.phone FROM accounts a JOIN customers c ON a.user_id = c.account_id" });
+  assert.equal(receipt.ok, true, receipt.error);
+  assert.match(receipt.executedSql, /LIMIT 2/);
+  assert.deepEqual(calls, ["explain", "query"]);
+  assert.equal(kernel.getRun(receipt.executionId).rows[0].phone, "13800138000");
+  assert.equal((await kernel.execute({ sql: "SELECT phone FROM accounts" })).code, "SQL_CALL_BUDGET_EXCEEDED");
+});
+
+test("read-only SQL validation keeps source and mutation restrictions in every SELECT scope", () => {
+  for (const sql of [
+    "DELETE FROM accounts",
+    "SELECT * FROM accounts; SELECT * FROM customers",
+    "SELECT a.id FROM other_db.accounts a",
+    "SELECT other_db.accounts.id FROM accounts",
+    "SELECT * FROM (SELECT id FROM other_db.accounts) a",
+    "SELECT * FROM accounts FOR UPDATE",
+    "SELECT id FROM accounts INTO OUTFILE '/tmp/export'",
+    "SELECT * FROM (SELECT SLEEP(1) AS x) a",
+    "WITH x AS (SELECT LOAD_FILE('/tmp/data') AS v) SELECT v FROM x",
+  ]) assert.equal(guardReadOnlySql(sql).ok, false, sql);
+  for (const sql of [
+    "SELECT * FROM accounts",
+    "SELECT a.id FROM accounts a WHERE EXISTS (SELECT 1 FROM customers c WHERE c.account_id = a.id)",
+    "SELECT a.id FROM accounts a JOIN (SELECT account_id, SUM(quota) total FROM usage_details GROUP BY account_id) u ON a.id = u.account_id",
+    "WITH usage_totals AS (SELECT account_id, SUM(quota) total FROM usage_details GROUP BY account_id) SELECT a.id FROM accounts a JOIN usage_totals u ON a.id = u.account_id",
+  ]) {
+    const result = guardReadOnlySql(sql, { maxRows: 17 });
+    assert.equal(result.ok, true, result.reason);
+    assert.match(result.sql, /LIMIT 17/);
+    assert.deepEqual(result.joinRelationIds, []);
+  }
+});
+
+test("database schema mode still refuses excessive scans before reading business rows", async () => {
+  let queries = 0;
+  const kernel = createQueryExecutionKernel({ source: { id: 1 }, schemaMode: "database",
+    connector: { explain: async () => [{ rows: 101 }], query: async () => { queries++; return [[], []]; } },
+    config: { explainMaxRows: 100, queryAgentMaxSqlCalls: 5 },
+  });
+  assert.equal((await kernel.execute({ sql: "SELECT * FROM accounts" })).ok, false);
+  assert.equal(queries, 0);
+});
 
 test("execution kernel performs the guarded explain/query sequence and registers a private full run", async () => {
   const { kernel, calls } = fixture({ rows: [{ id: 1, label: "ok" }] });

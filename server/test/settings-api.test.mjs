@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { createApp } from "../src/server.mjs";
+import { scoreOntologyCandidate } from "../src/ontology-candidate-score.mjs";
 
 async function createFixture(extra={}) {
   const root=await mkdtemp(join(tmpdir(),"ontoquery-settings-api-"));
@@ -28,16 +29,17 @@ test("settings API requires admin for reads and writes and hot-applies updates",
     assert.equal((await api(app,"/api/settings","token-editor",{llm:{model:"x"}},"PUT")).status,403);
     const view=await api(app,"/api/settings","token-admin",null,"GET");
     assert.equal(view.status,200);
+    assert.equal(Object.hasOwn(view.body.retrieval,"topK"),false);
     assert.ok("llm" in view.body&&"embedding" in view.body&&"retrieval" in view.body&&"query" in view.body&&"claudeQuery" in view.body&&"ontologyAi" in view.body&&"prompts" in view.body);
     assert.equal(view.body.promptMeta.agentQuestion.label,"Agent 初始任务");
     assert.deepEqual(view.body.promptMeta.agentQuestion.variables,["context"]);
     assert.equal(view.body.prompts.agentQuestion,view.body.promptDefaults.agentQuestion);
     const customPrompt="API 自定义提示词：{{context}}";
-    const updated=await api(app,"/api/settings","token-admin",{llm:{model:"hot-model",apiKey:"sk-new-key-tail"},retrieval:{topK:5},claudeQuery:{mode:"prefer",trafficPercent:10,maxBudgetUsd:2},ontologyAi:{mode:"review",autoConfirmScore:80},prompts:{agentQuestion:customPrompt}},"PUT");
+    const updated=await api(app,"/api/settings","token-admin",{llm:{model:"hot-model",apiKey:"sk-new-key-tail"},retrieval:{minSimilarity:0.5},claudeQuery:{mode:"prefer",trafficPercent:10,maxBudgetUsd:2},ontologyAi:{mode:"review",autoConfirmScore:80},prompts:{agentQuestion:customPrompt}},"PUT");
     assert.equal(updated.status,200);
     assert.equal(updated.body.llm.model,"hot-model");
     assert.deepEqual(updated.body.llm.apiKey,{set:true,masked:"****tail"});
-    assert.equal(updated.body.retrieval.topK,5);
+    assert.equal(updated.body.retrieval.minSimilarity,0.5);
     assert.equal(updated.body.claudeQuery.mode,"prefer");
     assert.equal(updated.body.claudeQuery.trafficPercent,10);
     assert.equal(updated.body.claudeQuery.maxBudgetUsd,2);
@@ -53,6 +55,53 @@ test("settings API requires admin for reads and writes and hot-applies updates",
     const invalidPrompt=await api(app,"/api/settings","token-admin",{prompts:{agentQuestion:"no variable"}},"PUT");
     assert.equal(invalidPrompt.status,400);
     assert.match(invalidPrompt.body.error,/缺少必需变量/);
+    const retired=await api(app,"/api/settings","token-admin",{retrieval:{topK:8}},"PUT");
+    assert.equal(retired.status,400);
+    assert.match(retired.body.error,/未知设置项 retrieval.topK/);
+    const unknownGroup=await api(app,"/api/settings","token-admin",{retiredGroup:{enabled:true}},"PUT");
+    assert.equal(unknownGroup.status,400);
+    assert.match(unknownGroup.body.error,/未知设置分组 retiredGroup/);
+  } finally { await app.close(); }
+});
+
+test("admin score policy hot-applies at 85 without calibration and keeps existing run snapshots",async()=>{
+  const app=await createFixture({ontologyCandidateScorer:{score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9})}});
+  try {
+    const source=app.store.createSource({name:"score-policy",kind:"mysql",host:"db",port:3306,dbName:"crm",userName:"ro",credential:"encrypted",isDemo:false});
+    app.store.upsertTable({sourceId:source.id,tableName:"crm_customer",grade:"A",active:1,comment:"客户主体"});
+    app.store.upsertColumn({sourceId:source.id,tableName:"crm_customer",columnName:"id",dataType:"bigint",nullable:0,isPrimary:1,isUnique:1,comment:"客户编号"});
+    app.store.upsertColumn({sourceId:source.id,tableName:"crm_customer",columnName:"name",dataType:"varchar",nullable:0,comment:"客户名称"});
+    const candidate={candidateType:"object",payload:{apiName:"customer",displayName:"客户",primaryKey:"id",properties:[
+      {apiName:"id",displayName:"客户编号",type:"integer",required:true,mapping:{table:"crm_customer",column:"id"}},
+      {apiName:"name",displayName:"客户名称",type:"string",mapping:{table:"crm_customer",column:"name"}},
+    ]},evidence:[]};
+    const createRun=()=>app.ontologyCandidates.createRun({sourceId:source.id,tableNames:["crm_customer"]},"data-editor");
+    const finish=(run)=>{
+      assert.equal(app.store.transitionOntologyGenerationRun({id:run.id,expectedStatus:"queued",status:"running"}).ok,true);
+      assert.equal(app.store.transitionOntologyGenerationRun({id:run.id,expectedStatus:"running",status:"succeeded"}).ok,true);
+    };
+    assert.equal((await api(app,"/api/settings","token-admin",{ontologyAi:{mode:"review",autoConfirmScore:80}},"PUT")).status,200);
+    const older=createRun();
+    const policy={ontologyAi:{mode:"auto_draft",autoConfirmScore:85}};
+    assert.equal((await api(app,"/api/settings","token-editor",policy,"PUT")).status,403);
+    const enabled=await api(app,"/api/settings","token-admin",policy,"PUT");
+    assert.equal(enabled.status,200);assert.equal(enabled.body.ontologyAi.autoConfirmScore,85);
+    assert.equal(app.store.getSetting("ontologyAi.mode").updatedBy,"platform-admin");
+    assert.equal(app.store.listOntologyCalibrationGates(source.id).length,0);
+    assert.equal((await app.ontologyCandidates.evaluateAndStore(older.id,candidate)).status,"review_required");
+    finish(older);
+
+    const automatic=createRun();
+    assert.equal(automatic.scope.modelingMode,"auto_draft");assert.equal(automatic.scope.autoConfirmScore,85);
+    const updated=await api(app,"/api/settings","token-admin",{ontologyAi:{mode:"auto_draft",autoConfirmScore:86,maxTables:20,maxFields:600,timeoutMs:300000,calibrationMinSamples:40}},"PUT");
+    assert.equal(updated.status,200,"saving advanced settings must not require switching back to review");
+    const accepted=await app.ontologyCandidates.evaluateAndStore(automatic.id,candidate);
+    assert.equal(accepted.score,85);assert.equal(accepted.status,"auto_confirmed");
+    assert.deepEqual(app.ontologyCandidates.listEvents(accepted.id).map((event)=>event.eventType),["auto_route"]);
+    finish(automatic);
+    const next=createRun();
+    assert.equal(next.scope.autoConfirmScore,86);
+    assert.equal((await app.ontologyCandidates.evaluateAndStore(next.id,candidate)).status,"review_required");
   } finally { await app.close(); }
 });
 

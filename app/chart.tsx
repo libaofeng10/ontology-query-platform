@@ -38,8 +38,8 @@ export function DataChart({ answer }: { answer: QueryAnswer }) {
         {[0.25, 0.5, 0.75, 1].map((ratio) => <line key={ratio} x1="34" x2={width - 34} y1={height - 32 - ratio * (height - 72)} y2={height - 32 - ratio * (height - 72)} className="grid-line" />)}
         <defs>
           <linearGradient id="areaGlow" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="#5eead4" stopOpacity=".28" />
-            <stop offset="100%" stopColor="#5eead4" stopOpacity="0" />
+            <stop offset="0%" stopColor="var(--cyan)" stopOpacity=".28" />
+            <stop offset="100%" stopColor="var(--cyan)" stopOpacity="0" />
           </linearGradient>
         </defs>
         <polygon points={area} fill="url(#areaGlow)" />

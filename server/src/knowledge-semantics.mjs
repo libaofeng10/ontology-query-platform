@@ -17,6 +17,9 @@ export function validateKnowledgeSemantics(page,{columnsByTable={}}={}) {
   const errors=[];
   const warnings=[];
   if(String(page?.pageType)!=="metric")return {ok:true,semanticHealth:"ok",errors,warnings};
+  // Claude can use a prose definition directly. Validate an optional SQL example
+  // when supplied; absence of SQL is not a defect in business knowledge.
+  if(!String(page.sqlContent||"").trim()&&String(page.content||"").trim())return {ok:true,semanticHealth:"ok",errors,warnings};
 
   const probe={...page,verified:true,owner:page.owner||"semantic-validation"};
   const concept=knowledgeIntentConcepts([probe],columnsByTable)[0];

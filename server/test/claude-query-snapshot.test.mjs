@@ -21,7 +21,7 @@ function fixture(overrides = {}) {
   const catalog = {
     tables: [
       { tableName: "crm_customer", comment: "客户主表", grade: "A", rowEstimate: 10 },
-      { tableName: "unmodeled_secret", comment: "不得暴露" },
+      { tableName: "unmodeled_secret", comment: "未建立本体对象的物理表" },
     ],
     columnsByTable: {
       crm_customer: [
@@ -53,16 +53,37 @@ function fixture(overrides = {}) {
   });
 }
 
-test("snapshot only exposes published mapped tables/columns; sensitive metadata is always false", () => {
+test("physical tables can be read without objects and object queries honor keywords and physical identifiers", () => {
   const snapshot = fixture();
-  assert.deepEqual(snapshot.allowedTableNames, ["crm_customer"]);
-  assert.deepEqual(snapshot.allowedColumnsByTable.crm_customer.sort(), ["customer_id", "is_deleted", "mobile", "name"]);
+  const table = snapshot.read({ operation: "get_tables", ids: ["unmodeled_secret"] });
+  assert.equal(table.items[0].columns[0].columnName, "password_hash");
+  assert.equal(snapshot.read({ operation: "get_objects", ids: ["crm_customer"] }).items[0].apiName, "customer");
+  assert.equal(snapshot.read({ operation: "get_objects", query: "不存在的业务对象" }).total, 0);
+  assert.equal(snapshot.read({ operation: "get_tables", query: "客户" }).items[0].tableName, "crm_customer");
+  assert.equal(snapshot.read({ operation: "get_tables", ids: ["crm_customer"], query: "不存在的业务对象" }).total, 0);
+});
+
+test("physical table reads retain business context and overview makes verified definitions discoverable", () => {
+  const snapshot = fixture();
+  const table = snapshot.read({ operation: "get_tables", ids: ["crm_customer"] }).items[0];
+  assert.equal(table.objects[0].apiName, "customer");
+  assert.equal(table.knowledge[0].slug, "active-customers");
+  const overview = snapshot.read("overview");
+  assert.equal(overview.knowledge[0].slug, "active-customers");
+  assert.deepEqual(overview.knowledge[0].tables, ["crm_customer"]);
+  assert.equal(overview.knowledge[0].content, undefined, "overview remains an index; full definitions are read on demand");
+});
+
+test("snapshot exposes physical catalog independently of ontology mappings; sensitive metadata is always false", () => {
+  const snapshot = fixture();
+  assert.deepEqual(snapshot.allowedTableNames, ["crm_customer", "unmodeled_secret"]);
+  assert.deepEqual(snapshot.allowedColumnsByTable.crm_customer.sort(), ["customer_id", "internal_note", "is_deleted", "mobile", "name"]);
   const phone = snapshot.columnsByTable.crm_customer.find((item) => item.columnName === "mobile");
   // 2026-09-04 敏感列逻辑已移除：所有列 sensitive 恒为 false、selectable 恒为 true。
   assert.equal(phone.sensitive, false);
   assert.equal(phone.filterable, true);
   assert.equal(phone.selectable, true);
-  assert.equal(snapshot.columnsByTable.crm_customer.some((item) => item.columnName === "internal_note"), false);
+  assert.equal(snapshot.columnsByTable.crm_customer.some((item) => item.columnName === "internal_note"), true);
   // 枚举不再因敏感列被排除。
   assert.deepEqual(snapshot.enumValues["crm_customer.mobile"], [{ value: "13800138000", meaning: null, meaningSource: null }]);
   assert.deepEqual(snapshot.enumValues["crm_customer.is_deleted"], [{ value: "0", meaning: "有效", meaningSource: null }]);
@@ -78,10 +99,10 @@ test("object reads and search disclose allowed physical state fields and enum me
   const deleted = table.columns.find((column) => column.columnName === "is_deleted");
   assert.equal(deleted.comment, "逻辑删除");
   assert.deepEqual(deleted.enumValues, [{ value: "0", meaning: "有效", meaningSource: null }]);
-  assert.equal(table.columns.some((column) => column.columnName === "internal_note"), false);
+  assert.equal(table.columns.some((column) => column.columnName === "internal_note"), true);
   const found = snapshot.read({ operation: "search", query: "is_deleted" });
   assert.ok(found.items.some((item) => item.kind === "column" && item.table === "crm_customer" && item.columnName === "is_deleted"));
-  assert.equal(snapshot.read({ operation: "search", query: "password_hash" }).total, 0);
+  assert.equal(snapshot.read({ operation: "search", query: "password_hash" }).total, 1);
 });
 
 test("ontology search reaches verified definitions beyond the first 200 without preselecting by question", () => {
@@ -105,10 +126,10 @@ test("ontology search reaches verified definitions beyond the first 200 without 
 
 test("snapshot read operations paginate and disclose only returned tables", () => {
   const snapshot = fixture();
-  assert.deepEqual(snapshot.disclose(["crm_customer", "unmodeled_secret"]), ["crm_customer"]);
+  assert.deepEqual(snapshot.disclose(["crm_customer", "unmodeled_secret"]), ["crm_customer", "unmodeled_secret"]);
   const overview = snapshot.read("overview");
   assert.equal(overview.schemaVersion, 2);
-  assert.deepEqual(overview.disclosedTables, ["crm_customer"]);
+  assert.deepEqual(overview.disclosedTables, ["crm_customer", "unmodeled_secret"]);
   const page = snapshot.read({ operation: "search", query: "客户", limit: 1 });
   assert.equal(page.items.length, 1);
   assert.equal(page.total > 1, true);
@@ -116,6 +137,58 @@ test("snapshot read operations paginate and disclose only returned tables", () =
   const next = snapshot.read({ operation: "search", query: "客户", cursor: page.nextCursor, limit: 50 });
   assert.equal(next.items.length, page.total - 1);
   assert.ok(snapshot.read({ operation: "get_objects", ids: ["customer"] }).items.length);
+});
+
+test("overview identifies a product by its description and mapped tables before object selection", () => {
+  const snapshot = fixture({ ontologySchema: {
+    name: "products", objectTypes: [{
+      apiName: "product_account", displayName: "产品账户", description: "AlphaGPT 产品账户及使用情况的用户入口",
+      properties: [{ apiName: "phone", mapping: { table: "crm_customer", column: "mobile" } }],
+    }], linkTypes: [],
+  } });
+  const object = snapshot.read("overview").objects[0];
+  assert.equal(object.description, "AlphaGPT 产品账户及使用情况的用户入口");
+  assert.deepEqual(object.tableNames, ["crm_customer"]);
+  assert.equal(object.properties, undefined, "overview stays an index; detailed fields require an object read");
+});
+
+test("knowledge queries filter and rank multiple keywords before pagination and intersect with requested IDs", () => {
+  const snapshot = fixture({ knowledge: [
+    { slug: "office", title: "律所名称", tables: ["crm_customer"], verified: 1 },
+    { slug: "gpt-account", title: "GPT账号", tables: ["crm_customer"], verified: 1 },
+    { slug: "gpt-usage", title: "GPT使用情况", aliases: ["GPT消耗"], tables: ["crm_customer"], verified: 1 },
+    { slug: "gpt-history", title: "GPT使用情况历史", tables: ["crm_customer"], verified: 1 },
+  ] });
+  const first = snapshot.read({ operation: "get_knowledge", query: "  gPt使用情况   消耗  ", limit: 1 });
+  assert.equal(first.items[0]?.slug, "gpt-usage");
+  assert.equal(first.total, 2);
+  assert.ok(first.nextCursor);
+  const next = snapshot.read({ operation: "get_knowledge", query: "gpt使用情况 消耗", cursor: first.nextCursor, limit: 1 });
+  assert.equal(next.items[0]?.slug, "gpt-history");
+  assert.equal(next.nextCursor, null);
+  assert.equal(snapshot.read({ operation: "get_knowledge", query: "不相关术语" }).total, 0);
+  assert.equal(snapshot.read({ operation: "get_knowledge", query: "消耗", ids: ["office"] }).total, 0);
+  assert.equal(snapshot.read({ operation: "get_knowledge", ids: ["office"] }).items[0]?.slug, "office");
+  assert.equal(snapshot.read({ operation: "get_knowledge", query: "   " }).total, 4);
+});
+
+test("ontology search accepts multiple terms while preserving published scope", () => {
+  const snapshot = fixture();
+  const result = snapshot.read({ operation: "search", query: "phone mobile" });
+  assert.ok(result.items.some((item) => item.kind === "property" && item.apiName === "phone"));
+  assert.ok(result.items.some((item) => item.kind === "column" && item.columnName === "mobile"));
+  assert.equal(result.items.some((item) => item.table === "unmodeled_secret"), false);
+  assert.equal(snapshot.read({ operation: "search", query: "password_hash unknown_secret" }).total, 1);
+});
+
+test("a matched business definition includes its mapped objects and allowed table structure", () => {
+  const snapshot = fixture();
+  const knowledge = snapshot.read({ operation: "get_knowledge", query: "有效客户" });
+  assert.deepEqual(knowledge.objects.map((object) => object.apiName), ["customer"]);
+  assert.deepEqual(knowledge.tables.map((table) => table.tableName), ["crm_customer"]);
+  assert.ok(knowledge.tables[0].columns.some((column) => column.columnName === "mobile"));
+  assert.equal(knowledge.tables[0].columns.some((column) => column.columnName === "internal_note"), true);
+  assert.deepEqual(snapshot.read({ operation: "get_knowledge", query: "不存在的定义" }).tables, []);
 });
 
 test("snapshot overview retains required execution evidence without copying arbitrary retrieval data", () => {
@@ -137,7 +210,7 @@ test("snapshot overview retains required execution evidence without copying arbi
   assert.doesNotMatch(JSON.stringify(snapshot), /private-provider-key|injected-instruction/);
 });
 
-test("snapshot exposes only relations explicitly mapped by the published schema", () => {
+test("snapshot provides confirmed physical relationships as guidance independently of published link mappings", () => {
   const snapshot = fixture({
     published: {
       id: 3, sourceId: 7, version: 2, status: "published", checksum: "b".repeat(64),
@@ -165,7 +238,7 @@ test("snapshot exposes only relations explicitly mapped by the published schema"
       ],
     },
   });
-  assert.deepEqual(snapshot.relations.map((item) => item.id), [1]);
+  assert.deepEqual(snapshot.relations.map((item) => item.id), [1, 2]);
   assert.deepEqual(snapshot.links[0].mappings.map((item) => item.relationId), [1]);
   assert.equal(snapshot.columnsByTable.crm_order.some((item) => item.columnName === "order_id"), true);
 });

@@ -8,10 +8,12 @@ import {
   scoreOntologyCandidate,
 } from "../src/ontology-candidate-score.mjs";
 
-test("candidate routing has no gap at the 80 point boundary",()=>{
-  assert.equal(routeOntologyCandidateScore({score:79}).status,"review_required");
-  assert.equal(routeOntologyCandidateScore({score:80}).status,"auto_confirmed");
-  assert.equal(routeOntologyCandidateScore({score:81}).status,"auto_confirmed");
+test("candidate routing includes 85 in automatic confirmation and respects explicit thresholds",()=>{
+  assert.equal(routeOntologyCandidateScore({score:84}).status,"review_required");
+  assert.equal(routeOntologyCandidateScore({score:85}).status,"auto_confirmed");
+  assert.equal(routeOntologyCandidateScore({score:86}).status,"auto_confirmed");
+  assert.equal(routeOntologyCandidateScore({score:80,autoConfirmScore:80}).status,"auto_confirmed");
+  assert.equal(routeOntologyCandidateScore({score:85,autoConfirmScore:86}).status,"review_required");
   assert.equal(routeOntologyCandidateScore({score:90,forcedReviewReasons:["SENSITIVE_FIELD_MAPPING"]}).status,"review_required");
   assert.equal(routeOntologyCandidateScore({score:90,validationErrors:[{code:"x"}]}).status,"blocked");
   assert.equal(routeOntologyCandidateScore({score:100,mode:"review"}).status,"review_required");

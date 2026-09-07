@@ -10,7 +10,7 @@ import { QUERY_PROMPT_DEFAULTS } from "../src/query-prompts.mjs";
 const BASE_CONFIG={
   llm:{baseUrl:"https://env-llm.example/v1",apiKey:"env-llm-key",model:"env-model"},
   embedding:{baseUrl:"",apiKey:"",model:"",dimensions:null},
-  retrieval:{vectorEnabled:true,topK:8,vectorWeight:0.4,minSimilarity:0.35,semanticThreshold:0.55},
+  retrieval:{vectorEnabled:true,vectorWeight:0.4,minSimilarity:0.35,semanticThreshold:0.55},
   discovery:{enumMaxDistinctRatio:0.05,labelDictionaryMaxRows:20},
   claudeQuery:{mode:"off",trafficPercent:0,binary:"/app/node_modules/.bin/claude",model:"",promptVersion:"claude-query-v1",timeoutMs:120_000,maxTurns:12,maxBudgetUsd:1,maxConcurrency:2,queueTimeoutMs:5_000,maxStdioBytes:2*1024*1024},
   ontologyAi:{mode:"off",autoConfirmScore:80,maxTables:20,maxFields:600,timeoutMs:90_000},
@@ -103,7 +103,7 @@ test("invalid values are rejected with a chinese error and nothing is written",a
   const {store,settings}=await createFixture();
   try {
     assert.throws(()=>settings.update({retrieval:{vectorWeight:1.5}}),/vectorWeight 必须在 0 和 1 之间/);
-    assert.throws(()=>settings.update({retrieval:{topK:0}}),/topK 必须是 1 到 50 的整数/);
+    assert.throws(()=>settings.update({retrieval:{topK:0}}),/未知设置项 retrieval.topK/);
     assert.throws(()=>settings.update({query:{semanticQueryPlanMode:"maybe"}}),/必须是 off、prefer、required 之一/);
     assert.throws(()=>settings.update({query:{queryAgentMaxIterations:1}}),/必须是 2 到 20 的整数/);
     assert.throws(()=>settings.update({query:{queryAgentTrafficPercent:101}}),/必须是 0 到 100 的整数/);
@@ -143,9 +143,36 @@ test("deployment-owned Claude path and prompt version ignore stale settings rows
     assert.equal(settings.config.claudeQuery.promptVersion,"claude-query-v1");
     assert.notEqual(settings.publicView().sources["claudeQuery.binary"],"db");
     assert.notEqual(settings.publicView().sources["claudeQuery.model"],"db");
+    for (const key of ["claudeQuery.binary","claudeQuery.model","claudeQuery.promptVersion"]) {
+      assert.equal(store.getSetting(key),undefined);
+    }
     assert.throws(()=>settings.update({claudeQuery:{binary:"/tmp/other"}}),/由部署配置固定/);
     assert.throws(()=>settings.update({claudeQuery:{model:"claude-other"}}),/由部署配置固定/);
   } finally { store.close(); }
+});
+
+test("startup removes retired settings without changing active budgets, secrets or migration markers",async()=>{
+  const {store,settings}=await createFixture();
+  try {
+    settings.update({llm:{apiKey:"sk-preserve-me"},query:{queryAgentMaxSqlCalls:5},claudeQuery:{mode:"required"}});
+    const secret=store.getSetting("llm.apiKey").valueJson;
+    store.upsertSetting({key:"retrieval.topK",valueJson:"12"});
+    store.upsertSetting({key:"system.enumDictionaryRuleVersion",valueJson:"3"});
+    const restarted=createSettingsService({store,baseConfig:BASE_CONFIG,appSecret:"settings-test-secret"});
+    assert.equal(store.getSetting("retrieval.topK"),undefined);
+    assert.equal(Object.hasOwn(restarted.config.retrieval,"topK"),false);
+    assert.equal(Object.hasOwn(restarted.publicView().retrieval,"topK"),false);
+    assert.equal(restarted.publicView().sources["retrieval.topK"],undefined);
+    assert.equal(restarted.config.claudeQuery.mode,"required");
+    assert.equal(restarted.config.queryAgentMaxSqlCalls,5);
+    assert.equal(restarted.config.llm.apiKey,"sk-preserve-me");
+    assert.equal(store.getSetting("llm.apiKey").valueJson,secret);
+    assert.equal(store.getSetting("system.enumDictionaryRuleVersion").valueJson,"3");
+    assert.throws(()=>restarted.update({llm:{model:"not-written"},retrieval:{topK:8}}),/未知设置项 retrieval.topK/);
+    assert.equal(store.getSetting("llm.model"),undefined);
+    assert.throws(()=>restarted.update({llm:{model:"not-written"},retiredGroup:{enabled:true}}),/未知设置分组 retiredGroup/);
+    assert.equal(store.getSetting("llm.model"),undefined);
+  } finally {store.close();}
 });
 
 test("label dictionary row cap is an online-editable discovery setting",async()=>{

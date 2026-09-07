@@ -44,8 +44,30 @@ export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
 
   function get(sourceId,pageType,slug) { return list(sourceId).find((page)=>page.pageType===pageType&&page.slug===slug)||null; }
 
+  // Business knowledge has its own authoring surface. Catalog pages remain
+  // available to legacy readers, but must not become a second editable catalog.
+  function listBusiness(sourceId) {
+    const pages=store.listKnowledge(sourceId).filter((page)=>["term","metric","rule"].includes(page.pageType)).map((page)=>({...page,origin:"knowledge",readOnly:false}));
+    for(const rule of store.listRules(sourceId))pages.push({
+      id:`rule:${rule.id}`,sourceId,pageType:"rule",slug:`catalog-rule-${rule.id}`,title:rule.name,
+      aliases:[],tables:splitAppliesTo(rule.appliesTo),content:rule.content,sqlContent:null,antiExamples:null,
+      verified:Boolean(rule.verified),owner:null,verifiedAt:null,updatedAt:null,origin:"catalog",readOnly:true,
+    });
+    return pages.sort((a,b)=>Number(b.verified)-Number(a.verified)||a.title.localeCompare(b.title,"zh-CN"));
+  }
+
+  function assertCatalogOwnership(sourceId,page) {
+    if(page.pageType==="join"&&store.listRelations(sourceId,false,true).some((relation)=>page.slug===`${relation.fromTable}-${relation.fromCol}-${relation.toTable}-${relation.toCol}`)) {
+      throw httpError(409,"该关系由数据源与本体维护，请在关系确认中更新，避免生成两份定义");
+    }
+    if(page.pageType==="rule"&&store.listRules(sourceId).some((rule)=>[slugify(rule.name),`catalog-rule-${rule.id}`].includes(page.slug))) {
+      throw httpError(409,"该规则来自数据源确认，请在数据源与本体中维护");
+    }
+  }
+
   async function save(sourceId,input) {
     const page=validatePage(sourceId,input);
+    assertCatalogOwnership(sourceId,page);
     const health=semanticVerdict(sourceId,page);
     const root=rootFor(sourceId);
     const file=join(root,`${page.pageType}s`,`${page.slug}.md`);
@@ -78,7 +100,7 @@ export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
           const markdown=await readFile(file,"utf8");const parsed=parseMarkdown(markdown,pageType,entry.name);
           if(!Object.hasOwn(parsed.meta,"owner")){result.skipped++;continue;}
           const input={...parsed,pageType,slug:entry.name.slice(0,-3),owner:parsed.meta.owner,verifiedAt:parsed.meta.verified_at};
-          const page=validatePage(sourceId,input);const health=semanticVerdict(sourceId,page);const checksum=createHash("sha256").update(markdown).digest("hex");const existing=store.getKnowledge(sourceId,pageType,page.slug);
+          const page=validatePage(sourceId,input);assertCatalogOwnership(sourceId,page);const health=semanticVerdict(sourceId,page);const checksum=createHash("sha256").update(markdown).digest("hex");const existing=store.getKnowledge(sourceId,pageType,page.slug);
           if(existing?.checksum===checksum){result.unchanged++;continue;}
           store.upsertKnowledge({...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),contractJson:page.contract?JSON.stringify(page.contract):null,semanticHealth:health.semanticHealth,filePath:file,checksum});result.imported++;
         } catch(error) { result.errors.push({file:entry.name,error:String(error.message||error)}); }
@@ -87,7 +109,7 @@ export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
     return result;
   }
 
-  return {list,get,save,remove,sync,rootFor};
+  return {list,listBusiness,get,save,remove,sync,rootFor};
 }
 
 function validatePage(sourceId,input) {
@@ -96,7 +118,9 @@ function validatePage(sourceId,input) {
   const title=String(input.title||"").trim(); if(!title) throw httpError(400,"title 必填");
   const slug=slugify(input.slug||title); if(!slug) throw httpError(400,"无法生成合法 slug");
   const sqlContent=String(input.sqlContent||"").trim();
-  if(!sqlContent) throw httpError(400,`${pageType} 页面必须提供 SQL 片段、ON 条件或参考 SQL`);
+  const content=String(input.content||"").trim();
+  if(pageType==="join"&&!sqlContent) throw httpError(400,"JOIN 页面必须提供 ON 条件");
+  if(!content&&!sqlContent) throw httpError(400,"请填写业务说明或参考 SQL");
   const verified=Boolean(input.verified); const owner=String(input.owner||"").trim()||null;
   if(verified&&!owner) throw httpError(400,"verified 页面必须填写 owner");
   const contract=normalizeContract(input.contract);

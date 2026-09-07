@@ -177,7 +177,7 @@ test("candidate merge API is editor-only and keeps both sides auditable",async()
   } finally { await app.close(); }
 });
 
-test("real-source calibration API enforces review evidence before admin activates auto_draft",async()=>{
+test("optional calibration API verifies evidence independently of admin score policy",async()=>{
   const root=await mkdtemp(join(tmpdir(),"ontoquery-calibration-api-"));
   const app=createApp({dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"calibration-api-secret",apiIdentities:[{name:"viewer-a",role:"viewer",token:"viewer-token",sourceIds:"*"},{name:"editor-a",role:"editor",token:"editor-token",sourceIds:"*"},{name:"admin-a",role:"admin",token:"admin-token",sourceIds:"*"}],connector:{close:async()=>{},test:async()=>({ok:true}),query:async()=>[[],[]],explain:async()=>[]},rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test"});
   try {
@@ -196,7 +196,7 @@ test("real-source calibration API enforces review evidence before admin activate
     app.store.publishOntologySchemaVersion(draft.id,"editor-a");
     const evalCases=[];for(let index=0;index<10;index++)evalCases.push(app.store.addEvalCase({sourceId:source.id,setName:"pilot-gold",question:`试点 Gold 问题 ${index+1}`,goldSql:"SELECT id FROM pilot_customer",category:"客户",heldOut:1}));
     const publishedDraft=app.store.getOntologySchemaVersion(draft.id);const evalGate=app.store.saveEvalGate({id:"pilot-gold",sourceId:source.id,setName:"pilot-gold",total:10,ontologySchemaVersion:draft.version,ontologySchemaPublishedAt:publishedDraft.publishedAt,evaluationChecksum:evalSetChecksum(evalCases),baseline:{requestedMode:"off",passRate:1},candidate:{requestedMode:"prefer",passRate:1,semanticExecutionRate:1,joinFailureRate:0},passed:1,decision:"enable_prefer",reason:"equivalent"});
-    assert.equal((await api(app,"/api/settings","admin-token",{ontologyAi:{mode:"auto_draft"}},"PUT")).status,400);
+    assert.equal((await api(app,"/api/settings","admin-token",{ontologyAi:{mode:"auto_draft",autoConfirmScore:85}},"PUT")).status,200);
     const report=await api(app,`/api/ontology/calibration?sourceId=${source.id}`,"viewer-token",null,"GET");assert.equal(report.status,200);assert.equal(report.body.counts.labeledAuto,40);assert.deepEqual(report.body.evalSets,[{setName:"pilot-gold",total:10,goldCount:10,heldOutCount:10,ready:true}]);
     const created=await api(app,"/api/ontology/calibration/gates","editor-token",{sourceId:source.id,draftSchemaVersionId:draft.id,evalGateId:evalGate.id,manualObjectCount:0});assert.equal(created.status,201);assert.equal(created.body.passed,true);
     assert.equal((await api(app,`/api/ontology/calibration/gates/${created.body.id}/activate`,"editor-token",{})).status,403);

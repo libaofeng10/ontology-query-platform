@@ -17,7 +17,10 @@ test("server-renders the OntoQuery workspace", async () => {
   assert.match(html, /AI 问答/);
   assert.match(html, /数据源/);
   assert.match(html, /本体图谱/);
-  assert.match(html, /业务对象建模/);
+  assert.match(html, /数据源与本体/);
+  assert.match(html, /业务知识/);
+  assert.doesNotMatch(html, /消歧队列|知识资产/);
+  assert.doesNotMatch(html, /业务对象建模|结构与分级/);
   assert.match(html, /这里只显示 SQLite 与数据源返回的真实数据/);
   assert.doesNotMatch(html, /7 月有效客户达到|目标已达到|demo-user/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/);

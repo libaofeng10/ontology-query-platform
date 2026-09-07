@@ -11,7 +11,7 @@ import { retrieveKnowledge } from "../src/knowledge-retrieval.mjs";
 const EMBEDDING={baseUrl:"https://embed.test/v1",apiKey:"embed-key",model:"embed-v1",dimensions:null};
 
 function fakeSettings(overrides={}) {
-  return {config:{embedding:{...EMBEDDING,...overrides.embedding},retrieval:{vectorEnabled:true,topK:8,vectorWeight:0.4,minSimilarity:0.35,semanticThreshold:0.55,...overrides.retrieval}}};
+  return {config:{embedding:{...EMBEDDING,...overrides.embedding},retrieval:{vectorEnabled:true,vectorWeight:0.4,minSimilarity:0.35,semanticThreshold:0.55,...overrides.retrieval}}};
 }
 function embeddingResponse(vectors) {
   return new Response(JSON.stringify({data:vectors.map((embedding,index)=>({index,embedding}))}),{status:200,headers:{"content-type":"application/json"}});

@@ -421,7 +421,6 @@ export async function runQueryAgent({store,connector,config,source,question,cont
       maxPages:6,
       maxTables:8,
       vector,
-      conceptAliases:config.retrieval?.conceptAliases||[],
       termAliases:context.termAliases||[],
       intent:queryIntent,
       ontologySchema:catalog.ontologySchema,

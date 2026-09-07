@@ -1,50 +1,111 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { Icon } from "./icons";
+import { fitGraph, graphView, GRAPH_NODE as NODE, GRAPH_VIEW as VIEW, layoutGraph, zoomGraph } from "./graph-layout.mjs";
+import type { GraphTransform } from "./graph-layout.mjs";
 import type { DataSource, NavId, OntologyGraph, OntologyGraphEdge, OntologyGraphNode } from "./types";
+import "./ontology-graph.css";
 
-const VIEW={width:1500,height:820};
-const NODE={width:164,height:58};
-const KIND_LABEL:Record<OntologyGraphNode["kind"],string>={object:"业务对象",table:"数据表",term:"业务术语",metric:"业务指标",rule:"业务规则"};
-const KIND_ORDER:OntologyGraphNode["kind"][]=["object","table","term","metric","rule"];
+type Kind=OntologyGraphNode["kind"];
+type Mode="semantic"|"mapping"|"all";
+const kinds:Kind[]=["object","table","term","metric","rule"];
+const kindLabel:Record<Kind,string>={object:"业务对象",table:"数据表",term:"术语",metric:"指标",rule:"规则"};
+const edgeLabel:Record<OntologyGraphEdge["kind"],string>={semantic:"业务关系",mapping:"属性映射",join:"表关联",subclass:"继承关系",binding:"知识关联",wikilink:"知识引用"};
 
 export function OntologyGraphWorkspace({graph,source,onNavigate}:{graph:OntologyGraph|null;source:DataSource|null;onNavigate:(id:NavId)=>void}) {
-  const [enabled,setEnabled]=useState<Record<OntologyGraphNode["kind"],boolean>>({object:true,table:true,term:true,metric:true,rule:true});
-  const [mode,setMode]=useState<"semantic"|"mapping"|"all">("semantic");
-  const [joins,setJoins]=useState<"all"|"confirmed">("all");const [search,setSearch]=useState("");const [selectedId,setSelectedId]=useState<string|null>(null);
-  const [view,setView]=useState({x:0,y:0,scale:1});const drag=useRef<{x:number;y:number;startX:number;startY:number}|null>(null);
-  const positions=useMemo(()=>layout(graph?.nodes||[]),[graph?.nodes]);
-  const normalized=search.trim().toLowerCase();
-  const visibleNodes=useMemo(()=>new Set((graph?.nodes||[]).filter((node)=>enabled[node.kind]&&visibleInMode(node.kind,mode)&&(!normalized||`${node.title} ${node.subtitle} ${node.content} ${node.tables.join(" ")} ${(node.properties||[]).map((property)=>`${property.displayName} ${property.apiName}`).join(" ")}`.toLowerCase().includes(normalized))).map((node)=>node.id)),[enabled,graph?.nodes,mode,normalized]);
-  const visibleEdges=(graph?.edges||[]).filter((edge)=>visibleNodes.has(edge.source)&&visibleNodes.has(edge.target)&&visibleEdgeInMode(edge.kind,mode)&&(joins==="all"||edge.kind!=="join"||edge.confirmed));
-  const selected=(graph?.nodes||[]).find((node)=>node.id===selectedId)||null;const neighborEdges=selected?visibleEdges.filter((edge)=>edge.source===selected.id||edge.target===selected.id):[];const neighbors=new Set(neighborEdges.flatMap((edge)=>[edge.source,edge.target]));
-  const connectedNodes=(graph?.nodes||[]).filter((node)=>neighbors.has(node.id)&&node.id!==selected?.id);
-  function zoom(delta:number){setView((current)=>({...current,scale:clamp(current.scale+delta,.45,2.2)}));}
-  function reset(){setView({x:0,y:0,scale:1});setSelectedId(null);}
-  function pointerDown(event:ReactPointerEvent<SVGSVGElement>){if(event.button!==0)return;event.currentTarget.setPointerCapture(event.pointerId);drag.current={x:event.clientX,y:event.clientY,startX:view.x,startY:view.y};}
+  const [mode,setMode]=useState<Mode>(graph?.stats.objects?"semantic":"mapping");
+  const [enabled,setEnabled]=useState<Partial<Record<Kind,boolean>>>({});
+  const [confirmedOnly,setConfirmedOnly]=useState(false);
+  const [search,setSearch]=useState("");
+  const [selectedId,setSelectedId]=useState<string|null>(null);
+  const [focus,setFocus]=useState(false);
+  const [viewport,setViewport]=useState<(GraphTransform&{key:string})|null>(null);
+  const svgRef=useRef<SVGSVGElement>(null);
+  const drag=useRef<{point:{x:number;y:number};view:GraphTransform}|null>(null);
+  const markerId=useId().replaceAll(":","");
+  const visible=useMemo(()=>graphView(graph?.nodes||[],graph?.edges||[],{mode,query:search,enabled,confirmedOnly,focusId:focus?selectedId:null}),[graph,mode,search,enabled,confirmedOnly,focus,selectedId]);
+  const layout=useMemo(()=>layoutGraph(visible.nodes,visible.edges),[visible]);
+  const layoutKey=`${mode}:${visible.nodes.map(node=>node.id).join("|")}:${visible.edges.map(edge=>edge.id).join("|")}`;
+  const fitted=useMemo(()=>fitGraph(layout),[layout]);
+  const view=viewport?.key===layoutKey?viewport:fitted;
+  const selected=visible.nodes.find(node=>node.id===selectedId)||null;
+  const related=selected?visible.edges.filter(edge=>edge.source===selected.id||edge.target===selected.id):[];
+  const neighbors=new Set(related.flatMap(edge=>[edge.source,edge.target]));
+  const nodeById=new Map((graph?.nodes||[]).map(node=>[node.id,node]));
+  const searchResults=(graph?.nodes||[]).filter(node=>visible.matches.has(node.id));
+  function choose(id:string,narrow=false){
+    const node=nodeById.get(id);if(!node)return;
+    if(node.kind==="table"&&mode==="semantic")setMode("mapping");
+    if(!["table","object"].includes(node.kind)&&mode==="mapping")setMode("semantic");
+    setEnabled(current=>({...current,[node.kind]:true}));setSelectedId(id);setSearch("");setFocus(narrow);
+  }
+  function changeMode(value:Mode){setMode(value);setSelectedId(null);setFocus(false);setViewport(null);}
+  function zoom(factor:number){setViewport({key:layoutKey,...zoomGraph(view,view.scale*factor)});}
+  function reset(){setViewport({key:layoutKey,...fitted});}
+  function pointerDown(event:ReactPointerEvent<SVGSVGElement>){
+    if(event.button!==0)return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    drag.current={point:canvasPoint(event.currentTarget,event.clientX,event.clientY),view};
+  }
   function pointerMove(event:ReactPointerEvent<SVGSVGElement>){
     const origin=drag.current;if(!origin)return;
-    const clientX=event.clientX,clientY=event.clientY;
-    setView((current)=>({...current,x:origin.startX+clientX-origin.x,y:origin.startY+clientY-origin.y}));
+    const point=canvasPoint(event.currentTarget,event.clientX,event.clientY);
+    setViewport({key:layoutKey,...origin.view,x:origin.view.x+point.x-origin.point.x,y:origin.view.y+point.y-origin.point.y});
   }
-  function pointerUp(event:ReactPointerEvent<SVGSVGElement>){const canvas=event.currentTarget;drag.current=null;if(canvas.hasPointerCapture(event.pointerId))canvas.releasePointerCapture(event.pointerId);}
-  function wheel(event:ReactWheelEvent<SVGSVGElement>){event.preventDefault();setView((current)=>({...current,scale:clamp(current.scale+(event.deltaY<0?.12:-.12),.45,2.2)}));}
+  function pointerUp(event:ReactPointerEvent<SVGSVGElement>){drag.current=null;if(event.currentTarget.hasPointerCapture(event.pointerId))event.currentTarget.releasePointerCapture(event.pointerId);}
+  useEffect(()=>{
+    const canvas=svgRef.current;if(!canvas)return;
+    const wheel=(event:WheelEvent)=>{
+      if(!event.ctrlKey&&!event.metaKey)return;
+      event.preventDefault();
+      setViewport({key:layoutKey,...zoomGraph(view,view.scale*Math.exp(-event.deltaY*.003),canvasPoint(canvas,event.clientX,event.clientY))});
+    };
+    canvas.addEventListener("wheel",wheel,{passive:false});
+    return()=>canvas.removeEventListener("wheel",wheel);
+  },[layoutKey,view]);
+  const nodeTypes=kinds.filter(kind=>mode==="all"||(mode==="mapping"?["object","table"].includes(kind):kind!=="table"));
 
-  if(!graph?.nodes.length)return <div className="content sub-page"><PageHeader source={source}/><div className="empty-state"><Icon name="graph" size={34}/><h2>还没有可展示的本体图谱</h2><p>先完成数据探查，再为当前数据源补充术语、指标和规则。图谱不会使用静态示意关系。</p><button className="primary-button" onClick={()=>onNavigate("discovery")}>前往数据探查</button></div></div>;
-
-  return <div className="content sub-page ontology-graph-page"><PageHeader source={source} version={graph.stats.schemaVersion}/><div className="metric-grid"><Metric label="业务对象" value={graph.stats.objects} meta={graph.stats.schemaVersion?`发布版 v${graph.stats.schemaVersion}`:"尚未发布 Schema"} tone="violet"/><Metric label="数据表" value={graph.stats.tables} meta="A/B 级有效表" tone="cyan"/><Metric label="术语与指标" value={graph.stats.terms+graph.stats.metrics} meta={`${graph.stats.terms} 术语 · ${graph.stats.metrics} 指标`} tone="amber"/><Metric label="语义 / 物理关系" value={graph.stats.semanticLinks+graph.stats.confirmedJoins} meta={`${graph.stats.semanticLinks} 语义 · ${graph.stats.confirmedJoins} JOIN`} tone="green"/></div><section className="graph-toolbar panel"><div className="segmented graph-mode"><button className={mode==="semantic"?"active":""} onClick={()=>setMode("semantic")}>业务语义</button><button className={mode==="mapping"?"active":""} onClick={()=>setMode("mapping")}>物理映射</button><button className={mode==="all"?"active":""} onClick={()=>setMode("all")}>全部</button></div><div className="graph-search"><Icon name="search"/><input aria-label="搜索图谱节点" value={search} onChange={(event)=>setSearch(event.target.value)} placeholder="搜索对象、属性、表或知识…"/></div><div className="graph-filters" aria-label="节点类型筛选">{KIND_ORDER.map((kind)=><label className={`filter-${kind}`} key={kind}><input type="checkbox" checked={enabled[kind]} onChange={(event)=>setEnabled({...enabled,[kind]:event.target.checked})}/><span/>{KIND_LABEL[kind]}</label>)}</div><div className="segmented"><button className={joins==="all"?"active":""} onClick={()=>setJoins("all")}>全部 JOIN</button><button className={joins==="confirmed"?"active":""} onClick={()=>setJoins("confirmed")}>仅已确认</button></div></section><div className="graph-workspace"><section className="panel graph-panel"><div className="graph-panel-head"><GraphLegend mode={mode}/><div className="graph-controls"><button aria-label="缩小图谱" onClick={()=>zoom(-.15)}>−</button><em>{Math.round(view.scale*100)}%</em><button aria-label="放大图谱" onClick={()=>zoom(.15)}>＋</button><button aria-label="重置图谱视图" onClick={reset}><Icon name="refresh" size={13}/></button></div></div><div className="graph-canvas-wrap"><svg className="graph-canvas" role="img" aria-label={`当前本体图谱，共 ${visibleNodes.size} 个节点、${visibleEdges.length} 条边`} viewBox={`0 0 ${VIEW.width} ${VIEW.height}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={()=>{drag.current=null;}} onLostPointerCapture={()=>{drag.current=null;}} onWheel={wheel}><g transform={`translate(${view.x} ${view.y}) scale(${view.scale})`}>{visibleEdges.map((edge)=><GraphEdge key={edge.id} edge={edge} positions={positions} highlighted={!selected||neighborEdges.includes(edge)}/>) }{(graph.nodes||[]).filter((node)=>visibleNodes.has(node.id)).map((node)=><GraphNode key={node.id} node={node} position={positions.get(node.id)!} selected={selectedId===node.id} dimmed={Boolean(selected&&!neighbors.has(node.id)&&selected.id!==node.id)} onSelect={()=>setSelectedId(node.id)}/>)}</g></svg>{!visibleNodes.size&&<div className="graph-no-result">没有匹配筛选条件的节点</div>}</div><div className="graph-hint">滚轮缩放 · 拖动画布 · 点击节点查看关系</div></section><aside className="panel graph-detail">{selected?<><div className={`graph-detail-type kind-${selected.kind}`}><Icon name={selected.kind==="table"?"database":selected.kind==="object"?"graph":selected.kind==="metric"?"target":selected.kind==="rule"?"shield":"book"}/>{KIND_LABEL[selected.kind]}{selected.verified&&<span><Icon name="check" size={11}/>已验证</span>}</div><h2>{selected.title}</h2><p>{selected.content||selected.subtitle}</p>{selected.grade&&<div className="detail-block"><small>表级别</small><strong className={`grade grade-${selected.grade.toLowerCase()}`}>{selected.grade}</strong></div>}{selected.properties?.length?<div className="detail-block"><small>对象属性 · {selected.properties.length}</small><div className="object-property-list">{selected.properties.map((property)=><div key={property.apiName}><span><strong>{property.displayName}</strong><code>{property.apiName} · {property.type}{property.required?" · required":""}</code></span><em>{property.mapping.table}.{property.mapping.column}</em></div>)}</div></div>:null}<div className="detail-block"><small>绑定表</small><div className="detail-chips">{selected.tables.length?selected.tables.map((table)=><button key={table} onClick={()=>{setMode("mapping");setSelectedId(`table:${table}`);}}>{table}</button>):<span>无</span>}</div></div><div className="detail-block"><small>直接连接 · {connectedNodes.length}</small><div className="connection-list">{connectedNodes.length?connectedNodes.map((node)=>{const edge=neighborEdges.find((item)=>item.source===node.id||item.target===node.id)!;return <button key={node.id} onClick={()=>setSelectedId(node.id)}><i className={`node-dot dot-${node.kind}`}/><span><strong>{node.title}</strong><small>{edge.label}</small></span><Icon name="arrow" size={12}/></button>}):<span className="muted-copy">当前视图下没有直接连接</span>}</div></div>{selected.kind==="table"?<button className="secondary-button detail-action" onClick={()=>onNavigate("discovery")}>查看表探查详情</button>:selected.kind==="object"?<button className="secondary-button detail-action" onClick={()=>onNavigate("modeling")}>打开业务对象建模</button>:<button className="secondary-button detail-action" onClick={()=>onNavigate("knowledge")}>查看知识资产</button>}</>:<div className="graph-detail-empty"><Icon name="graph" size={32}/><h2>选择一个节点</h2><p>查看对象属性、物理映射、知识绑定和一跳关系。</p><div className="graph-summary-list"><span><i className="node-dot dot-object"/>业务对象 <b>{graph.stats.objects}</b></span><span><i className="node-dot dot-table"/>数据表 <b>{graph.stats.tables}</b></span><span><i className="node-dot dot-term"/>术语 <b>{graph.stats.terms}</b></span><span><i className="node-dot dot-metric"/>指标 <b>{graph.stats.metrics}</b></span><span><i className="node-dot dot-rule"/>规则 <b>{graph.stats.rules}</b></span></div></div>}</aside></div></div>;
+  return <div className="content sub-page og-page">
+    <div className="og-heading"><div><h1>本体图谱</h1><p>{source?`${source.name} · ${graph?.stats.schemaVersion?`本体 v${graph.stats.schemaVersion}`:"尚未发布本体"}`:"请先选择数据源"}</p></div><div className="og-stats"><span><b>{graph?.stats.objects||0}</b>业务对象</span><span><b>{graph?.stats.tables||0}</b>数据表</span><span><b>{graph?.stats.semanticLinks||0}</b>业务关系</span></div></div>
+    {!graph?.nodes.length?<div className="og-empty"><Icon name="graph" size={38}/><h2>构建本体后，在这里查看关系</h2><p>选择数据表并完成本体构建，即可浏览业务对象及其数据映射。</p><button className="primary-button" onClick={()=>onNavigate("sources")}>前往数据源与本体</button></div>:<>
+      <div className="og-toolbar"><div className="og-modes" aria-label="图谱视图">{([['semantic','业务视图'],['mapping','数据映射'],['all','完整图谱']] as const).map(([value,label])=><button key={value} className={mode===value?"active":""} aria-pressed={mode===value} onClick={()=>changeMode(value)}>{label}</button>)}</div><label className="og-search"><Icon name="search" size={17}/><input aria-label="搜索图谱节点" placeholder="搜索对象、属性或数据表" value={search} onChange={event=>{setSearch(event.target.value);setFocus(false);}}/>{search&&<button aria-label="清空图谱搜索" onClick={()=>setSearch("")}><Icon name="close" size={14}/></button>}</label><button className={`og-focus ${focus?"active":""}`} disabled={!selected} aria-pressed={focus} onClick={()=>setFocus(!focus)}><Icon name="target" size={16}/>{focus?"显示全部关系":"只看相关"}</button></div>
+      <div className="og-workspace"><section className="og-surface">
+        <div className="og-canvas-heading"><div className="og-type-filters" aria-label="节点类型筛选">{nodeTypes.map(kind=><button key={kind} className={enabled[kind]===false?"disabled":""} aria-pressed={enabled[kind]!==false} onClick={()=>setEnabled({...enabled,[kind]:enabled[kind]===false})}><i className={`og-dot ${kind}`}/>{kindLabel[kind]}</button>)}</div>{mode!=="semantic"&&<label className="og-confirmed"><input type="checkbox" checked={confirmedOnly} onChange={event=>setConfirmedOnly(event.target.checked)}/>已确认关联</label>}</div>
+        <div className="og-canvas-wrap"><svg ref={svgRef} className="og-canvas" role="group" aria-label={`本体图谱，${visible.nodes.length} 个节点、${visible.edges.length} 条关系`} viewBox={`0 0 ${VIEW.width} ${VIEW.height}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onLostPointerCapture={()=>{drag.current=null;}}>
+          <defs><marker id={`${markerId}-arrow`} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M 1 1 L 7 4 L 1 7" fill="none" stroke="#8daba4" strokeWidth="1.5"/></marker></defs>
+          <g transform={`translate(${view.x} ${view.y}) scale(${view.scale})`}>{visible.edges.map((edge,index)=><GraphEdge key={edge.id} edge={edge} positions={layout.positions} selected={Boolean(selected)} highlighted={related.includes(edge)} markerId={markerId} offset={index%3-1}/>)}{visible.nodes.map(node=><GraphNode key={node.id} node={node} position={layout.positions.get(node.id)!} selected={selected?.id===node.id} dimmed={Boolean(selected&&selected.id!==node.id&&!neighbors.has(node.id))} matched={Boolean(search.trim()&&visible.matches.has(node.id))} onSelect={()=>choose(node.id,focus)}/>)}</g>
+        </svg>{!visible.nodes.length&&<div className="og-no-result"><Icon name="search" size={28}/><strong>没有匹配的节点</strong><button className="text-button" onClick={()=>{setSearch("");setEnabled({});setFocus(false);}}>清除筛选</button></div>}<div className="og-zoom"><button aria-label="缩小图谱" onClick={()=>zoom(1/1.2)}>−</button><span>{Math.round(view.scale*100)}%</span><button aria-label="放大图谱" onClick={()=>zoom(1.2)}>＋</button><i/><button aria-label="适应画布" title="适应画布" onClick={reset}><Icon name="target" size={17}/></button></div></div>
+        <div className="og-canvas-footer"><span>{visible.nodes.length} 个节点 · {visible.edges.length} 条关系{search.trim()?` · 命中 ${visible.matches.size} 个` :""}</span><span>拖动平移 · Ctrl / ⌘ + 滚轮缩放</span></div>
+      </section><aside className="og-inspector" aria-label="图谱详情">
+        {selected?<>
+          <div className="og-inspector-heading"><span><i className={`og-dot ${selected.kind}`}/>{kindLabel[selected.kind]}</span><button aria-label="关闭节点详情" onClick={()=>{setSelectedId(null);setFocus(false);}}><Icon name="close" size={16}/></button></div><h2>{selected.title}</h2><p className="og-subtitle">{selected.subtitle}</p><p className="og-description">{selected.content||"暂无业务说明"}</p>
+          {selected.properties?.length?<details className="og-detail-section" open><summary>对象属性 <b>{selected.properties.length}</b></summary><div className="og-properties">{selected.properties.map(property=><div key={property.apiName}><span><strong>{property.displayName}</strong><small>{property.type}{property.inherited?" · 继承":""}</small></span><code>{property.mapping.table}.{property.mapping.column}</code></div>)}</div></details>:null}
+          <details className="og-detail-section" open><summary>直接关系 <b>{related.length}</b></summary><div className="og-connections">{related.map(edge=>{const targetId=edge.source===selected.id?edge.target:edge.source;const target=nodeById.get(targetId);return target?<button key={edge.id} onClick={()=>choose(targetId,true)}><i className={`og-dot ${target.kind}`}/><span><strong>{target.title}</strong><small>{edgeLabel[edge.kind]} · {edge.source===selected.id?edge.forwardLabel||edge.label:edge.inverseLabel||edge.label}</small></span><Icon name="arrow" size={14}/></button>:null;})}{!related.length&&<p>当前视图没有直接关联。</p>}</div></details>
+          {selected.tables.length>0&&<details className="og-detail-section"><summary>对应数据表 <b>{selected.tables.length}</b></summary><div className="og-table-links">{selected.tables.map(table=><button key={table} disabled={!nodeById.has(`table:${table}`)} onClick={()=>choose(`table:${table}`,true)}>{table}<Icon name="arrow" size={12}/></button>)}</div></details>}
+          <button className="secondary-button og-detail-action" onClick={()=>onNavigate(["object","table"].includes(selected.kind)?"sources":"knowledge")}>{["object","table"].includes(selected.kind)?"前往数据源与本体":"查看业务知识"}<Icon name="arrow" size={14}/></button>
+        </>:<>
+          <div className="og-inspector-heading"><span>{search.trim()?"搜索结果":"浏览对象"}</span><small>{searchResults.length} 项</small></div><p className="og-description">{search.trim()?"搜索结果保留直接关联，点击节点可聚焦查看。":"选择一个对象，查看它的属性与直接关系。"}</p><div className="og-node-index">{searchResults.map(node=><button key={node.id} onClick={()=>choose(node.id,true)}><i className={`og-dot ${node.kind}`}/><span><strong>{node.title}</strong><small>{kindLabel[node.kind]}{node.properties?.length?` · ${node.properties.length} 个属性`:""}</small></span><Icon name="arrow" size={14}/></button>)}</div>
+        </>}
+      </aside></div>
+    </>}
+  </div>;
 }
 
-function PageHeader({source,version}:{source:DataSource|null;version?:number|null}){return <div className="page-header"><div><span className="section-kicker">Ontology Graph</span><h1>本体关系图谱</h1><p>{source?`当前数据源：${source.name} / ${source.dbName}。${version?`业务对象来自发布版 v${version}；`:"尚未发布业务对象 Schema；"}物理关系来自真实探查。`:"请先选择数据源。"}</p></div></div>;}
-function Metric({label,value,meta,tone}:{label:string;value:number;meta:string;tone:string}){return <div className={`metric-card ${tone}`}><small>{label}</small><strong>{value}</strong><span>{meta}</span></div>;}
-function GraphLegend({mode}:{mode:"semantic"|"mapping"|"all"}){return <div className="graph-legend">{mode!=="mapping"&&<><span className="legend-semantic"/>语义关系<span className="legend-subclass"/>子类型<span className="legend-binding"/>知识绑定</>}{mode!=="semantic"&&<><span className="legend-mapping"/>对象映射<span className="legend-join confirmed"/>已确认 JOIN</>}</div>;}
-function GraphEdge({edge,positions,highlighted}:{edge:OntologyGraphEdge;positions:Map<string,{x:number;y:number}>;highlighted:boolean}){const a=positions.get(edge.source),b=positions.get(edge.target);if(!a||!b)return null;const x1=a.x+NODE.width/2,y1=a.y+NODE.height/2,x2=b.x+NODE.width/2,y2=b.y+NODE.height/2;const dx=x2-x1;const curve=Math.min(85,Math.abs(dx)*.18+20);const d=`M ${x1} ${y1} C ${x1+Math.sign(dx||1)*curve} ${y1}, ${x2-Math.sign(dx||1)*curve} ${y2}, ${x2} ${y2}`;return <g className={`graph-edge edge-${edge.kind} ${edge.confirmed?"confirmed":"candidate"} ${highlighted?"":"dimmed"}`}><path d={d}/>{highlighted&&<title>{edge.label}</title>}</g>;}
-function GraphNode({node,position,selected,dimmed,onSelect}:{node:OntologyGraphNode;position:{x:number;y:number};selected:boolean;dimmed:boolean;onSelect:()=>void}){const label=node.title.length>21?`${node.title.slice(0,20)}…`:node.title;return <g className={`graph-node node-${node.kind} ${selected?"selected":""} ${dimmed?"dimmed":""}`} transform={`translate(${position.x} ${position.y})`} role="button" tabIndex={0} aria-label={`${KIND_LABEL[node.kind]} ${node.title}`} onPointerDown={(event)=>event.stopPropagation()} onClick={onSelect} onKeyDown={(event)=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();onSelect();}}}><rect width={NODE.width} height={NODE.height} rx="10"/><circle cx="17" cy="19" r="6"/><text x="31" y="22" className="node-title">{label}</text><text x="14" y="42" className="node-subtitle">{node.kind==="table"?`${node.grade||"B"} 级表`:node.kind==="object"?node.subtitle:node.verified?"已验证":"待验证"}</text>{node.verified&&<path className="node-check" d="m145 38 4 4 7-9"/>}<title>{node.title} · {node.content}</title></g>;}
-
-function layout(nodes:OntologyGraphNode[]){const result=new Map<string,{x:number;y:number}>();const groups=Object.fromEntries(KIND_ORDER.map((kind)=>[kind,nodes.filter((node)=>node.kind===kind)])) as Record<OntologyGraphNode["kind"],OntologyGraphNode[]>;placeLane(result,groups.term,{x:36,y:76,columns:2,columnGap:178,rowGap:82});placeLane(result,groups.metric,{x:1120,y:76,columns:2,columnGap:178,rowGap:82});const objectColumns=Math.min(5,Math.max(1,groups.object.length));const objectWidth=objectColumns*184;placeLane(result,groups.object,{x:(VIEW.width-objectWidth)/2,y:115,columns:objectColumns,columnGap:184,rowGap:92});const tableColumns=Math.min(5,Math.max(1,Math.ceil(Math.sqrt(groups.table.length))));const tableWidth=tableColumns*184;placeLane(result,groups.table,{x:(VIEW.width-tableWidth)/2,y:350,columns:tableColumns,columnGap:184,rowGap:94});const ruleColumns=Math.min(6,Math.max(1,groups.rule.length));const ruleWidth=ruleColumns*184;placeLane(result,groups.rule,{x:(VIEW.width-ruleWidth)/2,y:VIEW.height-105,columns:ruleColumns,columnGap:184,rowGap:76});return result;}
-function placeLane(result:Map<string,{x:number;y:number}>,nodes:OntologyGraphNode[],options:{x:number;y:number;columns:number;columnGap:number;rowGap:number}){nodes.forEach((node,index)=>result.set(node.id,{x:options.x+(index%options.columns)*options.columnGap,y:options.y+Math.floor(index/options.columns)*options.rowGap}));}
-function clamp(value:number,min:number,max:number){return Math.min(max,Math.max(min,value));}
-function visibleInMode(kind:OntologyGraphNode["kind"],mode:"semantic"|"mapping"|"all"){if(mode==="all")return true;if(mode==="mapping")return kind==="object"||kind==="table";return kind!=="table";}
-function visibleEdgeInMode(kind:OntologyGraphEdge["kind"],mode:"semantic"|"mapping"|"all"){if(mode==="all")return true;if(mode==="mapping")return kind==="mapping"||kind==="join";return kind==="semantic"||kind==="subclass"||kind==="binding"||kind==="wikilink";}
+function canvasPoint(canvas:SVGSVGElement,x:number,y:number){const point=canvas.createSVGPoint();point.x=x;point.y=y;const matrix=canvas.getScreenCTM();return matrix?point.matrixTransform(matrix.inverse()):{x,y};}
+function GraphNode({node,position,selected,dimmed,matched,onSelect}:{node:OntologyGraphNode;position:{x:number;y:number};selected:boolean;dimmed:boolean;matched:boolean;onSelect:()=>void}) {
+  const title=truncate(node.title,25);const subtitle=node.kind==="object"?`${node.properties?.length||0} 个属性 · ${node.tables.length} 张表`:node.kind==="table"?truncate(node.content||"数据表",30):node.verified?"已生效知识":"草稿";
+  return <g className={`og-node ${node.kind} ${selected?"selected":""} ${dimmed?"dimmed":""} ${matched?"matched":""}`} transform={`translate(${position.x} ${position.y})`} role="button" tabIndex={0} aria-label={`${kindLabel[node.kind]}：${node.title}`} aria-pressed={selected} onPointerDown={event=>event.stopPropagation()} onClick={onSelect} onKeyDown={event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();onSelect();}}}><rect className="og-node-body" width={NODE.width} height={NODE.height} rx="12"/><rect className="og-node-mark" x="14" y="16" width="29" height="29" rx="8"/><text className="og-node-glyph" x="28.5" y="36" textAnchor="middle">{node.kind==="object"?"◇":node.kind==="table"?"▤":node.kind==="metric"?"Σ":node.kind==="rule"?"✓":"词"}</text><text className="og-node-title" x="53" y="32">{title}</text><text className="og-node-subtitle" x="16" y="61">{subtitle}</text><title>{node.title}{node.content?`：${node.content}`:""}</title></g>;
+}
+function GraphEdge({edge,positions,selected,highlighted,markerId,offset}:{edge:OntologyGraphEdge;positions:Map<string,{x:number;y:number}>;selected:boolean;highlighted:boolean;markerId:string;offset:number}) {
+  const a=positions.get(edge.source),b=positions.get(edge.target);if(!a||!b)return null;
+  const ax=a.x+NODE.width/2,ay=a.y+NODE.height/2,bx=b.x+NODE.width/2,by=b.y+NODE.height/2;
+  const horizontal=Math.abs(bx-ax)>NODE.width;
+  let x1=ax,y1=ay,x2=bx,y2=by,d="";
+  if(edge.source===edge.target){x1=a.x+NODE.width;y1=ay;x2=ax;y2=a.y;d=`M ${x1} ${y1} C ${x1+64} ${y1-86}, ${x2} ${y2-72}, ${x2} ${y2}`;}
+  else if(horizontal){const sign=Math.sign(bx-ax);x1+=sign*NODE.width/2;x2-=sign*NODE.width/2;const bend=Math.max(40,Math.abs(x2-x1)*.5)+offset*12;d=`M ${x1} ${y1} C ${x1+sign*bend} ${y1}, ${x2-sign*bend} ${y2}, ${x2} ${y2}`;}
+  else {const sign=Math.sign(by-ay)||1;y1+=sign*NODE.height/2;y2-=sign*NODE.height/2;const bend=Math.max(28,Math.abs(y2-y1)*.5);d=`M ${x1} ${y1} C ${x1+offset*20} ${y1+sign*bend}, ${x2+offset*20} ${y2-sign*bend}, ${x2} ${y2}`;}
+  return <g className={`og-edge ${edge.kind} ${edge.confirmed?"":"candidate"} ${selected&&!highlighted?"dimmed":""} ${highlighted?"highlighted":""}`}><path d={d} markerEnd={`url(#${markerId}-arrow)`}/>{highlighted&&<text x={(x1+x2)/2} y={(y1+y2)/2-7} textAnchor="middle">{truncate(edge.forwardLabel||edge.label,27)}</text>}<title>{edgeLabel[edge.kind]}：{edge.label}</title></g>;
+}
+function truncate(value:string,units:number){let count=0,result="";for(const char of value){count+=char.charCodeAt(0)>255?1.7:1;if(count>units)return `${result}…`;result+=char;}return result;}

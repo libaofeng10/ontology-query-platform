@@ -63,12 +63,9 @@ export const config = {
   },
   retrieval: {
     vectorEnabled: String(process.env.RETRIEVAL_VECTOR_ENABLED ?? "true").toLowerCase() !== "false",
-    topK: numberFromEnv("RETRIEVAL_TOP_K", 8),
     vectorWeight: numberRatioFromEnv("RETRIEVAL_VECTOR_WEIGHT", 0.4),
     minSimilarity: numberRatioFromEnv("RETRIEVAL_MIN_SIMILARITY", 0.35),
     semanticThreshold: numberRatioFromEnv("RETRIEVAL_SEMANTIC_THRESHOLD", 0.55),
-    // Business-domain concept aliases, e.g. [{"match":"线索|商机线索","terms":["clue"]}].
-    conceptAliases: jsonFromEnv("RETRIEVAL_CONCEPT_ALIASES_JSON", []),
   },
   relationModel: {
     maxCandidates:numberFromEnv("RELATION_MODEL_MAX_CANDIDATES",600),
@@ -95,7 +92,7 @@ export const config = {
   },
   ontologyAi: {
     mode:enumFromEnv("ONTOLOGY_AI_MODELING_MODE",["off","review","auto_draft"],"off"),
-    autoConfirmScore:integerRangeFromEnv("ONTOLOGY_AI_AUTO_CONFIRM_SCORE",0,100,80),
+    autoConfirmScore:integerRangeFromEnv("ONTOLOGY_AI_AUTO_CONFIRM_SCORE",0,100,85),
     maxTables:integerRangeFromEnv("ONTOLOGY_AI_MAX_TABLES",1,20,20),
     maxFields:integerRangeFromEnv("ONTOLOGY_AI_MAX_FIELDS",1,600,600),
     timeoutMs:integerRangeFromEnv("ONTOLOGY_AI_LLM_TIMEOUT_MS",1_000,600_000,300_000),

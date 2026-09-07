@@ -7,11 +7,12 @@ export function createOntologyDomainModelingService({domainPlanner,candidates}={
     if(active)throw httpError(409,`已有业务域正在建模：${active.scope.domainName||active.id}`);
   }
 
-  async function run({task,source,payload,onProgress=()=>{}}={}) {
+  async function run({task,source,payload,onProgress=()=>{},onPlan=()=>{}}={}) {
     const actor=String(payload?.actor||"system");
     const orchestrationId=String(payload?.orchestrationId||task.id);
     onProgress({progress:1,total:100,currentStep:"正在自动划分业务域"});
-    const plan=await domainPlanner.plan(source.id,{refresh:payload?.refreshDomainPlan!==false,actor});
+    const plan=payload?.domainPlanSnapshot||await domainPlanner.plan(source.id,{refresh:payload?.refreshDomainPlan!==false,actor});
+    onPlan(plan);
     const selectedIds=new Set(Array.isArray(payload?.domainIds)?payload.domainIds.map(String):[]);
     const domains=(plan.domains||[]).filter((domain)=>!selectedIds.size||selectedIds.has(String(domain.id)));
     if(!domains.length)throw httpError(400,"业务域计划中没有可执行的域");

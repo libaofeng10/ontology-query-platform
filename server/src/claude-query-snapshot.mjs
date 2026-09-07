@@ -9,21 +9,17 @@ import { buildQueryResultContract } from "./query-result-contract.mjs";
  * published schema and a physical catalog, then all read operations are
  * served from the immutable copy.  A caller can therefore keep using the
  * normal store while a Claude request is in flight without changing what the
- * model is authorised to see.
+ * model reads as metadata. Catalog membership does not restrict SQL execution.
  */
-export const CLAUDE_QUERY_SNAPSHOT_VERSION = "claude-query-snapshot-v1";
+export const CLAUDE_QUERY_SNAPSHOT_VERSION = "claude-query-snapshot-v2";
 export const DEFAULT_SNAPSHOT_PAGE_SIZE = 20;
 export const MAX_SNAPSHOT_PAGE_SIZE = 50;
 export const MAX_SNAPSHOT_TEXT = 8_000;
 export const MAX_SNAPSHOT_BYTES = 512_000;
 
-const OPERATION_NAMES = new Set(["overview", "search", "get_objects", "get_relations", "get_knowledge"]);
+const OPERATION_NAMES = new Set(["overview", "search", "get_tables", "get_objects", "get_relations", "get_knowledge"]);
 const SAFE_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$]*$/;
-const LOOPBACK_TABLE_COLUMNS = new Set([
-  "is_deleted", "deleted", "deleted_at", "delete_flag", "is_delete", "is_valid", "valid", "valid_flag",
-  "status", "state", "created_at", "create_time", "updated_at", "update_time", "gmt_create", "gmt_modify",
-  "start_time", "end_time", "expire_time", "expired_at", "effective_time", "effective_at",
-]);
+
 
 export class ClaudeQuerySnapshotError extends Error {
   constructor(code, message, details = undefined) {
@@ -75,29 +71,9 @@ export function createClaudeQuerySnapshot(input = {}) {
   }
 
   const catalog = normalizeCatalog(input.catalog ?? input.context ?? catalogFromStore(input.store, sourceId));
-  const selectedTableNames = normalizeNameSet(
-    input.allowedTableNames
-      ?? input.selectedTableNames
-      ?? input.context?.retrieval?.tableNames
-      ?? input.context?.tables?.map((item) => item?.tableName),
-  );
-  const mapped = collectSchemaMappings(schema, catalog, input);
-  const tableNames = chooseAllowedTables({
-    mappedTableNames: mapped.tables,
-    selectedTableNames,
-    catalogTables: catalog.tables,
-    includeSelectedOnly: input.includeSelectedOnly === true,
-  });
-  // A physical relation is not automatically public just because both of its
-  // endpoint tables are mapped.  The published schema's link mappings are
-  // the authoritative relation allow-list; an empty mapping therefore means
-  // no joins are disclosed.
-  const relations = chooseRelations(catalog.relations, tableNames, mapped.relationIds);
-  const relationColumnKeys = new Set();
-  for (const relation of relations) {
-    relationColumnKeys.add(`${relation.fromTable}.${relation.fromCol}`.toLowerCase());
-    relationColumnKeys.add(`${relation.toTable}.${relation.toCol}`.toLowerCase());
-  }
+  // Physical metadata is guidance for Claude, not an ontology-derived grant.
+  const tableNames = new Set(catalog.tables.map((table) => table.tableName));
+  const relations = chooseRelations(catalog.relations, tableNames);
   const knowledge = normalizeKnowledge(
     input.knowledge ?? input.context?.knowledge ?? catalog.knowledge,
     tableNames,
@@ -106,16 +82,7 @@ export function createClaudeQuerySnapshot(input = {}) {
     input.rules ?? input.context?.rules ?? catalog.rules,
     tableNames,
   );
-  const knowledgeColumnKeys = collectReferencedColumns([...knowledge, ...rules]);
-  const columnsByTable = buildPublicColumns({
-    catalog,
-    schema,
-    mapped,
-    tableNames,
-    relationColumnKeys,
-    knowledgeColumnKeys,
-    explicitAllowedColumns: input.allowedColumnsByTable ?? input.context?.allowedColumns,
-  });
+  const columnsByTable = buildPublicColumns({ catalog, schema, tableNames });
   const publicTables = buildPublicTables(catalog.tables, tableNames, columnsByTable);
   const objects = buildPublicObjects(schema, columnsByTable, tableNames);
   const links = buildPublicLinks(schema, relations, tableNames);
@@ -260,71 +227,13 @@ function normalizeCatalog(input) {
   return { tables, columnsByTable, relations, enums, knowledge, rules };
 }
 
-function collectSchemaMappings(schema, catalog, input) {
-  const tables = new Set();
-  const columns = new Map();
-  const relationIds = new Set();
-  for (const object of Array.isArray(schema?.objectTypes) ? schema.objectTypes : []) {
-    for (const property of Array.isArray(object?.properties) ? object.properties : []) {
-      const mapping = property?.mapping;
-      const table = normalizeIdentifier(mapping?.table);
-      const column = normalizeIdentifier(mapping?.column);
-      if (!table || !column) continue;
-      tables.add(table);
-      (columns.get(table) ?? columns.set(table, new Set()).get(table)).add(column);
-    }
-  }
-  for (const link of Array.isArray(schema?.linkTypes) ? schema.linkTypes : []) {
-    for (const item of Array.isArray(link?.relationMappings) ? link.relationMappings : []) {
-      const id = Number(item?.relationId ?? item);
-      if (Number.isInteger(id) && id > 0) relationIds.add(id);
-    }
-  }
-  // A caller may supply verified physical columns that are not represented by
-  // a property (for example a mandatory is_deleted predicate).
-  for (const [tableName, names] of Object.entries(input?.mappedColumnsByTable || {})) {
-    const table = normalizeIdentifier(tableName);
-    if (!table) continue;
-    tables.add(table);
-    const target = columns.get(table) ?? (columns.set(table, new Set()), columns.get(table));
-    for (const name of names || []) target.add(normalizeIdentifier(name));
-  }
-  // Do not let a malformed schema invent a table absent from the physical
-  // catalog.  The schema still contributes its checksum, but no SQL scope.
-  const known = new Set(catalog.tables.map((item) => item.tableName));
-  for (const table of [...tables]) if (!known.has(table)) tables.delete(table);
-  return { tables, columns, relationIds };
-}
-
-function chooseAllowedTables({ mappedTableNames, selectedTableNames, catalogTables, includeSelectedOnly }) {
-  const known = new Set(catalogTables.map((item) => item.tableName));
-  let result = new Set([...mappedTableNames].filter((name) => known.has(name)));
-  const selected = new Set([...selectedTableNames].filter((name) => known.has(name)));
-  if (selected.size) {
-    if (includeSelectedOnly) result = new Set([...result].filter((name) => selected.has(name)));
-    else {
-      // Retrieval selection is a narrowing hint, but never grants access to an
-      // table absent from the published mapping.  This keeps relation closure
-      // predictable while allowing a selected mapped table to be used.
-      result = new Set([...result].filter((name) => selected.has(name)));
-    }
-  }
-  return result;
-}
-
-function chooseRelations(catalogRelations, tableNames, allowedRelationIds = null) {
+function chooseRelations(catalogRelations, tableNames) {
   const relations = [];
-  const relationScope = allowedRelationIds instanceof Set ? allowedRelationIds : null;
   for (const relation of catalogRelations) {
-    // A schema link cannot promote a physical relation that governance has
-    // left in review/rejected state.  The published schema and the physical
-    // relation must both agree before the join endpoint is disclosed.
+    // Confirmed relationships remain useful evidence. This list does not
+    // restrict the JOIN conditions Claude may generate.
     if (!["confirmed", "accepted"].includes(String(relation.status || "").toLowerCase())) continue;
     if (!tableNames.has(relation.fromTable) || !tableNames.has(relation.toTable)) continue;
-    // When the published schema contains link mappings, only those exact
-    // physical relation IDs may cross the snapshot boundary.  Null/unknown
-    // IDs are rejected in this restricted mode rather than matched by shape.
-    if (relationScope && (!Number.isInteger(relation.id) || !relationScope.has(Number(relation.id)))) continue;
     relations.push({
       id: relation.id == null ? null : Number(relation.id),
       fromTable: relation.fromTable,
@@ -340,23 +249,12 @@ function chooseRelations(catalogRelations, tableNames, allowedRelationIds = null
   return dedupeBy(relations, (item) => `${item.fromTable}.${item.fromCol}->${item.toTable}.${item.toCol}`);
 }
 
-function buildPublicColumns({ catalog, schema, mapped, tableNames, relationColumnKeys, knowledgeColumnKeys, explicitAllowedColumns }) {
+function buildPublicColumns({ catalog, schema, tableNames }) {
   const columnsByTable = {};
   for (const tableName of [...tableNames].sort()) {
     const sourceColumns = catalog.columnsByTable[tableName] || [];
-    const mappedColumns = mapped.columns.get(tableName) || new Set();
-    const explicit = normalizeNameSet(explicitAllowedColumns?.[tableName]);
     const propertySemantics = propertySemanticsForTable(schema, tableName);
-    const allowed = new Set([...mappedColumns, ...explicit]);
-    for (const column of sourceColumns) {
-      const key = `${tableName}.${column.columnName}`.toLowerCase();
-      if (column.isPrimary || column.isUnique || relationColumnKeys.has(key) || knowledgeColumnKeys.has(key)) allowed.add(column.columnName);
-      // Mandatory row-domain fields are useful to the kernel and are not a
-      // grant to arbitrary columns.  We include only well-known names.
-      if (LOOPBACK_TABLE_COLUMNS.has(column.columnName)) allowed.add(column.columnName);
-    }
     columnsByTable[tableName] = sourceColumns
-      .filter((column) => allowed.has(column.columnName))
       .map((column) => {
         const semantic = propertySemantics.get(column.columnName) || {};
         // 2026-09-04 应用户要求移除敏感列限制：所有列 selectable，
@@ -549,18 +447,6 @@ function normalizeRules(items, tableNames) {
     .filter((rule) => rule.name || rule.content);
 }
 
-function collectReferencedColumns(items) {
-  const result = new Set();
-  for (const item of items || []) {
-    const text = `${item?.content || ""}\n${item?.sqlContent || ""}`;
-    // This intentionally recognises only qualified identifiers.  Unqualified
-    // words in prose must not broaden the physical column allowlist.
-    const pattern = /`?([A-Za-z_][A-Za-z0-9_$]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_$]*)`?/g;
-    for (const match of text.matchAll(pattern)) result.add(`${match[1].toLowerCase()}.${match[2].toLowerCase()}`);
-  }
-  return result;
-}
-
 function sanitizeQueryIntent(intent) {
   if (!intent || typeof intent !== "object") return null;
   const copy = {
@@ -634,9 +520,10 @@ function readSnapshot(snapshot, request = {}) {
       checksum: snapshot.checksum,
       executionContract: snapshot.executionContract,
       tables: snapshot.tables,
-      objects: snapshot.objects.map((object) => ({ apiName: object.apiName, displayName: object.displayName, propertyCount: object.properties.length })),
+      objects: snapshot.objects.map(publicObjectIndex),
       relations: snapshot.relations,
       links: snapshot.links,
+      knowledge: snapshot.knowledge.map(publicKnowledgeIndex),
       disclosedTables: [...snapshot.disclosedTables].sort(),
     };
   }
@@ -645,10 +532,23 @@ function readSnapshot(snapshot, request = {}) {
     const all = searchableItems(snapshot, query);
     return pagedResult(operation, all, offset, limit, { query });
   }
+  if (operation === "get_tables") {
+    const wanted = normalizeRequestedIds(request.ids);
+    const query = safeText(request.query, 500).toLowerCase();
+    const all = snapshot.tables.filter((table) => !wanted.size || wanted.has(table.tableName.toLowerCase()))
+      .map((table) => ({
+        ...table,
+        columns: publicColumnsWithEnums(snapshot, table.tableName),
+        objects: snapshot.objects.filter((object) => object.properties.some((property) => property.table === table.tableName)).map(publicObjectIndex),
+        knowledge: snapshot.knowledge.filter((entry) => !entry.tables.length || entry.tables.includes(table.tableName)).map(publicKnowledgeIndex),
+      }));
+    return pagedResult(operation, matchSearchTerms(all, query), offset, limit, { ids: [...wanted].sort(), query });
+  }
   if (operation === "get_objects") {
     const wanted = normalizeRequestedIds(request.ids ?? request.objectNames ?? request.objects);
-    const all = snapshot.objects.filter((object) => !wanted.size || wanted.has(object.apiName.toLowerCase()) || wanted.has(object.displayName.toLowerCase()));
-    const page = pagedResult(operation, all, offset, limit, { ids: [...wanted].sort() });
+    const query = safeText(request.query, 500).toLowerCase();
+    const all = snapshot.objects.filter((object) => !wanted.size || wanted.has(object.apiName.toLowerCase()) || wanted.has(object.displayName.toLowerCase()) || object.properties.some((property) => wanted.has(property.table.toLowerCase())));
+    const page = pagedResult(operation, matchSearchTerms(all, query), offset, limit, { ids: [...wanted].sort(), query });
     return { ...page, items: page.items.map((object) => ({
       ...object,
       knowledge: snapshot.knowledge.filter((entry) => !entry.tables.length || object.properties.some((property) => entry.tables.includes(property.table))).map(({ slug, title, aliases }) => ({ slug, title, aliases })),
@@ -659,16 +559,38 @@ function readSnapshot(snapshot, request = {}) {
   }
   if (operation === "get_relations") {
     const wanted = normalizeRequestedIds(request.ids ?? request.relationIds ?? request.relations);
-    const all = snapshot.relations.filter((relation) => !wanted.size || wanted.has(String(relation.id)) || wanted.has(`${relation.fromTable}.${relation.fromCol}->${relation.toTable}.${relation.toCol}`));
-    return pagedResult(operation, all, offset, limit, { ids: [...wanted].sort() });
+    const query = safeText(request.query, 500).toLowerCase();
+    const all = snapshot.relations.filter((relation) => !wanted.size || wanted.has(String(relation.id)) || wanted.has(`${relation.fromTable}.${relation.fromCol}->${relation.toTable}.${relation.toCol}`.toLowerCase()));
+    return pagedResult(operation, matchSearchTerms(all, query), offset, limit, { ids: [...wanted].sort(), query });
   }
   const wanted = normalizeRequestedIds(request.ids ?? request.slugs ?? request.knowledge);
-  const all = [...snapshot.knowledge, ...snapshot.rules].filter((item) => !wanted.size || [item.slug, item.title, item.name, item.id].some((value) => value != null && wanted.has(String(value).toLowerCase())));
-  return pagedResult(operation, all, offset, limit, { ids: [...wanted].sort() });
+  const query = safeText(request.query, 500).toLowerCase();
+  const candidates = [...snapshot.knowledge, ...snapshot.rules].filter((item) => !wanted.size || [item.slug, item.title, item.name, item.id].some((value) => value != null && wanted.has(String(value).toLowerCase())));
+  const page = pagedResult(operation, matchSearchTerms(candidates, query), offset, limit, { ids: [...wanted].sort(), query });
+  const tableNames = new Set(page.items.flatMap((item) => item.tables || item.appliesTo || []).filter((table) => Object.hasOwn(snapshot.columnsByTable, table)));
+  // A definition can redirect the model to another product. Include that
+  // product's actual public structure so the knowledge is executable without
+  // guessing fields or repeating failed db_query calls to discover them.
+  return { ...page,
+    objects: snapshot.objects.filter((object) => object.properties.some((property) => tableNames.has(property.table))).map(publicObjectIndex),
+    tables: [...tableNames].sort().map((tableName) => ({ tableName, columns: publicColumnsWithEnums(snapshot, tableName) })),
+  };
+}
+
+function publicObjectIndex(object) {
+  return {
+    apiName: object.apiName, displayName: object.displayName,
+    description: safeText(object.description, 500),
+    tableNames: [...new Set(object.properties.map((property) => property.table))],
+    propertyCount: object.properties.length,
+  };
+}
+
+function publicKnowledgeIndex({ slug, title, aliases, tables }) {
+  return { slug, title, aliases, tables };
 }
 
 function searchableItems(snapshot, query) {
-  const haystack = (item) => JSON.stringify(item).toLowerCase();
   const items = [
     ...snapshot.tables.map((item) => ({ kind: "table", ...item })),
     ...snapshot.objects.map((item) => ({ kind: "object", ...item })),
@@ -678,7 +600,22 @@ function searchableItems(snapshot, query) {
     ...snapshot.knowledge.map((item) => ({ kind: "knowledge", ...item })),
     ...snapshot.rules.map((item) => ({ kind: "rule", ...item })),
   ];
-  return query ? items.filter((item) => haystack(item).includes(query)) : items;
+  return matchSearchTerms(items, query);
+}
+
+function matchSearchTerms(items, query) {
+  const phrase = query.trim().replace(/\s+/g, " ");
+  if (!phrase) return items;
+  const terms = [...new Set(phrase.match(/[\p{L}\p{N}_$]+/gu) || [phrase])];
+  // This is tool-local keyword search over the authorized snapshot, not a
+  // question planner. Rank before paging; unknown terms must not list all data.
+  return items.map((item) => {
+    const text = JSON.stringify(item).toLowerCase();
+    const label = [item.title, item.name, item.apiName, item.displayName, item.slug, item.tableName, item.columnName, ...(item.aliases || [])].filter(Boolean).join(" ").toLowerCase();
+    const matched = terms.filter((term) => text.includes(term));
+    const score = matched.length * 10 + matched.filter((term) => label.includes(term)).length * 2 + (text.includes(phrase) ? 1 : 0);
+    return { item, score };
+  }).filter(({ score }) => score > 0).sort((a, b) => b.score - a.score).map(({ item }) => item);
 }
 
 function publicColumnsWithEnums(snapshot, table) {

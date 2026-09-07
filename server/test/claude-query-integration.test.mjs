@@ -32,6 +32,80 @@ async function fixture() {
   return { store, source };
 }
 
+test("Claude queries unmapped tables and columns with an unregistered JOIN before any ontology read", async () => {
+  const { store, source } = await fixture();
+  store.upsertColumn({ sourceId: source.id, tableName: "crm_customer", columnName: "external_ref", dataType: "bigint" });
+  store.upsertTable({ sourceId: source.id, tableName: "product_account", grade: "C", active: 0 });
+  for (const columnName of ["user_id", "phone"]) store.upsertColumn({ sourceId: source.id, tableName: "product_account", columnName, dataType: "varchar" });
+  const events = [];
+  const calls = [];
+  const bridge = createClaudeQueryBridge({ model: "fake", requireApiKey: false,
+    transport: async ({ session, snapshot, prompt }) => {
+      assert.doesNotMatch(prompt, /只能使用.*已确认|第一条 SQL 前|先.*披露/);
+      const receipt = await session.callTool("db_query", { sql: "SELECT a.phone FROM product_account a JOIN crm_customer c ON c.external_ref = a.user_id" });
+      assert.equal(receipt.ok, true, receipt.error);
+      assert.equal(snapshot.columnsByTable.crm_customer.some((column) => column.columnName === "external_ref"), true);
+      const physical = await session.callTool("ontology_read", { operation: "get_tables", ids: ["product_account"] });
+      assert.equal(physical.ok, true, physical.error);
+      assert.deepEqual(physical.data.items.map((table) => table.tableName), ["product_account"]);
+      assert.ok(physical.data.items[0].columns.some((column) => column.columnName === "phone"));
+      return { status: "answered", execution_ids: [receipt.executionId], conclusion: "账号已查询。" };
+    },
+  });
+  try {
+    const service = createQueryService({ store, claudeBridge: bridge,
+      connector: {
+        explain: async (_source, sql) => { calls.push(["explain", sql]); return [{ rows: 1 }]; },
+        query: async (_source, sql) => { calls.push(["query", sql]); return [[{ phone: "13800138000" }], [{ name: "phone" }]]; },
+      },
+      claudeMcpFactory: async options => createClaudeQueryMcpSession({ ...options, listen: false }),
+      config: { llm: {}, queryMaxRows: 100, explainMaxRows: 1000, queryAgentMaxSqlCalls: 5, claudeQuery: { mode: "required", model: "fake", maxBudgetUsd: 1, requireApiKey: false } },
+    });
+    const answer = await service.ask({ sourceId: source.id, question: "查询客户对应产品账号", userName: "tester", onEvent: event => events.push(event) });
+    assert.equal(answer.refused, undefined, answer.reason);
+    assert.deepEqual(answer.rows, [{ phone: "13800138000" }]);
+    assert.deepEqual(calls.map(([kind]) => kind), ["explain", "query"]);
+    assert.match(calls[1][1], /LIMIT 100/);
+    assert.equal(events[0].tool, "db_query");
+    assert.equal(store.listAudits(source.id, 1)[0].intentJson, null);
+  } finally { await bridge.close(); store.close(); }
+});
+
+test("Claude cannot report no usage from an auxiliary result after an unexecuted query exhausts the SQL budget", async () => {
+  const { store, source } = await fixture();
+  let executed = 0;
+  const bridge = createClaudeQueryBridge({
+    model: "fake", requireApiKey: false,
+    transport: async ({ session }) => {
+      await session.callTool("ontology_read", { operation: "get_objects", ids: ["customer"] });
+      const lookup = await session.callTool("db_query", { sql: "SELECT customer_id FROM crm_customer" });
+      assert.equal(lookup.ok, true);
+      const unfinished = await session.callTool("db_query", { sql: "SELECT mobile FROM crm_customer" });
+      assert.equal(unfinished.errorCode, "SQL_CALL_BUDGET_EXCEEDED");
+      return { status: "answered", execution_ids: [lookup.executionId], conclusion: "该客户没有 GPT 使用记录。" };
+    },
+  });
+  try {
+    const service = createQueryService({
+      store,
+      connector: { explain: async () => [{ rows: 1 }], query: async () => { executed++; return [[], [{ name: "customer_id" }]]; } },
+      claudeBridge: bridge,
+      claudeMcpFactory: async (options) => createClaudeQueryMcpSession({ ...options, listen: false }),
+      config: { llm: {}, queryMaxRows: 100, explainMaxRows: 1_000, queryAgentMaxSqlCalls: 1, claudeQuery: { mode: "required", model: "fake", maxBudgetUsd: 1, requireApiKey: false } },
+    });
+    const answer = await service.ask({ sourceId: source.id, question: "查询客户 GPT 使用情况", userName: "tester" });
+    assert.equal(answer.refused, true);
+    assert.equal(answer.failureClass, "budget_exceeded");
+    assert.match(answer.reason, /未完成/);
+    assert.doesNotMatch(answer.conclusion || "", /没有 GPT 使用记录/);
+    assert.equal(executed, 1);
+    assert.equal(store.listAudits(source.id, 1)[0].intentJson, null);
+  } finally {
+    await bridge.close();
+    store.close();
+  }
+});
+
 test("Claude discovers published objects even when phrasing has no platform retrieval or filter binding", async () => {
   const { store, source } = await fixture();
   const bridge = createClaudeQueryBridge({

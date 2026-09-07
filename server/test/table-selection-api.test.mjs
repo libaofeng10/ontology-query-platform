@@ -88,6 +88,21 @@ test("excluded tables are never probed and vanish from every downstream surface"
   store.close();
 });
 
+test("a fixed build scope never probes tables that appeared after selection",async()=>{
+  const dir=await mkdtemp(join(tmpdir(),"ontoquery-fixed-build-scope-"));
+  const store=createStore(join(dir,"store.sqlite"));
+  const source=store.createSource({name:"real",kind:"mysql",host:"db",port:3306,dbName:"sales",userName:"ro",credential:"encrypted",isDemo:false});
+  const probed=[];
+  const discovery=createDiscoveryService({store,connector:fakeConnector(probed),wikiDir:join(dir,"wiki"),relationModel:{judge:async()=>({status:"completed",decisions:[]})}});
+  try{
+    // The staging table exists in the live catalog, but not in the job's selection.
+    await discovery.discover(source,{tableNames:["crm_customer"]});
+    assert.ok(probed.includes("crm_customer"));
+    assert.equal(probed.includes("crm_customer_backfill"),false);
+    assert.deepEqual(store.listTables(source.id).map((table)=>table.tableName),["crm_customer"]);
+  }finally{store.close();}
+});
+
 test("preview and selection API round-trip, purge runs on save, and demo sources preview from the store",async()=>{
   const root=mkdtempSync(join(tmpdir(),"ontoquery-selection-api-"));
   const app=createApp({dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"selection-secret",apiIdentities:[{name:"data-editor",role:"editor",token:"token-editor",sourceIds:"*"}],connector:fakeConnector(),rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test"});

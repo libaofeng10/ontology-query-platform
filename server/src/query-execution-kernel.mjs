@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from "node:crypto";
-import { guardSql } from "./sql-guard.mjs";
+import { guardSql, guardReadOnlySql } from "./sql-guard.mjs";
 import { buildQueryColumnSemantics, detectQuestionValueKinds } from "./query-column-semantics.mjs";
 import { normalizeQueryRow } from "./query-result-normalization.mjs";
 import { queryIntentFilterError, queryResultContractValidation } from "./query-scope-coverage.mjs";
@@ -18,9 +18,10 @@ function kernelFailure(input = {}) {
  * The one execution authority shared by every query planner.
  *
  * A planner is allowed to propose SQL, but it must never own the sequence
- * guard -> intent contract -> result contract -> disclosure -> EXPLAIN -> query.
+ * read-only guard -> optional ontology checks -> EXPLAIN -> query.
  * Keeping that sequence in this module gives the Claude adapter and the legacy
- * tool loop the same security and correctness boundary.
+ * tool loop the same execution and resource boundary. The coordinator selects
+ * database mode for Claude; other planners retain ontology validation.
  *
  * The module deliberately has a small interface.  Callers provide immutable
  * request dependencies and (where a clarification can replace the intent or
@@ -34,6 +35,7 @@ export function createQueryExecutionKernel({
   config = {},
   question = "",
   catalog = {},
+  schemaMode = "ontology",
   queryIntent,
   retrievalEvidence,
   disclosedTables,
@@ -48,6 +50,7 @@ export function createQueryExecutionKernel({
 } = {}) {
   if (!connector || typeof connector.query !== "function") throw new TypeError("query execution kernel 需要 connector.query");
   if (!source || source.id == null) throw new TypeError("query execution kernel 需要 source");
+  if (!["ontology", "database"].includes(schemaMode)) throw new TypeError("无效的 schemaMode");
 
   const effectiveConfig = config || {};
   const maxRows = boundedPositiveInt(effectiveConfig.queryMaxRows ?? catalog.policy?.maxRows, 500, 1, 100_000);
@@ -108,7 +111,9 @@ export function createQueryExecutionKernel({
     });
     let verdict;
     try {
-      verdict = guardSql(requestedSql, activePolicy);
+      verdict = schemaMode === "database"
+        ? guardReadOnlySql(requestedSql, { maxRows })
+        : guardSql(requestedSql, activePolicy);
     } catch (error) {
       return kernelFailure({ stage: "guard", code: "GUARD_ERROR", error: safeError(error), retryable: false });
     }
@@ -168,14 +173,12 @@ export function createQueryExecutionKernel({
       }, verdict);
     }
 
-    // `requireDisclosure:false` used to be accepted as an escape hatch.  No
-    // untrusted planner should be able to turn off request-local schema
-    // disclosure, so enforce it unconditionally (the parameter remains only
-    // to avoid breaking older callers).
+    // The coordinator selects schemaMode once. Per-SQL tool arguments cannot
+    // change it; ontology-mode callers retain their existing disclosure gate.
     void requireDisclosure;
     const disclosed = resolveDisclosure(getDisclosedTables, disclosedTables);
     const undisclosed = verdict.tables.filter((table) => !disclosed.has(normalizeIdentifier(table)));
-    if (undisclosed.length) {
+    if (schemaMode === "ontology" && undisclosed.length) {
       return failureWithVerdict({
         stage: "guard",
         code: "DISCLOSURE_REQUIRED",

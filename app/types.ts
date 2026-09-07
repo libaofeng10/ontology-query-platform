@@ -1,4 +1,4 @@
-export type NavId = "query" | "sources" | "discovery" | "questions" | "modeling" | "knowledge" | "graph" | "evaluation" | "audit" | "settings";
+export type NavId = "query" | "sources" | "questions" | "knowledge" | "graph" | "evaluation" | "audit" | "settings";
 export type QueryPlanningMode = "semantic" | "legacy" | "agent" | "claude" | "demo";
 export type ClaudeQueryMode = "off" | "prefer" | "required";
 
@@ -37,8 +37,8 @@ export type Evidence = {
 };
 export type QueryAnswer = { id:string; sessionId?:string; question:string; conclusion:string; delta?:string; columns:QueryColumn[]; rows:QueryRow[]; resultSets?:QueryResultSet[]; chart:{type:"line"|"bar"|"pie";xKey:string;yKey:string}|null; evidence:Evidence };
 export type QueryRefusal = { refused:true; reason:string; errorCode?:string; failureClass?:string; sessionId?:string; missingTerm?:string; missingConfiguration?:string[]; missingFacets?:string[]; missingAssets?:Array<{kind:string;label:string}>; attemptedSql?:string; planningMode?:Exclude<QueryPlanningMode,"demo">; planningAttempts?:number; toolTrace?:QueryToolTrace[]; clarifications?:Array<{question:string;answer:string}> };
-export type CapabilityGap = { key:string; code:string; assetLabel:string; count:number; lastAskedAt:string|null; sampleQuestions:string[]; detail?:string|null; remedy:{action:string;prefill?:{pageType?:string;slug?:string;title?:string;field?:string}}; status:"open"|"resolved" };
-export type CapabilityGapBoard = { gaps:CapabilityGap[]; generatedAt:string; auditWindow:number };
+export type CapabilityGap = { key:string; code:string; assetLabel:string; count:number; lastAskedAt:string|null; sampleQuestions:string[]; detail?:string|null; remedy:{action:string;prefill?:{pageType?:string;slug?:string;title?:string;field?:string}}; status:"open"|"resolved"|"historical"|"replayed"; category?:"knowledge"|"catalog"|"operation"; auditIds?:number[]; historicalCount?:number; replayedCount?:number };
+export type CapabilityGapBoard = { gaps:CapabilityGap[]; generatedAt:string; auditWindow:number; summary?:{knowledge:number;operations:number;catalog:number;historical:number;replayed:number} };
 export type QueryClarification = { clarification:{pendingId:string;question:string;options:string[];allowFreeText:boolean;expiresAt:string}; sessionId:string; planningMode:"agent"|"claude"; planningAttempts:number; toolTrace:QueryToolTrace[]; tokenUsage?:{promptTokens:number;completionTokens:number;totalTokens:number;available:boolean} };
 export type QueryResponse = QueryAnswer|QueryRefusal|QueryClarification;
 export type QuerySession = { id:string; sourceId:number; userName:string; title:string; messageCount:number; createdAt:string; updatedAt:string };
@@ -84,9 +84,11 @@ export type BackgroundTask = {
   id:string; sourceId:number; taskType:"discovery"|string;
   status:"queued"|"running"|"succeeded"|"failed";
   progress:number; total:number; currentStep:string|null; error:string|null;
+  payload?:{orchestrationId?:string|null;sourceBuild?:{selections:Array<{tableName:string;included:boolean}>}};
   result:DiscoverySummary|EvaluationSummary|EvaluationGateSummary|OntologyDomainModelingResult|null; createdAt:string; startedAt:string|null; finishedAt:string|null;
 };
 export type SchemaSnapshot = { id:number; sourceId:number; version:number; checksum:string; createdAt:string };
+export type SourceOntologyBuildStatus={task:BackgroundTask|null;modelingEnabled:boolean;profilingEnabled:boolean};
 
 export type OntologyQuestion = {
   id:number; kind:string; scope:"column"|"table"|"global"; tableName:string|null;
@@ -97,7 +99,7 @@ export type KnowledgePage = {
   id:number|string; sourceId:number; pageType:"term"|"metric"|"join"|"rule"|"table";
   slug:string; title:string; aliases:string[]; tables:string[]; content:string;
   sqlContent:string|null; antiExamples:string|null; verified:boolean; owner:string|null;
-  verifiedAt:string|null; updatedAt:string|null; grade?:string;
+  verifiedAt:string|null; updatedAt:string|null; grade?:string; origin?:"knowledge"|"catalog"; readOnly?:boolean; contract?:Record<string,unknown>|null; semanticHealth?:string;
 };
 
 export type OntologyGraphNode = {
@@ -147,7 +149,7 @@ export type SourceInput = { name:string; host:string; port:number; dbName:string
 export type KnowledgeInput = {
   sourceId:number; pageType:"term"|"metric"|"join"|"rule"; slug?:string; title:string;
   aliases:string[]; tables:string[]; content:string; sqlContent:string;
-  antiExamples:string; verified:boolean; owner:string;
+  antiExamples:string; verified:boolean; owner:string; contract?:Record<string,unknown>|null;
 };
 
 export type SemanticProperty = {
@@ -266,7 +268,7 @@ export type ClaudeQuerySettings = {
 export type SettingsData = {
   llm:{ baseUrl:string; apiKey:MaskedSecret; model:string };
   embedding:{ baseUrl:string; apiKey:MaskedSecret; model:string; dimensions:number|null };
-  retrieval:{ vectorEnabled:boolean; topK:number; vectorWeight:number; minSimilarity:number; semanticThreshold:number };
+  retrieval:{ vectorEnabled:boolean; vectorWeight:number; minSimilarity:number; semanticThreshold:number };
   discovery:{enumMaxDistinctRatio:number};
   profiling:{enabled:boolean;sampleLimit:number;maxTablesPerRefresh:number;timeoutMs:number};
   query:{ semanticQueryPlanMode:"off"|"prefer"|"required"; queryAgentMode:"off"|"prefer"|"required"; queryAgentTrafficPercent:number; queryAgentMaxIterations:number; queryAgentMaxSqlCalls:number; queryAgentMaxScannedRows:number; queryAgentPendingTtlMs:number; queryMaxRows:number; explainMaxRows:number; queryTimeoutMs:number; queryLlmTimeoutMs:number };
@@ -281,7 +283,7 @@ export type SettingsData = {
 export type SettingsInput = {
   llm?:Partial<{ baseUrl:string|null; apiKey:string|null; model:string|null }>;
   embedding?:Partial<{ baseUrl:string|null; apiKey:string|null; model:string|null; dimensions:number|null }>;
-  retrieval?:Partial<{ vectorEnabled:boolean; topK:number; vectorWeight:number; minSimilarity:number; semanticThreshold:number }>;
+  retrieval?:Partial<{ vectorEnabled:boolean; vectorWeight:number; minSimilarity:number; semanticThreshold:number }>;
   discovery?:Partial<{enumMaxDistinctRatio:number}>;
   profiling?:Partial<{enabled:boolean;sampleLimit:number;maxTablesPerRefresh:number;timeoutMs:number}>;
   query?:Partial<{ semanticQueryPlanMode:"off"|"prefer"|"required"; queryAgentMode:"off"|"prefer"|"required"; queryAgentTrafficPercent:number; queryAgentMaxIterations:number; queryAgentMaxSqlCalls:number; queryAgentMaxScannedRows:number; queryAgentPendingTtlMs:number; queryMaxRows:number; explainMaxRows:number; queryTimeoutMs:number; queryLlmTimeoutMs:number }>;

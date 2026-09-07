@@ -6,7 +6,7 @@ export function createOntologyGraphService({store,knowledge}) {
     const excluded=store.excludedTableNames(sourceId);
     const tables=store.listTables(sourceId).filter((table)=>table.active&&table.grade!=="C"&&!excluded.has(table.tableName));
     const tableNames=new Set(tables.map((table)=>table.tableName));
-    const pages=knowledge.list(sourceId).filter((page)=>["term","metric","rule"].includes(page.pageType));
+    const pages=knowledge.listBusiness(sourceId);
     const ontology=store.getPublishedOntologySchema(sourceId);
     const objectTypes=ontology?.schema?.objectTypes||[];
     const linkTypes=ontology?.schema?.linkTypes||[];

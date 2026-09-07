@@ -10,14 +10,23 @@ import { createHash } from "node:crypto";
 
 export function createDiscoveryService({store,connector,wikiDir,config={},relationModel:relationModelOverride}) {
   const relationConfig={maxCandidates:600,batchSize:20,timeoutMs:60_000,minConfidence:0.55,sampleLimit:500,overlapConcurrency:4,overlapTimeoutMs:10_000,...config.relationModel};
-  const profilingConfig={enabled:false,sampleLimit:1000,maxTablesPerRefresh:20,timeoutMs:10_000,...config.profiling};
   const discoveryConfig={enumMaxDistinctRatio:0.05,labelDictionaryMaxRows:undefined,...config.discovery};
   const relationModel=relationModelOverride||createRelationModelService({llm:config.llm||{},batchSize:relationConfig.batchSize,timeoutMs:relationConfig.timeoutMs});
 
-  async function discover(source,{onProgress=()=>{}}={}) {
+  async function discover(source,{onProgress=()=>{},tableNames=null}={}) {
+    const profilingConfig={enabled:false,sampleLimit:1000,maxTablesPerRefresh:20,timeoutMs:10_000,...config.profiling};
+    const selected=tableNames?new Set(tableNames):null;
+    const excluded=store.excludedTableNames(source.id);
+    const included=(name)=>!excluded.has(name)&&(!selected||selected.has(name));
+    const restrict=(schema)=>{
+      schema.tables=schema.tables.filter((table)=>included(table.tableName));
+      schema.columns=schema.columns.filter((column)=>included(column.tableName));
+      schema.foreignKeys=schema.foreignKeys.filter((relation)=>included(relation.fromTable)&&included(relation.toTable));
+      return schema;
+    };
     emit(onProgress,2,"准备数据源探查");
     if (source.isDemo) {
-      const schema=demoSchema(source.id);
+      const schema=restrict(demoSchema(source.id));
       const schemaDiff=saveSnapshot(source.id,schema);
       const relationKeys=schema.foreignKeys.map(relationKey);
       store.finishSchemaRefresh(source.id,schema,relationKeys);
@@ -29,17 +38,11 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     }
 
     emit(onProgress,5,"读取 INFORMATION_SCHEMA");
-    const schema=await introspectSchema(connector,source);
+    const schema=restrict(await introspectSchema(connector,source));
     // Scope decision happens before anything else sees the schema: excluded tables are cut
     // from tables, columns AND foreign keys here, so the probe, the relation candidates, the
     // snapshot and the question generators all operate on a world where they don't exist.
-    const excluded=store.excludedTableNames(source.id);
-    if(excluded.size) {
-      schema.tables=schema.tables.filter((table)=>!excluded.has(table.tableName));
-      schema.columns=schema.columns.filter((column)=>!excluded.has(column.tableName));
-      schema.foreignKeys=schema.foreignKeys.filter((fk)=>!excluded.has(fk.fromTable)&&!excluded.has(fk.toTable));
-      store.purgeExcludedTables(source.id);
-    }
+    if(excluded.size)store.purgeExcludedTables(source.id);
     const normalized=normalizeSchema(schema);
     const schemaDiff=compareSchema(store.getLatestSchemaSnapshot(source.id)?.schema,normalized);
     const inbound=new Map();

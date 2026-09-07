@@ -1,30 +1,53 @@
 import { knowledgeIntentConcepts, catalogFilterConcepts } from "./query-intent.mjs";
 import { validateKnowledgeSemantics } from "./knowledge-semantics.mjs";
 
-// Aggregates refused/failed audit rows into a governance backlog of capability gaps.
-// Pure read + deterministic recomputation: no new tables, no LLM calls, no replay of
-// historical questions — status derives from the same concept builders parseQueryIntent uses,
-// so a knowledge page saved today flips its gap to resolved on the next read with zero wiring.
+// Keep business definitions, catalog maintenance and runtime incidents distinct.
+// Status derives from stored evidence only; listing never runs a query or model.
 
 const FAILURE_CLASS_LABELS={
   llm_unconfigured:"LLM 未配置",retrieval_miss:"知识覆盖缺失",schema_gap:"结构映射缺失",ontology_missing:"本体未发布",
   protocol_error:"模型协议异常",enum_dictionary:"枚举字典误拦",policy_block:"安全策略拦截",execution_error:"执行失败",
-  intent_error:"意图解析失败",guard_false_positive:"护栏误报",budget_exhausted:"预算耗尽",result_incomplete:"结果不完整",data_quality:"数据质量",
+  intent_error:"意图解析失败",guard_false_positive:"护栏误报",budget_exhausted:"预算耗尽",budget_exceeded:"预算耗尽",result_incomplete:"结果不完整",data_quality:"数据质量",
 };
 
 const METRIC_GAP_CODES=new Set(["MEASURE_DEFINITION_REQUIRED","METRIC_AMBIGUOUS"]);
 const FILTER_GAP_CODES=new Set(["FILTER_FIELD_UNKNOWN","FILTER_VALUE_BINDING_UNKNOWN"]);
 
-export function createCapabilityGapService({store}) {
-  function listGaps(sourceId,{limit=500}={}) {
-    const audits=store.listAudits(sourceId,limit).filter((row)=>["refused","failed"].includes(row.verdict));
+export function createCapabilityGapService({store,currentPlanningMode=()=>null}) {
+  function listGaps(sourceId,{limit=500,scope="all"}={}) {
+    const window=store.listAudits(sourceId,Math.min(500,Math.max(1,Number(limit)||500)));
+    const audits=window.filter((row)=>["refused","failed"].includes(row.verdict));
     const resolution=buildResolutionContext(store,sourceId);
     const gaps=[...aggregateGaps(audits),...pageHealthGaps(resolution)];
-    for(const gap of gaps)gap.status=gapStatus(gap,resolution);
+    const mode=currentPlanningMode(sourceId);
+    for(const gap of gaps) {
+      gap.category=gapCategory(gap);
+      gap.status=gapStatus(gap,resolution);
+      if(mode==="claude"&&METRIC_GAP_CODES.has(gap.code)&&resolution.knowledgePages.some((page)=>page.verified&&page.pageType==="metric"&&page.content?.trim()&&!page.sqlContent?.trim()&&[page.title,...(page.aliases||[])].some((label)=>normalizeLabel(label)===normalizeLabel(gap.assetLabel))))gap.status="resolved";
+      const rows=audits.filter((row)=>gapDescriptors(row).some((descriptor)=>descriptor.key===gap.key));
+      gap.auditIds=rows.map((row)=>row.id);
+      gap.historicalCount=rows.filter((row)=>mode==="claude"&&["agent","semantic","legacy"].includes(row.planningMode)).length;
+      gap.replayedCount=rows.filter((row)=>window.some((later)=>later.id>row.id&&later.question===row.question&&later.planningMode===row.planningMode&&later.verdict==="passed")).length;
+      if(rows.length&&gap.historicalCount===rows.length)gap.status="historical";
+      // A successful replay is execution evidence, not approval of a business
+      // definition. Never use it to mark knowledge or catalog content resolved.
+      else if(rows.length&&gap.category==="operation"&&gap.replayedCount===rows.length)gap.status="replayed";
+    }
     gaps.sort((left,right)=>(left.status==="open"?0:1)-(right.status==="open"?0:1)||right.count-left.count||String(right.lastAskedAt||"").localeCompare(String(left.lastAskedAt||"")));
-    return {gaps,generatedAt:new Date().toISOString(),auditWindow:audits.length};
+    const visible=scope==="knowledge"?gaps.filter((gap)=>gap.category==="knowledge"&&gap.status!=="historical"):gaps;
+    return {gaps:visible,generatedAt:new Date().toISOString(),auditWindow:audits.length,
+      summary:{knowledge:gaps.filter((gap)=>gap.category==="knowledge"&&gap.status==="open").length,operations:gaps.filter((gap)=>gap.category==="operation"&&gap.status==="open").length,catalog:gaps.filter((gap)=>gap.category==="catalog"&&gap.status==="open").length,historical:gaps.filter((gap)=>gap.status==="historical").length,replayed:gaps.filter((gap)=>gap.status==="replayed").length}};
   }
   return {listGaps};
+}
+
+function gapCategory(gap) {
+  if(gap.code.startsWith("PAGE:")||gap.code.startsWith("PAGE_SEMANTIC_")||METRIC_GAP_CODES.has(gap.code))return "knowledge";
+  if(FILTER_GAP_CODES.has(gap.code)||gap.code==="PRODUCT_SCOPE_REGISTRY_REQUIRED")return "catalog";
+  // Unclassified runtime failures cannot establish that a business definition is
+  // missing. They stay with their audit evidence until diagnosed.
+  if(gap.code.startsWith("CLASS:"))return "operation";
+  return "knowledge";
 }
 
 // A verified page with semantic defects is worse than a missing one: it answers with

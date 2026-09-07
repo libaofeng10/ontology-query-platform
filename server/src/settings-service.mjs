@@ -19,7 +19,6 @@ const GROUPS = {
   },
   retrieval: {
     vectorEnabled: { envVar: "RETRIEVAL_VECTOR_ENABLED", validate: bool },
-    topK: { envVar: "RETRIEVAL_TOP_K", validate: intRange(1, 50) },
     vectorWeight: { envVar: "RETRIEVAL_VECTOR_WEIGHT", validate: ratio },
     minSimilarity: { envVar: "RETRIEVAL_MIN_SIMILARITY", validate: ratio },
     semanticThreshold: { envVar: "RETRIEVAL_SEMANTIC_THRESHOLD", validate: ratio },
@@ -99,11 +98,17 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
   }
 
   function rebuild() {
+    // This knob was never consumed by retrieval. Remove persisted overrides as
+    // well as the API field so a restart cannot resurrect a no-op setting.
+    if (store.getSetting("retrieval.topK")) store.deleteSetting("retrieval.topK");
     for (const [group, keys] of Object.entries(GROUPS)) {
       for (const key of Object.keys(keys)) {
         const spec = keys[key];
         const settingKey = `${group}.${key}`;
         const fallback = defaultsFor(group, key);
+        // Deployment-owned values cannot take effect from SQLite. Clear old
+        // overrides while retaining their actual deployment values for diagnostics.
+        if (spec.readonly && store.getSetting(settingKey)) store.deleteSetting(settingKey);
         if (locked.has(settingKey)) { state[group][key] = fallback; sources[settingKey] = "override"; continue; }
         const row = store.getSetting(settingKey);
         // Deployment-owned values (the CLI path and prompt contract version)
@@ -121,14 +126,17 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
   rebuild();
 
   function update(input, updatedBy = null) {
-    if (!input || typeof input !== "object") throw httpError(400, "设置必须是 JSON 对象");
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw httpError(400, "设置必须是 JSON 对象");
+    for (const group of Object.keys(input)) {
+      if (!Object.hasOwn(GROUPS, group)) throw httpError(400, `未知设置分组 ${group}`);
+    }
     const writes = [];
     for (const [group, keys] of Object.entries(GROUPS)) {
       const section = input[group];
       if (section == null) continue;
-      if (typeof section !== "object") throw httpError(400, `${group} 必须是对象`);
+      if (typeof section !== "object" || Array.isArray(section)) throw httpError(400, `${group} 必须是对象`);
       for (const [key, value] of Object.entries(section)) {
-        const spec = keys[key];
+        const spec = Object.hasOwn(keys, key) ? keys[key] : null;
         if (!spec) throw httpError(400, `未知设置项 ${group}.${key}`);
         const settingKey = `${group}.${key}`;
         if (locked.has(settingKey)) throw httpError(400, `${settingKey} 由启动参数固定，不可在线修改`);
@@ -175,7 +183,7 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
 
   const llmView = viewOf(state.llm, ["baseUrl", "apiKey", "model"]);
   const embeddingView = viewOf(state.embedding, ["baseUrl", "apiKey", "model", "dimensions"]);
-  const retrievalView = viewOf(state.retrieval, ["vectorEnabled", "topK", "vectorWeight", "minSimilarity", "semanticThreshold"]);
+  const retrievalView = viewOf(state.retrieval, ["vectorEnabled", "vectorWeight", "minSimilarity", "semanticThreshold"]);
   const discoveryView = viewOf(state.discovery, ["enumMaxDistinctRatio", "labelDictionaryMaxRows"]);
   const profilingView = viewOf(state.profiling, ["enabled", "sampleLimit", "maxTablesPerRefresh", "timeoutMs"]);
   const claudeQueryView = viewOf(state.claudeQuery, Object.keys(GROUPS.claudeQuery));

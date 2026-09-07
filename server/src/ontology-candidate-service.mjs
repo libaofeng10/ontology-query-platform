@@ -15,7 +15,7 @@ const ACCEPTED_STATUSES=new Set(["auto_confirmed","confirmed","applied"]);
 
 export function createOntologyCandidateService({store,config,scorer,generator,critic,embeddingIndex,semanticSchemas,embeddingFetchImpl=globalThis.fetch}={}) {
   if(!store)throw new Error("ontology candidate service 需要 store");
-  const aiConfig=config?.ontologyAi||{mode:"off",autoConfirmScore:80,maxTables:20,maxFields:600};
+  const aiConfig=config?.ontologyAi||{mode:"off",autoConfirmScore:85,maxTables:20,maxFields:600};
   const candidateScorer=scorer||createOntologyCandidateScorer({embedding:config?.embedding,fetchImpl:embeddingFetchImpl});
   const criticStats=new Map();
 
@@ -81,7 +81,7 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     const namespace=normalizeOntologyNamespace(input?.domainName);
     const embeddingModel=String(config?.embedding?.model||"unconfigured").trim()||"unconfigured";
     const sourceAutoConfirmScore=store.getSourceOntologySetting?.(source.id)?.autoConfirmScore;
-    const effectiveAutoConfirmScore=boundedInteger(sourceAutoConfirmScore,0,100,boundedInteger(aiConfig.autoConfirmScore,0,100,80));
+    const effectiveAutoConfirmScore=boundedInteger(sourceAutoConfirmScore,0,100,boundedInteger(aiConfig.autoConfirmScore,0,100,85));
     const run=store.createOntologyGenerationRun({
       id,sourceId:source.id,taskId,mode,
       scope:{tableNames,domainName:String(input?.domainName||"").trim(),domainDescription:String(input?.domainDescription||"").trim(),namespace,nonSensitiveFieldCount,batches:generationScope.batches,limits:{maxTables,maxFields},modelingMode:aiConfig.mode,autoConfirmScore:effectiveAutoConfirmScore,llmTimeoutMs:boundedInteger(aiConfig.timeoutMs,1_000,600_000,300_000),embeddingModel,publishedSchemaVersionIdAtStart:publishedAtStart?.id||null,...domainOrchestrationScope(input)},

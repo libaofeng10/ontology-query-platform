@@ -106,10 +106,10 @@ test("generation summaries retain missing table coverage for a targeted suppleme
   } finally { fixture.store.close(); }
 });
 
-test("the automatic run stage generates Links only from auto-confirmed Object endpoints",async()=>{
+test("85-point Objects automatically proceed to Link generation without confirmation actions",async()=>{
   const fixture=await createFixture();
   try {
-    const config={ontologyAi:{mode:"auto_draft",autoConfirmScore:78,maxTables:20,maxFields:600},llm:{model:"model"},embedding:{model:"embed-v1"}};
+    const config={ontologyAi:{mode:"auto_draft",autoConfirmScore:85,maxTables:20,maxFields:600},llm:{model:"model"},embedding:{model:"embed-v1"}};
     const scorer={score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9})};
     let linkEndpoints=[];
     const generator={
@@ -119,7 +119,9 @@ test("the automatic run stage generates Links only from auto-confirmed Object en
     const service=createOntologyCandidateService({store:fixture.store,config,scorer,generator});
     const run=service.createRun({sourceId:fixture.source.id,tableNames:["crm_customer","sales_order"],domainName:"sales"},"editor-a");
     const result=await service.runGeneration({payload:{runId:run.id}});
-    assert.equal(linkEndpoints.length,2);assert.ok(linkEndpoints.every((item)=>item.status==="auto_confirmed"));assert.equal(result.objectCount,2);assert.equal(result.linkCount,1);assert.equal(result.linkEligibleRelationCount,1);
+    assert.equal(linkEndpoints.length,2);assert.ok(linkEndpoints.every((item)=>item.status==="auto_confirmed"&&item.score===85));assert.equal(result.objectCount,2);assert.equal(result.linkCount,1);assert.equal(result.linkEligibleRelationCount,1);
+    assert.equal(result.reviewRequiredCount,0);
+    for(const item of fixture.store.listOntologyCandidates({runId:run.id}))assert.deepEqual(service.listEvents(item.id).map((event)=>event.eventType),["auto_route"]);
     assert.equal(fixture.store.listOntologyCandidates({runId:run.id,candidateType:"link"})[0].status,"auto_confirmed");
   } finally { fixture.store.close(); }
 });

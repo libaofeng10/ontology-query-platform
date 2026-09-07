@@ -4,13 +4,32 @@ import test from "node:test";
 import { createClaudeQueryMcpSession } from "../src/claude-query-mcp.mjs";
 import { createClaudeQuerySnapshot } from "../src/claude-query-snapshot.mjs";
 
-function snapshot() {
+function snapshot(overrides = {}) {
   return createClaudeQuerySnapshot({
     sourceId: 1,
     published: { sourceId: 1, version: 1, status: "published", schema: { name: "crm", objectTypes: [{ apiName: "customer", properties: [{ apiName: "id", mapping: { table: "customer", column: "id" } }, { apiName: "phone", mapping: { table: "customer", column: "phone" } }], }], linkTypes: [] } },
     catalog: { tables: [{ tableName: "customer" }], columnsByTable: { customer: [{ columnName: "id", dataType: "int", isPrimary: 1 }, { columnName: "phone", dataType: "varchar", isSensitive: 1 }] }, relations: [] },
+    ...overrides,
   });
 }
+
+test("knowledge reads disclose the returned table structure without disclosing unknown or unmatched tables", async () => {
+  const session = await createClaudeQueryMcpSession({
+    snapshot: snapshot({ knowledge: [{ slug: "customer-usage", title: "客户使用情况", verified: true, tables: ["customer", "unpublished"] }] }),
+    listen: false,
+    executeFn: async () => ({ rows: [{ id: 1 }], fields: ["id"] }),
+  });
+  try {
+    await session.callTool("ontology_read", { operation: "get_knowledge", query: "未命中" });
+    assert.equal((await session.callTool("db_query", { sql: "SELECT id FROM customer" })).ok, true);
+    const read = await session.callTool("ontology_read", { operation: "get_knowledge", query: "客户 使用情况" });
+    assert.deepEqual(read.disclosedTables, ["customer"]);
+    assert.deepEqual(read.data.tables.map((table) => table.tableName), ["customer"]);
+    assert.ok(read.data.tables[0].columns.some((column) => column.columnName === "phone"));
+    assert.equal((await session.callTool("db_query", { sql: "SELECT id FROM customer" })).ok, true);
+    assert.equal((await session.callTool("db_query", { sql: "SELECT id FROM unpublished" })).ok, true);
+  } finally { await session.close(); }
+});
 
 test("MCP tools use the snapshot/kernel boundary and keep full rows private", async () => {
   const calls = [];
@@ -23,10 +42,7 @@ test("MCP tools use the snapshot/kernel boundary and keep full rows private", as
     },
   });
   try {
-    const before = await session.callTool("db_query", { sql: "SELECT id FROM customer" });
-    assert.equal(before.errorCode, "TABLE_NOT_DISCLOSED");
-    const read = await session.callTool("ontology_read", { operation: "get_objects", ids: ["customer"] });
-    assert.equal(read.ok, true);
+    assert.equal(session.snapshot.disclosedTables.size, 0);
     const result = await session.callTool("db_query", { name: "customers", sql: "SELECT id, phone FROM customer" });
     assert.equal(result.ok, true);
     assert.equal(result.rowCount, 1);
@@ -105,15 +121,15 @@ test("MCP reports rejected tools and observer failures cannot change execution r
   } finally { await session.close(); }
 });
 
-test("MCP blocks unknown tables and writes before invoking the kernel", async () => {
+test("MCP delegates unlisted tables to the executor but blocks writes", async () => {
   let calls = 0;
   const session = await createClaudeQueryMcpSession({ snapshot: snapshot(), listen: false, initialDisclosedTables: ["customer"], executeFn: async () => { calls++; return { rows: [], fields: [] }; } });
   try {
     const unknown = await session.callTool("db_query", { sql: "SELECT id FROM other_table" });
-    assert.equal(unknown.errorCode, "UNKNOWN_TABLE");
+    assert.equal(unknown.ok, true);
     const write = await session.callTool("db_query", { sql: "DELETE FROM customer" });
     assert.equal(write.errorCode, "READ_ONLY_REQUIRED");
-    assert.equal(calls, 0);
+    assert.equal(calls, 1);
   } finally { await session.close(); }
 });
 

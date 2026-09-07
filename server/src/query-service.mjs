@@ -494,7 +494,7 @@ function buildSemanticRuntime(store,sourceId,ontologySchemaVersionId) {
 function buildClaudeContext(store,sourceId,ontologySchemaVersionId) {
   const ontologyRecord=ontologySchemaVersionId?store.getOntologySchemaVersion(Number(ontologySchemaVersionId)):store.getPublishedOntologySchema(sourceId);
   if(ontologySchemaVersionId&&!ontologyRecord)throw httpError(404,"指定的 Ontology Schema 版本不存在");
-  const tables=store.listTables(sourceId).filter((table)=>table.grade!=="C"&&table.active);
+  const tables=store.listTables(sourceId);
   return {
     tables,
     columns:Object.fromEntries(tables.map((table)=>[table.tableName,store.listColumns(sourceId,table.tableName)])),
@@ -542,14 +542,14 @@ async function buildContext(store,sourceId,question,priorContext={},deps={}) {
   let queryIntent=followUp&&historicalIntent?mergeContextualQueryIntent(currentIntent,historicalIntent):currentIntent;
   let retrievalQuestion=buildIntentRetrievalQuestion(queryIntent,contextualQuestion);
   let vector=await buildRetrievalVector(sourceId,retrievalQuestion,deps);
-  let retrieval=retrieveKnowledge({question:retrievalQuestion,pages:knowledgePages,tables:allTables,columnsByTable:allColumns,relations:allRelations,vector,conceptAliases:deps.retrieval?.conceptAliases||[],termAliases,intent:queryIntent,ontologySchema,enumItemsByColumn});
+  let retrieval=retrieveKnowledge({question:retrievalQuestion,pages:knowledgePages,tables:allTables,columnsByTable:allColumns,relations:allRelations,vector,termAliases,intent:queryIntent,ontologySchema,enumItemsByColumn});
   const globalConceptCount=rowDomainConcepts.filter((item)=>item.activationPolicy==="global_table").length;
   let globalRulesStable=globalConceptCount===0;
   for(let iteration=0;iteration<=globalConceptCount;iteration++) {
     const withGlobalRules=applyGlobalRowDomainRules(queryIntent,rowDomainConcepts,requiredExecutionTables(retrieval),{subjectExecutionTables:requiredSubjectExecutionTables(retrieval)});
     if(intentContractFingerprint(withGlobalRules)===intentContractFingerprint(queryIntent)) {globalRulesStable=true;break;}
     queryIntent=withGlobalRules;retrievalQuestion=buildIntentRetrievalQuestion(queryIntent,contextualQuestion);vector=await buildRetrievalVector(sourceId,retrievalQuestion,deps);
-    retrieval=retrieveKnowledge({question:retrievalQuestion,pages:knowledgePages,tables:allTables,columnsByTable:allColumns,relations:allRelations,vector,conceptAliases:deps.retrieval?.conceptAliases||[],termAliases,intent:queryIntent,ontologySchema,enumItemsByColumn});
+    retrieval=retrieveKnowledge({question:retrievalQuestion,pages:knowledgePages,tables:allTables,columnsByTable:allColumns,relations:allRelations,vector,termAliases,intent:queryIntent,ontologySchema,enumItemsByColumn});
   }
   if(!globalRulesStable) {
     queryIntent=structuredClone(queryIntent);
@@ -986,7 +986,7 @@ async function runClaudeQueryBranch({store,connector,config,source,question,cont
   const snapshot=await deps.claudeSnapshotBuilder({...context,context,sourceId,source:snapshotSource(source),store});
   if(!snapshot||typeof snapshot.read!=="function") throw new Error("Claude ontology snapshot 构造失败");
   const kernelCatalog=buildKernelCatalog(snapshot,config);
-  const kernel=createQueryExecutionKernel({connector,source,config,question,catalog:kernelCatalog,queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),getDisclosedTables:()=>snapshot.disclosedTables||new Set(),signal,maxSqlCalls:claudeConfig.maxSqlCalls??config.queryAgentMaxSqlCalls,maxScannedRows:claudeConfig.maxScannedRows??config.queryAgentMaxScannedRows,preview:{maxRows:20,maxBytes:24*1024,maxCellChars:200}});
+  const kernel=createQueryExecutionKernel({connector,source,config,question,catalog:kernelCatalog,schemaMode:"database",queryIntent:context.queryIntent,retrievalEvidence:[context.retrieval].filter(Boolean),signal,maxSqlCalls:claudeConfig.maxSqlCalls??config.queryAgentMaxSqlCalls,maxScannedRows:claudeConfig.maxScannedRows??config.queryAgentMaxScannedRows,preview:{maxRows:20,maxBytes:24*1024,maxCellChars:200}});
   const produced=await deps.claudeMcpFactory({snapshot,kernel,source,sourceId,requestId,signal,onEvent,listen:true,previewRows:20,previewBytes:24*1024,initialDisclosedTables:[]});
   const mcpSession=produced?.session||produced;
   if(!mcpSession) throw new Error("Claude MCP session 构造失败");
@@ -1070,7 +1070,7 @@ function safeError(error) { return String(error?.message||error).replace(/(passw
 
 function snapshotSource(source) { return {id:source.id}; }
 function buildKernelCatalog(snapshot,config) {
-  return {tables:snapshot.tables,columnsByTable:snapshot.columnsByTable,relations:snapshot.relations,policy:{allowedTables:snapshot.allowedTableNames,allowedColumns:snapshot.allowedColumnsByTable,valueKinds:[],allowedRelations:snapshot.relations,maxRows:config.queryMaxRows||500,enums:{}}};
+  return {tables:snapshot.tables,columnsByTable:snapshot.columnsByTable,relations:snapshot.relations,policy:{valueKinds:[],maxRows:config.queryMaxRows||500,enums:{}}};
 }
 function redactClaudeBoundaryValue(value,depth=0,seen=new WeakSet()) {
   if(value==null)return value;

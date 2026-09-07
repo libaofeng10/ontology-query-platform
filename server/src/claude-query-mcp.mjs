@@ -21,13 +21,13 @@ export const CLAUDE_QUERY_MCP_BODY_TIMEOUT_MS = 30_000;
 export const CLAUDE_QUERY_MCP_TOOLS = Object.freeze([
   {
     name: "ontology_read",
-    description: "读取当前请求已授权的已发布业务本体元数据。只能读取工具返回的对象、属性、关系、知识和规则。",
+    description: "读取当前数据源的物理表字段、业务本体、关系、知识和规则；这些信息用于理解业务，不是 SQL 白名单。",
     inputSchema: {
       type: "object",
       properties: {
-        operation: { type: "string", enum: ["overview", "search", "get_objects", "get_relations", "get_knowledge"] },
-        query: { type: "string", maxLength: 500 },
-        ids: { type: "array", items: { type: "string", maxLength: 200 }, maxItems: 50 },
+        operation: { type: "string", enum: ["overview", "search", "get_tables", "get_objects", "get_relations", "get_knowledge"] },
+        query: { type: "string", maxLength: 500, description: "空格分隔的关键词，读取操作先筛选再分页；overview 不使用此参数。" },
+        ids: { type: "array", items: { type: "string", maxLength: 200 }, maxItems: 50, description: "get_tables 用物理表名；get_objects 用对象名或映射表名；get_relations 用关系 ID；get_knowledge 用知识 ID 或 slug。" },
         cursor: { type: "string", maxLength: 500 },
         limit: { type: "integer", minimum: 1, maximum: 50 },
       },
@@ -130,11 +130,7 @@ export async function createClaudeQueryMcpSession(options = {}) {
     closePromise: null,
   };
 
-  // Honour request-local disclosure supplied by the coordinator even when a
-  // prebuilt snapshot object is passed in.  Without this, callers that have
-  // already audited a table must redundantly perform ontology_read before a
-  // first db_query (and, worse, the option appears to be accepted but is
-  // silently ignored).
+  // Keep read history for evidence; it no longer grants permission to query.
   if (snapshot?.disclose) snapshot.disclose(options.initialDisclosedTables ?? options.disclosedTables ?? []);
 
   if (!state.kernel && typeof state.kernelFactory === "function") {
@@ -418,6 +414,7 @@ async function dispatchTool(state, name, args) {
 const ONTOLOGY_OPERATION_LABELS = Object.freeze({
   overview: "读取业务概览",
   search: "检索业务定义",
+  get_tables: "读取物理表结构",
   get_objects: "读取对象与字段",
   get_relations: "读取关联关系",
   get_knowledge: "读取业务知识",
@@ -500,12 +497,7 @@ async function dbQuery(state, args = {}) {
     return failureResult("CROSS_DATABASE_FORBIDDEN", "禁止跨数据库限定查询");
   }
   const tableNames = extractTableNames(sql);
-  const allowed = new Set((state.snapshot?.allowedTableNames || []).map((name) => normalizeIdentifier(name)).filter(Boolean));
   const disclosed = state.snapshot?.disclosedTables instanceof Set ? state.snapshot.disclosedTables : new Set();
-  const unknown = tableNames.filter((name) => !allowed.has(name));
-  if (unknown.length) return failureResult("UNKNOWN_TABLE", `查询引用了未发布或不允许的表：${unknown.join("、")}`, { tables: unknown });
-  const undisclosed = tableNames.filter((name) => !disclosed.has(name));
-  if (undisclosed.length) return failureResult("TABLE_NOT_DISCLOSED", `请先通过 ontology_read 查看表：${undisclosed.join("、")}`, { tables: undisclosed, retryable: true });
 
   const name = safeText(args.name || "query", 200);
   let receipt;
