@@ -2,6 +2,16 @@ import { createHash } from "node:crypto";
 
 export const COLUMN_PROFILE_VERSION="column-profile-v1";
 
+export function columnProfileForPrompt(profile) {
+  if(!profile)return null;
+  const expired=profile.sampledAt&&Date.now()-Date.parse(profile.sampledAt)>86_400_000;
+  const status=expired?"stale":profile.status||"sampled";
+  const available=status==="sampled";
+  return {status,sampledAt:profile.sampledAt||null,sampleSize:profile.sampleSize??null,samplingMethod:profile.samplingMethod||"unspecified",scope:"sample",reason:expired?"sample_expired":profile.reason||null,
+    sampleValues:available?(profile.sampleValues||[]).slice(0,5).map(value=>truncate([...String(value)].map(char=>char.charCodeAt(0)<32||char.charCodeAt(0)===127?" ":char).join(""),64)):[],
+    formatPattern:available?profile.formatPattern||null:null,distinctCount:available?profile.distinctCount??null:null,nullRatio:available?profile.nullRatio??null:null};
+}
+
 const EMAIL=/^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/i;
 const PHONE=/^(?:\+?86[-\s]?)?1[3-9]\d{9}$/;
 // International numbers are only treated as phone values when they carry an

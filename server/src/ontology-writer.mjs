@@ -1,3 +1,5 @@
+import { describeRelationEvidence } from "./relation-data-evidence.mjs";
+import { relationSlug, formatRelation } from "./physical-relation.mjs";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -53,7 +55,7 @@ ${columns.map((column) => `| ${column.columnName} | ${column.dataType} | ${colum
 ${Object.entries(enumGroups).length ? Object.entries(enumGroups).map(([column, values]) => `### ${column}\n| 值 | 含义 | 占比 |\n|---|---|---|\n${values.map((value) => `| ${value.value} | ${value.meaning || "待确认"} | ${value.ratio == null ? "—" : `${(value.ratio * 100).toFixed(1)}%`} |`).join("\n")}`).join("\n\n") : "暂无安全可用的低基数枚举探针结果。"}
 
 ## 关联
-${relations.length ? relations.map((relation) => `[[${relation.fromTable}-${relation.fromCol}-${relation.toTable}-${relation.toCol}]]`).join(" · ") : "暂无已确认关联。"}
+${relations.length ? relations.map((relation) => `[[${relationSlug(relation)}]]`).join(" · ") : "暂无已确认关联。"}
 
 ## 陷阱
 待业务审核补充。自动重建不会覆盖 verified: true 的人工页面。
@@ -63,7 +65,7 @@ ${relations.length ? relations.map((relation) => `[[${relation.fromTable}-${rela
 
 export async function writeJoinPage(root, relation) {
   await ensureOntologyStructure(root);
-  const name = `${relation.fromTable}-${relation.fromCol}-${relation.toTable}-${relation.toCol}`;
+  const name = relationSlug(relation);
   return writeProtected(join(root, "joins", `${safeFileName(name)}.md`), `---
 type: join
 from: ${relation.fromTable}
@@ -77,11 +79,11 @@ verified: ${relation.status === "confirmed"}
 
 ## ON 条件
 \`\`\`sql
-${relation.fromTable}.${relation.fromCol} = ${relation.toTable}.${relation.toCol}
+${formatRelation(relation)}
 \`\`\`
 
 ## 说明
-值域重叠 ${relation.overlapRatio == null ? "待探针" : `${(relation.overlapRatio * 100).toFixed(2)}%`}，当前状态：${relation.status}。
+${describeRelationEvidence(relation)}。当前状态：${relation.status}。
 
 ## 陷阱
 N 侧聚合到 1 侧实体时，应检查是否需要 COUNT(DISTINCT ...) 防止重复计数。

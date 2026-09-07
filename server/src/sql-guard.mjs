@@ -1,3 +1,4 @@
+import { relationPairs, formatRelation } from "./physical-relation.mjs";
 import sqlParser from "node-sql-parser";
 
 const { Parser } = sqlParser;
@@ -76,7 +77,8 @@ function guardSqlInternal(sql, policy, enforceSchema) {
     const aliasContext = buildAliasContext(statement, cte);
     if (aliasContext.error) return denied(aliasContext.error, { tables:tableNames });
 
-    joinVerdict = validateJoins(statement, policy.allowedRelations || [], aliasContext, cte);
+    try { joinVerdict = validateJoins(statement, policy.allowedRelations || [], aliasContext, cte); }
+    catch { return denied("物理关系目录的完整列组无效，请重新读取数据结构",{code:"INVALID_RELATION_CONSTRAINT"}); }
     if (!joinVerdict.ok) return { ...joinVerdict, tables:tableNames };
 
     const columnVerdict = validateColumns(
@@ -168,7 +170,7 @@ function resolveInCteBody(local,lineage,ref) {
   const target=ref.table?local.get(normalizeName(ref.table)):local.size===1?[...local.values()][0]:null;
   if(!target) return null;
   if(typeof target==="object") return lineage.get(target.cte)?.get(column)??null;
-  return {table:target,column};
+  return {table:target,column,lineageAlias:normalizeName(ref.table||[...local.keys()][0])};
 }
 
 // One merged alias map across every SELECT scope. The SQL here is machine
@@ -232,10 +234,31 @@ function resolvePhysicalInScope(ref,ancestors,aliasContext,cte) {
 function validateJoins(statement, allowedRelations, aliasContext, cte) {
   const relationByKey = new Map();
   for (const relation of allowedRelations) {
+    if(relationPairs(relation).length!==1)continue;
     relationByKey.set(edgeKey(relation.fromTable,relation.fromCol,relation.toTable,relation.toCol),relation);
     relationByKey.set(edgeKey(relation.toTable,relation.toCol,relation.fromTable,relation.fromCol),relation);
   }
+  const referenceInstance=(ref)=>{const resolved=resolvePhysical(ref,aliasContext,cte);return ref.table?`${normalizeName(ref.table)}:${resolved?.lineageAlias||""}`:"";};
   const usedRelations=[];
+  const approved=new Map();
+  // A composite constraint must hold in one predicate group for the same alias
+  // instances. Never borrow a member from another JOIN, subquery or OR branch.
+  walkWithAncestors(statement,(select,ancestors)=>{
+    if(select.type!=="select")return;
+    const scope=[...ancestors,select];
+    for(const predicate of [...(select.from||[]).map(source=>source.on),select.where].filter(Boolean)){
+      const equations=requiredEqualities(predicate).map(node=>({node,a:resolvePhysicalInScope(node.left,scope,aliasContext,cte),b:resolvePhysicalInScope(node.right,scope,aliasContext,cte),leftAlias:referenceInstance(node.left),rightAlias:referenceInstance(node.right)}));
+      for(const relation of allowedRelations.filter(item=>relationPairs(item).length>1))for(const seed of equations){
+        if(!seed.a||!seed.b||!seed.leftAlias||!seed.rightAlias||seed.leftAlias===seed.rightAlias)continue;
+        for(const reverse of [false,true]){
+          const from=reverse?seed.b:seed.a,to=reverse?seed.a:seed.b,fromAlias=reverse?seed.rightAlias:seed.leftAlias,toAlias=reverse?seed.leftAlias:seed.rightAlias;
+          if(from.table!==normalizeName(relation.fromTable)||to.table!==normalizeName(relation.toTable))continue;
+          const matches=relationPairs(relation).map(pair=>equations.find(eq=>eq.a&&eq.b&&((eq.leftAlias===fromAlias&&eq.rightAlias===toAlias&&eq.a.table===from.table&&eq.b.table===to.table&&eq.a.column===normalizeName(pair.fromCol)&&eq.b.column===normalizeName(pair.toCol))||(eq.leftAlias===toAlias&&eq.rightAlias===fromAlias&&eq.a.table===to.table&&eq.b.table===from.table&&eq.a.column===normalizeName(pair.toCol)&&eq.b.column===normalizeName(pair.fromCol)))));
+          if(matches.every(Boolean))for(const match of matches)approved.set(match.node,relation);
+        }
+      }
+    }
+  });
 
   for (const select of collectSelects(statement)) {
     for (const [index,source] of (select.from||[]).entries()) {
@@ -253,7 +276,7 @@ function validateJoins(statement, allowedRelations, aliasContext, cte) {
   walk(statement,(node)=>{
     if(failure||node.type!=="binary_expr") return;
     const operator=String(node.operator||"").toUpperCase();
-    if(operator==="="&&node.left?.type==="column_ref"&&node.right?.type==="column_ref") { failure=checkColumnPair(node.left,node.right);return; }
+    if(operator==="="&&node.left?.type==="column_ref"&&node.right?.type==="column_ref") { failure=checkColumnPair(node.left,node.right,node);return; }
     if(!["=","IN","NOT IN"].includes(operator)) return;
     const subquery=subqueryOf(node.right)||subqueryOf(node.left);
     if(subquery) failure=checkSubqueryLink(operator,node.left?.type==="column_ref"?node.left:node.right?.type==="column_ref"?node.right:null,subquery);
@@ -262,16 +285,20 @@ function validateJoins(statement, allowedRelations, aliasContext, cte) {
 
   return {
     ok:true,
-    joins:usedRelations.map((relation)=>`${relation.fromTable}.${relation.fromCol} = ${relation.toTable}.${relation.toCol}`),
+    joins:usedRelations.map(formatRelation),
     joinRelationIds:[...new Set(usedRelations.map((relation)=>relation.id).filter((id)=>id!==null&&id!==undefined))],
   };
 
-  function checkColumnPair(left,right) {
+  function checkColumnPair(left,right,node) {
+    if(approved.has(node)){const relation=approved.get(node);if(!usedRelations.includes(relation))usedRelations.push(relation);return null;}
     const a=resolvePhysical(left,aliasContext,cte);
     const b=resolvePhysical(right,aliasContext,cte);
     if(a?.computed||b?.computed) return `CTE 计算列不能作为关联条件：${(a?.computed?a:b).cte}.${(a?.computed?a:b).column}`;
     if(!a||!b) return null;
-    if(a.table===b.table) return null;
+    if(a.table===b.table&&normalizeName(left.table)===normalizeName(right.table)) return null;
+    // Identity comparisons remain usable for result-contract lineage checks.
+    // A member of a declared composite self relation still needs its full group.
+    if(a.table===b.table&&a.column===b.column&&!allowedRelations.some(relation=>relationPairs(relation).length>1&&normalizeName(relation.fromTable)===a.table&&normalizeName(relation.toTable)===a.table&&relationPairs(relation).some(pair=>normalizeName(pair.fromCol)===a.column&&normalizeName(pair.toCol)===b.column)))return null;
     const relation=relationByKey.get(edgeKey(a.table,a.column,b.table,b.column));
     if(!relation) return `使用了未确认的 JOIN：${a.table}.${a.column} = ${b.table}.${b.column}`;
     if(!usedRelations.includes(relation)) usedRelations.push(relation);
@@ -292,7 +319,7 @@ function validateJoins(statement, allowedRelations, aliasContext, cte) {
     const inner=resolvePhysical(innerRef,aliasContext,cte);
     if(outer?.computed||inner?.computed) return `CTE 计算列不能作为关联条件：${(outer?.computed?outer:inner).cte}.${(outer?.computed?outer:inner).column}`;
     if(!outer||!inner) return null;
-    if(outer.table===inner.table) return null;
+    if(outer.table===inner.table&&outer.column===inner.column&&!allowedRelations.some(relation=>relationPairs(relation).length>1&&normalizeName(relation.fromTable)===outer.table&&normalizeName(relation.toTable)===inner.table)) return null;
     const relation=relationByKey.get(edgeKey(outer.table,outer.column,inner.table,inner.column));
     if(!relation) return `使用了未确认的关联：${outer.table}.${outer.column} = ${inner.table}.${inner.column}`;
     if(!usedRelations.includes(relation)) usedRelations.push(relation);
@@ -338,6 +365,7 @@ function validateMandatoryFilters(statement,filters,aliasContext,cte) {
   const found=[];
   walkWithAncestors(statement.where,(node,ancestors)=>{
     if(node.type!=="binary_expr")return;
+    if(ancestors.some(parent=>parent.type==="select"||parent.type==="unary_expr"||parent.type==="binary_expr"&&String(parent.operator||"").toUpperCase()!=="AND"))return;
     const operator=String(node.operator||"").toUpperCase();
     let column=null;let valueNode=null;
     if(node.left?.type==="column_ref"){column=node.left;valueNode=node.right;}
@@ -347,11 +375,11 @@ function validateMandatoryFilters(statement,filters,aliasContext,cte) {
     if(!physical||physical.computed)return;
     const nodes=operator==="IN"&&valueNode?.type==="expr_list"?valueNode.value||[]:[valueNode];
     const values=nodes.map(filterLiteral).filter((item)=>item.valid).map((item)=>String(item.value));
-    found.push({table:physical.table,column:physical.column,values});
+    found.push({table:physical.table,column:physical.column,alias:column.table,values});
   });
   for(const filter of filters) {
     const allowed=(filter.values||[]).map(String);
-    const present=found.some((item)=>normalizeName(item.table)===normalizeName(filter.table)&&normalizeName(item.column)===normalizeName(filter.column)&&item.values.length>0&&item.values.every((value)=>allowed.includes(value)));
+    const present=found.some((item)=>(!filter.alias||normalizeName(item.alias)===normalizeName(filter.alias))&&normalizeName(item.table)===normalizeName(filter.table)&&normalizeName(item.column)===normalizeName(filter.column)&&item.values.length>0&&item.values.every((value)=>allowed.includes(value)));
     if(!present)return denied(`缺少子类型 ${filter.object||filter.owner||"(未知)"} 的强制判别条件 ${filter.table}.${filter.column}`);
   }
   return {ok:true};
@@ -560,3 +588,10 @@ function walkWithAncestors(value,visitor,ancestors=[],seen=new Set()) {
 }
 
 export const _internal = { validateJoins, validateColumns, validateValueSemantics, collectJoinComparisons, collectFunctionNames, buildCteInfo, buildAliasContext, parseLimitSpec };
+
+function requiredEqualities(node){
+  if(node?.type!=="binary_expr")return [];
+  if(String(node.operator).toUpperCase()==="AND")return [...requiredEqualities(node.left),...requiredEqualities(node.right)];
+  if(node.operator==="="&&node.left?.type==="column_ref"&&node.right?.type==="column_ref")return [node];
+  return [];
+}

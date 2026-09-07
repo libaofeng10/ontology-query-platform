@@ -1,3 +1,4 @@
+import { formatRelation } from "./physical-relation.mjs";
 export function createOntologyGraphService({store,knowledge}) {
   function build(sourceId) {
     // Respect the data source's table selection: only tables the user opted
@@ -21,7 +22,7 @@ export function createOntologyGraphService({store,knowledge}) {
     const nodeIds=new Set(nodes.map((node)=>node.id));const edges=[];const edgeIds=new Set();
     for(const relation of store.listRelations(sourceId)) {
       const source=`table:${relation.fromTable}`,target=`table:${relation.toTable}`;if(!nodeIds.has(source)||!nodeIds.has(target))continue;
-      pushEdge(edges,edgeIds,{id:`join:${relation.id}`,source,target,kind:"join",label:`${relation.fromCol} = ${relation.toCol} · ${relation.cardinality||"?"}`,confirmed:["confirmed","accepted"].includes(relation.status)});
+      pushEdge(edges,edgeIds,{id:`join:${relation.id}`,source,target,kind:"join",label:`${formatRelation(relation)} · ${relation.cardinality||"?"}`,confirmed:["confirmed","accepted"].includes(relation.status)});
     }
     for(const objectType of objectTypes) {
       const source=`object:${objectType.apiName}`;

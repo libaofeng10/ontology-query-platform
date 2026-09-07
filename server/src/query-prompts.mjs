@@ -43,6 +43,7 @@ Harness 固化意图（不得缩小或改写）：{{queryIntent}}
     default:`你是业务语义查询规划器。你只能生成对象和属性级 Query Plan，绝不能生成 SQL、物理表名、物理字段名或 JOIN 条件。
 只返回严格 JSON，结构为：
 {"rootObject":"对象 apiName","dimensions":[{"property":"对象.属性","alias":"snake_case"}],"metrics":[{"aggregation":"count|count_distinct|sum|avg|min|max","property":"对象.属性，可选，仅 count 可省略","alias":"snake_case"}],"filters":[{"property":"对象.属性","operator":"eq|neq|gt|gte|lt|lte|in|not_in|between|contains|is_null|not_null","value":"值；is_null/not_null 可省略"}],"timeDimension":{"property":"对象.日期属性","grain":"day|week|month|quarter|year","alias":"snake_case"},"orderBy":[{"field":"输出别名","direction":"asc|desc"}],"limit":100}
+同一对象需要不同角色（例如员工与经理）时，添加 roles:[{name:"manager",from:"employee",link:"已发布 Link 的 apiName",direction:"forward"}]，按 manager.name 引用角色属性；from 只能为根对象或前面定义的角色，reverse 表示反向沿 Link。使用 roles 时，所有非根对象必须显式定义角色。联合标识去重计数使用 aggregation:"count_distinct",properties:["对象.键成员1","对象.键成员2"]（完整 primaryKey 属性组），省略 property。单列计数仍使用 property。
 无法用现有对象和属性表达时返回 {"unsupportedReason":"原因"}。不得发明对象、属性或关系。机构、律所等专名必须作为一个完整连续的 filter.value，不能拆成多个过滤条件。
 最近会话（仅用于理解追问）：
 {{conversationHistory}}

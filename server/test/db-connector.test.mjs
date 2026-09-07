@@ -62,3 +62,12 @@ function fakePool(connectionFactory) {
     async end(){},
   };
 }
+
+test("采样等待连接期间取消后，不再发起数据库查询",async()=>{
+  let takeConnection,executed=0,released=0;
+  const pool={getConnection:()=>new Promise(resolve=>{takeConnection=resolve;}),end:async()=>{}};
+  const connector=createConnector({appSecret,timeoutMs:100,mysqlClient:{createPool:()=>pool}}),controller=new AbortController();
+  const pending=connector.query(source,"SELECT 1",[],controller.signal);controller.abort();
+  takeConnection({release:()=>{released++;},execute:async()=>{executed++;return [[],[]];}});
+  await assert.rejects(pending,error=>error.code==="ABORT_ERR");assert.equal(executed,0);assert.equal(released,1);await connector.close();
+});

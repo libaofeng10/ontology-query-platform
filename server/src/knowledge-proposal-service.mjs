@@ -1,3 +1,4 @@
+import { relationPairs, formatRelation } from "./physical-relation.mjs";
 import { callLlmJsonWithTrace } from "./llm-client.mjs";
 import { knowledgeIntentConcepts, parseQueryIntent } from "./query-intent.mjs";
 
@@ -78,7 +79,7 @@ function shortlistCandidates(context) {
     const timeColumns=columns.filter((column)=>TIME_ROLE_TERMS.test(describe(column))&&/date|time|timestamp/i.test(String(column.dataType||""))).map((column)=>({columnName:column.columnName,comment:clip(column.comment,120)}));
     tables.push({tableName,numeratorEvents,identities,timeColumns,columns:columns.map((column)=>column.columnName)});
   }
-  return {tables,joins:confirmedRelations.map((relation)=>({from:`${relation.fromTable}.${relation.fromCol}`,to:`${relation.toTable}.${relation.toCol}`}))};
+  return {tables,joins:confirmedRelations.map((relation)=>({from:`${relation.fromTable}.${relation.fromCol}`,to:`${relation.toTable}.${relation.toCol}`,columnPairs:relationPairs(relation),predicate:formatRelation(relation)}))};
 }
 
 function metricProposalMessages({question,assetLabel,shortlist}) {

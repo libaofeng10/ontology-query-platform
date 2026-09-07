@@ -1,12 +1,17 @@
+import { describeRelationEvidence } from "./relation-data-evidence.mjs";
 import { introspectSchema } from "./db-introspect.mjs";
 import { probeTable } from "./db-probe.mjs";
-import { generateRelationCandidates } from "./relation-candidates.mjs";
+import { analyzeRelationCandidates } from "./relation-discovery-analysis.mjs";
 import { createRelationModelService } from "./relation-model-service.mjs";
 import { generateEnumMeaningQuestions } from "./enum-meaning-candidates.mjs";
 import { gradeTable } from "./table-grading.mjs";
 import { removeTablePage, writeJoinPage, writeRulePage, writeTablePage } from "./ontology-writer.mjs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { COLUMN_PROFILE_VERSION } from "./column-profile.mjs";
+import { sampleRelationOverlap } from "./relation-data-evidence.mjs";
+import { relationKey as physicalRelationKey, relationPairs, reverseRelation, relationColumnsPresent, formatRelation } from "./physical-relation.mjs";
+export { sampleRelationOverlap } from "./relation-data-evidence.mjs";
 
 export function createDiscoveryService({store,connector,wikiDir,config={},relationModel:relationModelOverride}) {
   const relationConfig={maxCandidates:600,batchSize:20,timeoutMs:60_000,minConfidence:0.55,sampleLimit:500,overlapConcurrency:4,overlapTimeoutMs:10_000,...config.relationModel};
@@ -72,8 +77,9 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
       const probedColumns=probeResults.get(table.tableName)?.columns || columnsByTable[table.tableName] || [];
       for(const column of probedColumns) {
         // 2026-09-04 应用户要求移除敏感列逻辑：发现阶段不再自动推断 isSensitive。
-        store.upsertColumn({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,dataType:column.dataType,nullable:column.nullable==="YES"?1:Number(column.nullable??1),nullRate:column.nullRate??null,cardinality:column.cardinality??null,isSensitive:0,comment:column.comment||null,isPrimary:Number(column.isPrimary||0),isUnique:Number(column.isUnique||0),isIndexed:Number(column.isIndexed||0)});
+        store.upsertColumn({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,dataType:column.dataType,nullable:column.nullable==="YES"?1:Number(column.nullable??1),nullRate:column.nullRate??null,cardinality:column.cardinality??null,isSensitive:0,comment:column.comment||null,isPrimary:Number(column.isPrimary||0),isUnique:Number(column.isUnique||0),isIndexed:Number(column.isIndexed||0),keyConstraints:column.keyConstraints||[]});
         if(column.profile)store.upsertColumnProfile({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,...column.profile,sampledAt:new Date().toISOString()});
+        else if(profilingConfig.enabled)store.upsertColumnProfile({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,profile:{status:"unavailable",reason:column.profileUnavailableReason||"not_sampled",sampleValues:[]},sampleSize:0,profileVersion:COLUMN_PROFILE_VERSION,sampledAt:new Date().toISOString()});
         for(const value of column.enums||[]) store.upsertEnum({sourceId:source.id,tableName:table.tableName,columnName:column.columnName,...value});
       }
     }
@@ -81,24 +87,22 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     const relationKeys=[];
     const explicitKeys=new Set();
     for(const fk of schema.foreignKeys) {
-      const relation=store.upsertRelation({sourceId:source.id,...fk,cardinality:"N:1",confidence:1,overlapRatio:1,status:"confirmed",inferenceSource:"foreign_key"});
+      const relation=store.upsertRelation({sourceId:source.id,...fk,cardinality:fk.cardinality||"N:1",confidence:1,overlapRatio:null,status:"confirmed",inferenceSource:"foreign_key"});
       relationKeys.push(relationKey(relation));
       explicitKeys.add(relationKey(relation));
       explicitKeys.add(reverseRelationKey(relation));
+      for(const pair of relationPairs(relation)){const part={fromTable:relation.fromTable,toTable:relation.toTable,...pair};explicitKeys.add(relationKey(part));explicitKeys.add(reverseRelationKey(part));}
     }
     const currentColumns=new Set(schema.columns.map((column)=>`${column.tableName}.${column.columnName}`));
     for(const relation of store.listRelations(source.id).filter((item)=>item.status==="confirmed")) {
-      if(currentColumns.has(`${relation.fromTable}.${relation.fromCol}`)&&currentColumns.has(`${relation.toTable}.${relation.toCol}`)) relationKeys.push(relationKey(relation));
+      if(relation.inferenceSource!=="foreign_key"&&relationColumnsPresent(relation,currentColumns)) relationKeys.push(relationKey(relation));
     }
 
     emit(onProgress,72,"生成结构关系候选");
     const eligibleTableNames=store.listTables(source.id).filter((table)=>table.grade!=="C").map((table)=>table.tableName);
     const profilesByColumn=new Map(store.listTables(source.id).flatMap((table)=>store.listColumns(source.id,table.tableName).map((column)=>[`${table.tableName}.${column.columnName}`,column.profile])));
-    let candidates=generateRelationCandidates({schema,eligibleTableNames,maxCandidates:relationConfig.maxCandidates}).filter((candidate)=>!explicitKeys.has(candidate.key)).map((candidate)=>({...candidate,from:{...candidate.from,profile:profilingConfig.enabled?profilesByColumn.get(`${candidate.from.tableName}.${candidate.from.columnName}`)||null:null},to:{...candidate.to,profile:profilingConfig.enabled?profilesByColumn.get(`${candidate.to.tableName}.${candidate.to.columnName}`)||null:null}}));
-    emit(onProgress,74,"前置验证关系候选值域");
-    candidates=await mapLimit(candidates,relationConfig.overlapConcurrency,async(candidate)=>({...candidate,overlapRatio:candidate.structuralScore<0.3?null:await sampleRelationOverlap(connector,source,candidate.from,candidate.to,relationConfig.sampleLimit,{timeoutMs:relationConfig.overlapTimeoutMs})}));
     const knowledgePages=store.listKnowledge(source.id).filter((page)=>page.verified);
-    const modelResult=await relationModel.judge(candidates,{knowledgePages,onProgress:({completed,total,current})=>emit(onProgress,76+Math.round((completed/Math.max(1,total))*8),current)});
+    const {candidates,modelResult,diagnostics}=await analyzeRelationCandidates({schema:{...schema,columns:schema.columns.map(column=>({...column,profile:profilingConfig.enabled?profilesByColumn.get(`${column.tableName}.${column.columnName}`)||null:null}))},eligibleTableNames,model:relationModel,connector,source,config:relationConfig,knowledgePages,explicitKeys,onProgress:({completed,total,current})=>emit(onProgress,76+Math.round((completed/Math.max(1,total))*8),current)});
     const candidatesById=new Map(candidates.map((candidate)=>[candidate.id,candidate]));
     let suggestedCount=0;
     let rejectedCount=0;
@@ -106,7 +110,8 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     for(const decision of modelResult.decisions) {
       const candidate=candidatesById.get(decision.candidateId);
       if(!candidate) continue;
-      const isSuggested=(decision.decision==="relation"&&decision.confidence>=relationConfig.minConfidence)||(decision.decision==="uncertain"&&decision.confidence>=Math.max(0.7,relationConfig.minConfidence));
+      // Uncertainty is a review item, never evidence that a relationship does not exist.
+      const isSuggested=decision.decision!=="none"||decision.confidence<relationConfig.minConfidence;
       const overlapRatio=candidate.overlapRatio??null;
       const confidence=clamp(decision.confidence*0.60+candidate.structuralScore*0.25+(overlapRatio??0)*0.15);
       const status=isSuggested?"review":"rejected";
@@ -114,7 +119,8 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
         sourceId:source.id,
         fromTable:candidate.from.tableName,fromCol:candidate.from.columnName,
         toTable:candidate.to.tableName,toCol:candidate.to.columnName,
-        cardinality:normalizeCardinality(decision.cardinality,candidate),confidence,overlapRatio,status,
+        columnPairs:candidate.columnPairs,
+        cardinality:normalizeCardinality(decision.cardinality,candidate),confidence,overlapRatio,dataEvidence:candidate.dataEvidence,status,
         inferenceSource:"model",modelDecision:decision.decision,modelConfidence:decision.confidence,
         modelReason:decision.reason,modelName:modelResult.modelName,
         structuralScore:candidate.structuralScore,structuralReason:candidate.structuralReasons.join("；"),
@@ -123,18 +129,25 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
       if(relation.status==="confirmed") continue;
       if(status==="review") {
         suggestedCount++;
-        store.addQuestion({sourceId:source.id,kind:"JOIN 路径",scope:"table",tableName:relation.fromTable,columnName:relation.fromCol,relationId:relation.id,question:`${relation.fromTable}.${relation.fromCol} 是否关联 ${relation.toTable}.${relation.toCol}？`,evidence:modelEvidence(relation),options:["确认该关联","保留候选","不允许关联"]});
+        store.addQuestion({sourceId:source.id,kind:"JOIN 路径",scope:"table",tableName:relation.fromTable,columnName:relation.fromCol,relationId:relation.id,question:`是否确认关联 ${formatRelation(relation)}？`,evidence:modelEvidence(relation),options:["确认该关联","保留候选","不允许关联"]});
       } else rejectedCount++;
     }
 
-    store.saveRelationAnalysis({sourceId:source.id,modelStatus:modelResult.status,modelName:modelResult.modelName,candidateCount:candidates.length,judgedCount:modelResult.decisions.length,suggestedCount,rejectedCount,error:modelResult.error||null});
+    const judgedIds=new Set(modelResult.decisions.map(item=>item.candidateId));
+    for(const candidate of candidates.filter(item=>!judgedIds.has(item.id))){
+      const prior=store.getRelationByKey(source.id,candidate.from.tableName,candidate.from.columnName,candidate.to.tableName,candidate.to.columnName,candidate.columnPairs);
+      const relation=prior&&(["confirmed","denied"].includes(prior.status)||prior.inferenceSource==="document")?prior:store.upsertRelation({sourceId:source.id,fromTable:candidate.from.tableName,fromCol:candidate.from.columnName,toTable:candidate.to.tableName,toCol:candidate.to.columnName,columnPairs:candidate.columnPairs,status:"review",inferenceSource:"model",modelDecision:"uncertain",modelReason:"模型尚未完成有效判断，请重试或补充业务依据",structuralScore:candidate.structuralScore,overlapRatio:candidate.overlapRatio,dataEvidence:candidate.dataEvidence});
+      relationKeys.push(relationKey(relation));
+      if(relation.status==="review")store.addQuestion({sourceId:source.id,kind:"JOIN 路径",scope:"table",tableName:relation.fromTable,columnName:relation.fromCol,relationId:relation.id,question:`是否确认关联 ${formatRelation(relation)}？`,evidence:"模型尚未完成有效判断，不能作为否定关系的依据。",options:["确认该关联","保留候选","不允许关联"]});
+    }
+    store.saveRelationAnalysis({sourceId:source.id,modelStatus:modelResult.status,modelName:modelResult.modelName,candidateCount:candidates.length,judgedCount:modelResult.decisions.length,suggestedCount,rejectedCount,error:modelResult.error||null,diagnostics});
     if(modelResult.status!=="completed") {
       for(const relation of store.listRelations(source.id).filter((item)=>item.status==="review")) {
-        if(currentColumns.has(`${relation.fromTable}.${relation.fromCol}`)&&currentColumns.has(`${relation.toTable}.${relation.toCol}`)) relationKeys.push(relationKey(relation));
+        if(relationColumnsPresent(relation,currentColumns)) relationKeys.push(relationKey(relation));
       }
     }
     for(const relation of store.listRelations(source.id,false,true).filter((item)=>item.inferenceSource==="document"&&["review","confirmed","denied"].includes(item.status))) {
-      if(currentColumns.has(`${relation.fromTable}.${relation.fromCol}`)&&currentColumns.has(`${relation.toTable}.${relation.toCol}`))relationKeys.push(relationKey(relation));
+      if(relationColumnsPresent(relation,currentColumns))relationKeys.push(relationKey(relation));
     }
     store.finishSchemaRefresh(source.id,normalized,[...new Set(relationKeys)]);
     store.closeStaleRelationQuestions(source.id);
@@ -193,13 +206,13 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
 }
 
 function emit(callback,progress,currentStep) { callback({progress,total:100,currentStep}); }
-function relationKey(item) { return `${item.fromTable}.${item.fromCol}>${item.toTable}.${item.toCol}`; }
-function reverseRelationKey(item) { return `${item.toTable}.${item.toCol}>${item.fromTable}.${item.fromCol}`; }
+function relationKey(item) { return physicalRelationKey(item); }
+function reverseRelationKey(item) { return physicalRelationKey(reverseRelation(item)); }
 function normalizeSchema(schema) {
   return {
     tables:[...(schema.tables||[])].map(({tableName,rowEstimate=0,comment=null})=>({tableName,rowEstimate,comment})).sort((a,b)=>a.tableName.localeCompare(b.tableName)),
-    columns:[...(schema.columns||[])].map(({tableName,columnName,dataType,nullable=null,isPrimary=0,isUnique=0,isIndexed=0,comment=null})=>({tableName,columnName,dataType,nullable,isPrimary:Number(isPrimary||0),isUnique:Number(isUnique||0),isIndexed:Number(isIndexed||0),comment})).sort((a,b)=>`${a.tableName}.${a.columnName}`.localeCompare(`${b.tableName}.${b.columnName}`)),
-    foreignKeys:[...(schema.foreignKeys||[])].map(({fromTable,fromCol,toTable,toCol})=>({fromTable,fromCol,toTable,toCol})).sort((a,b)=>relationKey(a).localeCompare(relationKey(b))),
+    columns:[...(schema.columns||[])].map(({tableName,columnName,dataType,nullable=null,isPrimary=0,isUnique=0,isIndexed=0,comment=null,keyConstraints=[]})=>({tableName,columnName,dataType,nullable,isPrimary:Number(isPrimary||0),isUnique:Number(isUnique||0),isIndexed:Number(isIndexed||0),comment,keyConstraints})).sort((a,b)=>`${a.tableName}.${a.columnName}`.localeCompare(`${b.tableName}.${b.columnName}`)),
+    foreignKeys:[...(schema.foreignKeys||[])].map((relation)=>({fromTable:relation.fromTable,fromCol:relation.fromCol,toTable:relation.toTable,toCol:relation.toCol,columnPairs:relationPairs(relation)})).sort((a,b)=>relationKey(a).localeCompare(relationKey(b))),
   };
 }
 function checksumSchema(schema) { return createHash("sha256").update(JSON.stringify(schema)).digest("hex"); }
@@ -219,29 +232,17 @@ function compareSchema(previous,current) {
   return {changed,previousVersion:null,addedTables,removedTables,changedTables,addedColumns,removedColumns};
 }
 
-export async function sampleRelationOverlap(connector,source,left,right,limit,{timeoutMs=10_000}={}) {
-  const safeLimit=Math.max(1,Math.min(2000,Number(limit)||500));
-  const controller=new AbortController();let timer;const work=(async()=>{
-    const leftColumn=quoteIdentifier(left.columnName);const rightColumn=quoteIdentifier(right.columnName);
-    const [leftRows]=await connector.query(source,`SELECT DISTINCT ${leftColumn} AS value FROM ${quoteIdentifier(left.tableName)} WHERE ${leftColumn} IS NOT NULL ORDER BY ${leftColumn} LIMIT ${safeLimit}`,[],controller.signal);
-    const [rightRows]=await connector.query(source,`SELECT DISTINCT ${rightColumn} AS value FROM ${quoteIdentifier(right.tableName)} WHERE ${rightColumn} IS NOT NULL ORDER BY ${rightColumn} LIMIT ${safeLimit}`,[],controller.signal);
-    if(!leftRows.length||!rightRows.length) return 0;
-    const rightValues=new Set(rightRows.map((row)=>String(row.value)));
-    return leftRows.filter((row)=>rightValues.has(String(row.value))).length/leftRows.length;
-  })().catch(()=>null);
-  const deadline=new Promise((resolve)=>{timer=setTimeout(()=>{controller.abort();resolve(null);},Math.max(100,Number(timeoutMs)||10_000));});
-  try{return await Promise.race([work,deadline]);}finally{clearTimeout(timer);}
-}
 
 function normalizeCardinality(cardinality,candidate) {
+  const fromUnique=candidate.from.isPrimary||candidate.from.isUnique,toUnique=candidate.to.isPrimary||candidate.to.isUnique;
+  if(fromUnique&&toUnique)return "1:1";
+  if(toUnique)return "N:1";
+  if(fromUnique)return "1:N";
+  if(candidate.dataEvidence?.multipleMatchCount>0&&["N:1","1:1"].includes(cardinality))return "N:N";
   if(cardinality&&cardinality!=="unknown") return cardinality;
-  if(candidate.to.isPrimary||candidate.to.isUnique) return candidate.from.isUnique?"1:1":"N:1";
   return "N:N";
 }
-function modelEvidence(relation) { const overlap=relation.overlapRatio==null?"未取得本地样本":`前置本地样本值域重叠 ${(relation.overlapRatio*100).toFixed(2)}%`;return `模型 ${relation.modelName||"未命名"} 判断：${relation.modelReason||"无理由"}；模型置信度 ${((relation.modelConfidence||0)*100).toFixed(1)}%；结构评分 ${((relation.structuralScore||0)*100).toFixed(1)}%；${overlap}；脱敏列画像与已核验知识摘要（如有）已作为判断证据。该建议未经人工确认，不会进入问数 JOIN 白名单。`; }
+function modelEvidence(relation) { return `模型 ${relation.modelName||"未命名"} 判断：${relation.modelReason||"无理由"}；模型置信度 ${((relation.modelConfidence||0)*100).toFixed(1)}%；结构评分 ${((relation.structuralScore||0)*100).toFixed(1)}%；${describeRelationEvidence(relation)}。列画像与已核验知识摘要（如有）已作为判断证据。确认后可作为本体关系生成的依据。`; }
 function clamp(value) { return Math.max(0,Math.min(1,value)); }
-
-function quoteIdentifier(value) { const identifier=String(value??"");if(!identifier||identifier.length>64||/[\0\r\n]/.test(identifier))throw new Error(`无效的数据库标识符：${identifier}`);return `\`${identifier.replaceAll("`","``")}\``; }
-async function mapLimit(items,limit,mapper) { const result=new Array(items.length);let next=0;const workers=Array.from({length:Math.min(Math.max(1,Number(limit)||1),items.length)},async()=>{while(true){const index=next++;if(index>=items.length)return;result[index]=await mapper(items[index],index);}});await Promise.all(workers);return result; }
 
 export const _internal={normalizeSchema,compareSchema,sampleOverlap:sampleRelationOverlap,normalizeCardinality};

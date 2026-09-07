@@ -68,6 +68,11 @@ export const config = {
     semanticThreshold: numberRatioFromEnv("RETRIEVAL_SEMANTIC_THRESHOLD", 0.55),
   },
   relationModel: {
+    proposalsEnabled:String(process.env.RELATION_PROPOSALS_ENABLED??"true").toLowerCase()==="true",
+    maxProposalBatches:integerRangeFromEnv("RELATION_PROPOSAL_MAX_BATCHES",1,100,12),
+    stratifiedSampling:String(process.env.RELATION_STRATIFIED_SAMPLING??"true").toLowerCase()==="true",
+    maxProbeQueries:integerRangeFromEnv("RELATION_MAX_PROBE_QUERIES",1,7,4),
+    maxResampleCandidates:integerRangeFromEnv("RELATION_MAX_RESAMPLE_CANDIDATES",0,100,40),
     maxCandidates:numberFromEnv("RELATION_MODEL_MAX_CANDIDATES",600),
     batchSize:numberFromEnv("RELATION_MODEL_BATCH_SIZE",8),
     timeoutMs:numberFromEnv("RELATION_MODEL_TIMEOUT_MS",180_000),

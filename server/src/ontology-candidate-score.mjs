@@ -29,7 +29,13 @@ export function createObjectStableKey({namespace,payload,tableName}={}) {
   return `object:${normalizeOntologyNamespace(namespace??payload?.namespace)}:${tables[0]}`;
 }
 
-export function createLinkStableKey({namespace,relation,relationId,sourceStableKey,targetStableKey,sourceTables=[],targetTables=[]}={}) {
+export function createLinkStableKey({namespace,relation,relationId,relationIds,sourceStableKey,targetStableKey,sourceTables=[],targetTables=[]}={}) {
+  if(relationIds?.length>1){
+    if(relationIds.some(id=>!Number.isInteger(Number(id))||Number(id)<=0)||new Set(relationIds.map(Number)).size!==relationIds.length)throw candidateError("ONTOLOGY_RELATION_ID_INVALID","Link 路径必须绑定不同的有效 relationId");
+    if(!sourceStableKey||!targetStableKey)throw candidateError("ONTOLOGY_LINK_ENDPOINT_STABLE_KEY_REQUIRED","Link 路径必须提供端点 stableKey");
+    const ids=relationIds.map(Number),canonical=[JSON.stringify([sourceStableKey,ids,targetStableKey]),JSON.stringify([targetStableKey,[...ids].reverse(),sourceStableKey])].sort()[0];
+    return `link:${normalizeOntologyNamespace(namespace)}:path:${createHash("sha256").update(canonical).digest("hex").slice(0,24)}`;
+  }
   const id=Number(relationId??relation?.id);
   if(!Number.isInteger(id)||id<=0)throw candidateError("ONTOLOGY_RELATION_ID_INVALID","Link 候选必须绑定有效 relationId，才能生成 stableKey");
   if(!sourceStableKey||!targetStableKey)throw candidateError("ONTOLOGY_LINK_ENDPOINT_STABLE_KEY_REQUIRED","Link 候选的两个端点必须提供 stableKey");
@@ -50,6 +56,7 @@ export function createOntologyCandidateStableKey(candidate,context={}) {
     namespace:candidate.namespace,
     relation,
     relationId,
+    relationIds:(candidate.payload.relationMappings||[]).map(item=>Number(item.relationId??item)),
     sourceStableKey:candidate.sourceStableKey||endpoints.source?.stableKey,
     targetStableKey:candidate.targetStableKey||endpoints.target?.stableKey,
     sourceTables:mappedTables(endpoints.source?.payload),
@@ -81,7 +88,7 @@ export function scoreOntologyCandidate(candidate,options={}) {
       if(Number(endpoint.sourceId)!==Number(candidate.sourceId))errors.push(issue("ONTOLOGY_CANDIDATE_CROSS_SOURCE_MAPPING","payload","Link 端点与候选不属于同一数据源"));
     }
     if(endpoints.source&&endpoints.target) {
-      schemaValidation=validateSemanticSchema({name:"candidate_validation",objectTypes:[endpoints.source.payload,endpoints.target.payload],linkTypes:[candidate.payload]},catalog);
+      schemaValidation=validateSemanticSchema({name:"candidate_validation",objectTypes:[...new Map([endpoints.source,endpoints.target].map(item=>[item.id,item.payload])).values()],linkTypes:[candidate.payload]},catalog);
       errors.push(...schemaValidation.errors);warnings.push(...schemaValidation.warnings);
     }
   }

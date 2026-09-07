@@ -14,6 +14,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Independent checkouts are linted from their own project roots.
+    ".claude/worktrees/**",
   ]),
   eslint.configs.recommended,
   ...tseslint.configs.recommended,

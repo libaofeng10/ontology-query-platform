@@ -1,3 +1,4 @@
+import { relationPairs } from "./physical-relation.mjs";
 import { createHash } from "node:crypto";
 import { callLlmJson, isLlmConfigured } from "./llm-client.mjs";
 import { ontologyCandidateGeneratorInternal } from "./ontology-candidate-generator.mjs";
@@ -133,7 +134,7 @@ export function createOntologyDomainPlanner({store,config,fetchImpl=globalThis.f
   function domainChecksum({tables,relations}){
     const normalized={
       tables:tables.map((table)=>({tableName:table.tableName,grade:table.grade,comment:table.comment??null})).sort((a,b)=>a.tableName.localeCompare(b.tableName)),
-      relations:relations.map((relation)=>({fromTable:relation.fromTable,fromCol:relation.fromCol,toTable:relation.toTable,toCol:relation.toCol})).sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b))),
+      relations:relations.map((relation)=>({fromTable:relation.fromTable,fromCol:relation.fromCol,toTable:relation.toTable,toCol:relation.toCol,columnPairs:relationPairs(relation),status:relation.status})).sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b))),
     };
     return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
   }

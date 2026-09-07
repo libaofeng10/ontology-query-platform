@@ -142,10 +142,11 @@ npm run dev            # 同时启动 Web 与 API
 npm run dev:web        # 仅启动 Web
 npm run dev:api        # 仅启动 API（watch 模式）
 npm run lint           # ESLint
+npm run typecheck      # TypeScript 类型检查
 npm run build          # 生产构建
 npm test               # 服务端测试
 npm run test:rendered  # 页面渲染测试
-npm run check          # lint + build + 全部测试
+npm run check          # 类型检查 + lint + build + 全部测试
 ```
 
 ## Docker Compose 部署

@@ -1,3 +1,4 @@
+import { relationPairs, relationKey } from "./physical-relation.mjs";
 import { createHash } from "node:crypto";
 import { redactTypedLiterals } from "./query-column-semantics.mjs";
 import { buildQueryResultContract } from "./query-result-contract.mjs";
@@ -240,13 +241,14 @@ function chooseRelations(catalogRelations, tableNames) {
       fromCol: relation.fromCol,
       toTable: relation.toTable,
       toCol: relation.toCol,
+      columnPairs: relationPairs(relation),
       cardinality: safeText(relation.cardinality, 80),
       status: safeText(relation.status, 40),
       confidence: finiteNumber(relation.confidence),
       source: safeText(relation.inferenceSource, 80),
     });
   }
-  return dedupeBy(relations, (item) => `${item.fromTable}.${item.fromCol}->${item.toTable}.${item.toCol}`);
+  return dedupeBy(relations, relationKey);
 }
 
 function buildPublicColumns({ catalog, schema, tableNames }) {
@@ -265,6 +267,7 @@ function buildPublicColumns({ catalog, schema, tableNames }) {
           dataType: safeText(column.dataType, 80),
           nullable: column.nullable == null ? null : Boolean(column.nullable),
           isPrimary: Boolean(column.isPrimary),
+          ...(column.keyConstraints?.length?{keyConstraints:column.keyConstraints}:{}),
           isUnique: Boolean(column.isUnique),
           isIndexed: Boolean(column.isIndexed),
           comment: safeText(column.comment, MAX_SNAPSHOT_TEXT),
@@ -341,7 +344,7 @@ function buildPublicObjects(schema, columnsByTable, tableNames) {
       apiName: safeText(object.apiName, 120),
       displayName: safeText(object.displayName, 200),
       description: safeText(object.description, MAX_SNAPSHOT_TEXT),
-      primaryKey: safeText(object.primaryKey, 120),
+      primaryKey: Array.isArray(object.primaryKey)?object.primaryKey.map(name=>safeText(name,120)):safeText(object.primaryKey,120),
       parent: safeText(object.parent, 120),
       properties,
     });
@@ -363,6 +366,7 @@ function buildPublicLinks(schema, relations, tableNames) {
         fromCol: relation.fromCol,
         toTable: relation.toTable,
         toCol: relation.toCol,
+      columnPairs: relationPairs(relation),
       });
     }
     if (!mappings.length) continue;
@@ -656,6 +660,7 @@ function normalizeColumn(item = {}) {
     dataType: safeText(item.dataType ?? item.data_type, 80),
     nullable: item.nullable,
     isPrimary: flag(item.isPrimary, item.is_primary),
+    ...(Array.isArray(item.keyConstraints)&&item.keyConstraints.length?{keyConstraints:item.keyConstraints}:{}),
     isUnique: flag(item.isUnique, item.is_unique),
     isIndexed: flag(item.isIndexed, item.is_indexed),
     // Accept all historical catalog spellings.  Do not use Boolean(value):
@@ -680,6 +685,7 @@ function normalizeRelation(item = {}) {
     fromCol: normalizeIdentifier(item.fromCol ?? item.from_col),
     toTable: normalizeIdentifier(item.toTable ?? item.to_table),
     toCol: normalizeIdentifier(item.toCol ?? item.to_col),
+    columnPairs: relationPairs({...item,fromCol:item.fromCol??item.from_col,toCol:item.toCol??item.to_col}).map(pair=>({fromCol:normalizeIdentifier(pair.fromCol),toCol:normalizeIdentifier(pair.toCol)})),
     cardinality: safeText(item.cardinality, 80),
     status: safeText(item.status, 40).toLowerCase(),
     confidence: finiteNumber(item.confidence),

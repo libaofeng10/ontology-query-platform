@@ -28,7 +28,7 @@ export function semanticSubtypeNames(schema) {
 
 function compareObject(current,base,changes) {
   const prefix=`objectTypes.${current.apiName}`;
-  if(current.primaryKey!==base.primaryKey) push(changes,"object","changed",prefix,current.displayName||current.apiName,"breaking",`主键由 ${base.primaryKey||"(空)"} 变为 ${current.primaryKey||"(空)"}`);
+  if(JSON.stringify(current.primaryKey)!==JSON.stringify(base.primaryKey)) push(changes,"object","changed",prefix,current.displayName||current.apiName,"breaking",`主键由 ${base.primaryKey||"(空)"} 变为 ${current.primaryKey||"(空)"}`);
   if((current.parent||null)!==(base.parent||null))push(changes,"object","changed",`${prefix}.parent`,current.displayName||current.apiName,"breaking",`父类型由 ${base.parent||"(无)"} 变为 ${current.parent||"(无)"}`,"object_parent_changed");
   if(discriminatorSignature(current)!==discriminatorSignature(base))push(changes,"object","changed",`${prefix}.discriminator`,current.displayName||current.apiName,"breaking",discriminatorDetail(current,base),"discriminator_changed");
   if(termBindingSignature(current)!==termBindingSignature(base))push(changes,"object","changed",`${prefix}.termBinding`,current.displayName||current.apiName,"compatible","术语锚点绑定发生变化","term_binding_changed");

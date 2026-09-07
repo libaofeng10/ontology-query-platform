@@ -1,3 +1,4 @@
+import { relationPairs } from "./physical-relation.mjs";
 import { diffSemanticSchemas } from "./semantic-schema-diff.mjs";
 
 export function analyzeSemanticSchemaImpact(currentSchema,baseSchema,{cases=[],relations=[],availableTables=null}={}) {
@@ -82,7 +83,7 @@ function dependencyForChange(change,current,base,relationById) {
       for(const token of [link.apiName,link.displayName,link.source,link.target])semanticTokens.add(token);
       for(const mapping of link.relationMappings||[]) {
         const relation=relationById.get(Number(mapping.relationId));
-        if(relation) for(const token of [relation.fromTable,relation.fromCol,relation.toTable,relation.toCol])physicalTokens.add(token);
+        if(relation) for(const token of [relation.fromTable,relation.toTable,...relationPairs(relation).flatMap(pair=>[pair.fromCol,pair.toCol])])physicalTokens.add(token);
       }
     }
   }

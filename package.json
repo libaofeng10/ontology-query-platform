@@ -19,7 +19,8 @@
     "eval:loop-v2:readiness": "node scripts/eval-readiness.mjs --manifest examples/evaluation/loop-v2-rock-readonly.candidate.json",
     "claude:preflight": "node scripts/claude-query-preflight.mjs",
     "eval:claude:local": "node scripts/claude-query-eval-local.mjs",
-    "check": "npm run lint && npm run build && npm run test && npm run test:rendered",
+    "typecheck": "tsc --noEmit --incremental false",
+    "check": "npm run typecheck && npm run lint && npm run build && npm run test && npm run test:rendered",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {

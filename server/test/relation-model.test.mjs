@@ -98,6 +98,7 @@ test("model-discovered relations require exact human confirmation before joining
     if(sql.includes("information_schema.TABLES")) return [tables];
     if(sql.includes("information_schema.COLUMNS")) return [columns];
     if(sql.includes("information_schema.KEY_COLUMN_USAGE")) return [[]];
+    if(sql.includes("matchCount")) return [[{value:1,matchCount:1},{value:2,matchCount:1}]];
     if(sql.includes("sales_order")&&sql.includes("customer_id")) return [[{value:1},{value:2}]];
     if(sql.includes("crm_customer")&&sql.includes("`id`")) return [[{value:1},{value:2}]];
     throw new Error(`unexpected query: ${sql}`);
@@ -112,7 +113,9 @@ test("model-discovered relations require exact human confirmation before joining
   assert.equal(store.listRelations(source.id,true).length,0,"unconfirmed model output must not enter the SQL join allowlist");
   const question=store.listQuestions(source.id)[0];
   assert.equal(question.relationId,relations[0].id);
-  assert.match(question.evidence,/不会进入问数 JOIN 白名单/);
+  assert.match(question.evidence,/确认后可作为本体关系生成的依据/);
+  assert.match(question.evidence,/不代表全表统计/);
+  assert.equal(relations[0].dataEvidence.sampleSize,2);
   store.setRelationStatus(question.relationId,"confirmed");
   assert.equal(store.listRelations(source.id,true).length,1);
   store.close();

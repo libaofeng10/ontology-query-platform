@@ -1,0 +1,10 @@
+{
+  "version": "relation-truth-v1",
+  "name": "合成指标自检（不代表真实模型效果）",
+  "complete": true,
+  "tables": ["orders", "customer", "unrelated"],
+  "relations": [
+    {"fromTable":"orders","toTable":"customer","columnPairs":[{"fromCol":"tenant_id","toCol":"tenant_id"},{"fromCol":"customer_code","toCol":"code"}],"label":"relation","cardinality":"N:1"},
+    {"fromTable":"orders","toTable":"unrelated","columnPairs":[{"fromCol":"id","toCol":"id"}],"label":"none"}
+  ]
+}

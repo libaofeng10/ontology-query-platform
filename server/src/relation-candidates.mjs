@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { detectSensitiveField } from "./sensitive-fields.mjs";
+import { relationKey, relationPairs } from "./physical-relation.mjs";
+import { columnsAreUnique, uniqueColumnSets } from "./catalog-identity.mjs";
 
 const REFERENCE_SUFFIX = /(?:^|_)(id|no|code|key|uuid)$/i;
 const GENERIC_TABLE_TOKENS = new Set(["t", "tbl", "table", "sys", "biz", "data", "info", "base", "dim", "fact", "record", "records", "detail", "details"]);
-const SELF_REFERENCE_STEMS = new Set(["parent", "root", "upper", "previous", "prev"]);
+const SELF_REFERENCE_STEMS = new Set(["parent", "root", "upper", "previous", "prev", "manager", "supervisor"]);
 
 /**
  * Builds a bounded, table-balanced candidate set before any model call.
@@ -13,24 +14,28 @@ export function generateRelationCandidates({schema, eligibleTableNames, maxCandi
   const eligible=new Set(eligibleTableNames || schema.tables.map((table)=>table.tableName));
   const tables=(schema.tables||[]).filter((table)=>eligible.has(table.tableName));
   const columnsByTable=Object.groupBy((schema.columns||[]).filter((column)=>eligible.has(column.tableName)),(column)=>column.tableName);
-  const targetColumnsByTable=Object.fromEntries(tables.map((table)=>[table.tableName,(columnsByTable[table.tableName]||[]).filter((column)=>!detectSensitiveField(column.columnName).sensitive&&Boolean(column.isPrimary||column.isUnique||column.isIndexed))]));
+  const targetColumnsByTable=columnsByTable;
+  const uniqueKeysByTable=Object.fromEntries(Object.entries(columnsByTable).map(([name,columns])=>[name,uniqueColumnSets(columns)]));
   const candidates=new Map();
 
   for(const sourceTable of tables) {
     const sourceColumns=columnsByTable[sourceTable.tableName]||[];
     for(const sourceColumn of sourceColumns) {
-      const reference=referenceStem(sourceColumn.columnName);
-      if(!reference || sourceColumn.isPrimary || detectSensitiveField(sourceColumn.columnName).sensitive) continue;
+      const reference=referenceStem(sourceColumn.columnName)||{stem:normalizeName(sourceColumn.columnName),suffix:"semantic"};
       const ranked=[];
       for(const targetTable of tables) {
         const semanticScore=tableSemanticScore(reference.stem,sourceColumn,sourceTable,targetTable);
         const isSelf=sourceTable.tableName===targetTable.tableName;
         if(isSelf&&!SELF_REFERENCE_STEMS.has(reference.stem)) continue;
-        for(const targetColumn of targetColumnsByTable[targetTable.tableName]) {
+        for(const targetColumn of targetColumnsByTable[targetTable.tableName]||[]) {
           const sameColumn=normalizeName(targetColumn.columnName)===normalizeName(sourceColumn.columnName);
           const targetIsKey=Boolean(targetColumn.isPrimary||targetColumn.isUnique);
+          if(!targetIsKey&&(uniqueKeysByTable[targetTable.tableName]||[]).some(key=>key.length>1&&key.includes(targetColumn.columnName)))continue;
           const genericId=normalizeName(sourceColumn.columnName)==="id"&&normalizeName(targetColumn.columnName)==="id";
-          if(genericId || (!targetIsKey&&!(sameColumn&&targetColumn.isIndexed))) continue;
+          const unindexedSemanticKey=semanticScore>=0.55&&(normalizeName(targetColumn.columnName)==="id"||sameColumn);
+          if(genericId || (!targetIsKey&&!(sameColumn&&targetColumn.isIndexed)&&!unindexedSemanticKey)) continue;
+          if(isSelf&&sameColumn)continue;
+          if((reference.suffix==="semantic"||sourceColumn.isPrimary)&&semanticScore<0.55)continue;
           if(semanticScore<0.18&&!sameColumn) continue;
 
           const typeCompatible=compatibleType(sourceColumn.dataType,targetColumn.dataType);
@@ -42,9 +47,9 @@ export function generateRelationCandidates({schema, eligibleTableNames, maxCandi
             + (sourceColumn.isIndexed?0.05:0) + keyNameScore + (sameColumn?0.08:0) + 0.06,
           );
           const reasons=[
-            `字段后缀 ${reference.suffix}`,
+            reference.suffix==="semantic"?"字段名称或注释有业务引用语义":`字段后缀 ${reference.suffix}`,
             semanticReason(reference.stem,targetTable.tableName,semanticScore),
-            targetColumn.isPrimary?"目标字段为主键":targetColumn.isUnique?"目标字段有唯一索引":"目标字段已建索引",
+            targetColumn.isPrimary?"目标字段为主键":targetColumn.isUnique?"目标字段有唯一索引":targetColumn.isIndexed?"目标字段已建索引":"目标没有唯一性约束，需验证实际匹配",
             sameColumn?"字段名完全一致":null,
             "字段类型兼容",
           ].filter(Boolean);
@@ -56,7 +61,47 @@ export function generateRelationCandidates({schema, eligibleTableNames, maxCandi
     }
   }
 
+  for(const targetTable of tables){
+    const targetColumns=columnsByTable[targetTable.tableName]||[];
+    for(const key of uniqueColumnSets(targetColumns).filter(key=>key.length>1&&key.length<=8)){
+      for(const sourceTable of tables){
+        if(sourceTable.tableName===targetTable.tableName)continue;
+        const sourceColumns=columnsByTable[sourceTable.tableName]||[];
+        const pairs=key.map(toCol=>{
+          const target=targetColumns.find(column=>column.columnName===toCol);
+          const options=sourceColumns.filter(column=>compatibleType(column.dataType,target.dataType)&&(
+            column.columnName===toCol||normalizeName(column.columnName)===`${singular(normalizeName(targetTable.tableName))}_${normalizeName(toCol)}`||
+            (referenceStem(column.columnName)?.suffix===toCol&&tableSemanticScore(referenceStem(column.columnName).stem,column,sourceTable,targetTable)>=.55)
+          ));
+          return options.length===1?{fromCol:options[0].columnName,toCol}:null;
+        });
+        if(pairs.some(pair=>!pair)||pairs.every(pair=>pair.fromCol===pair.toCol&&/^(tenant|org|company)_id$|^id$/i.test(pair.fromCol)))continue;
+        const candidate=validateRelationProposal({fromTable:sourceTable.tableName,toTable:targetTable.tableName,columnPairs:pairs,reason:"匹配完整联合唯一键，需验证元组与业务语义"},{schema,eligibleTableNames,origin:"rule",structuralScore:.65});
+        if(candidate)candidates.set(candidate.key,candidate);
+      }
+    }
+  }
   return fairLimit([...candidates.values()],maxCandidates);
+}
+
+export function validateRelationProposal(raw,{schema,eligibleTableNames,origin="model_proposal",structuralScore=.35}) {
+  const eligible=new Set(eligibleTableNames||schema.tables.map(table=>table.tableName));
+  if(!eligible.has(raw?.fromTable)||!eligible.has(raw?.toTable)||typeof raw.reason!=="string"||!raw.reason.trim())return null;
+  let pairs;try{pairs=relationPairs(raw);}catch{return null;}
+  if(pairs.length>8||new Set(pairs.map(pair=>pair.fromCol)).size!==pairs.length||new Set(pairs.map(pair=>pair.toCol)).size!==pairs.length)return null;
+  if(raw.fromTable===raw.toTable&&pairs.every(pair=>pair.fromCol===pair.toCol))return null;
+  const side=(tableName,field)=>{
+    const table=schema.tables.find(table=>table.tableName===tableName);
+    const all=schema.columns.filter(column=>column.tableName===tableName);
+    const columns=pairs.map(pair=>all.find(column=>column.columnName===pair[field]));
+    if(!table||columns.some(column=>!column))return null;
+    return {tableName,tableComment:table.comment||null,...columns[0],columnName:columns[0].columnName,columnNames:columns.map(column=>column.columnName),columns,isUnique:columnsAreUnique(all,columns.map(column=>column.columnName))};
+  };
+  const from=side(raw.fromTable,"fromCol"),to=side(raw.toTable,"toCol");
+  if(!from||!to||from.columns.some((column,index)=>!compatibleType(column.dataType,to.columns[index].dataType)))return null;
+  if(!to.isUnique&&uniqueColumnSets(schema.columns.filter(column=>column.tableName===raw.toTable)).some(key=>to.columnNames.length<key.length&&to.columnNames.every(name=>key.includes(name))))return null;
+  const key=relationKey({...raw,columnPairs:pairs});
+  return {id:`rel_${createHash("sha256").update(key).digest("hex").slice(0,16)}`,key,from,to,columnPairs:pairs,origin,structuralScore,structuralReasons:[raw.reason.trim().slice(0,1000)]};
 }
 
 function makeCandidate(fromTable,fromColumn,toTable,toColumn,structuralScore,reasons) {
@@ -64,6 +109,7 @@ function makeCandidate(fromTable,fromColumn,toTable,toColumn,structuralScore,rea
   return {
     id:`rel_${createHash("sha256").update(key).digest("hex").slice(0,16)}`,
     key,
+    columnPairs:[{fromCol:fromColumn.columnName,toCol:toColumn.columnName}],origin:"rule",
     from:{tableName:fromTable.tableName,tableComment:fromTable.comment||null,columnName:fromColumn.columnName,columnComment:fromColumn.comment||null,dataType:fromColumn.dataType,isPrimary:Boolean(fromColumn.isPrimary),isUnique:Boolean(fromColumn.isUnique),isIndexed:Boolean(fromColumn.isIndexed)},
     to:{tableName:toTable.tableName,tableComment:toTable.comment||null,columnName:toColumn.columnName,columnComment:toColumn.comment||null,dataType:toColumn.dataType,isPrimary:Boolean(toColumn.isPrimary),isUnique:Boolean(toColumn.isUnique),isIndexed:Boolean(toColumn.isIndexed)},
     structuralScore:Number(structuralScore.toFixed(4)),

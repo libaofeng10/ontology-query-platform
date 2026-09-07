@@ -1,3 +1,5 @@
+import { describeRelationEvidence } from "./relation-data-evidence.mjs";
+import { relationSlug, formatRelation } from "./physical-relation.mjs";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -32,8 +34,8 @@ export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
       pushIfMissing(pages,keys,{id:`table:${table.tableName}`,sourceId,pageType:"table",slug:table.tableName,title:table.comment?`${table.tableName} · ${table.comment}`:table.tableName,aliases:[],tables:[table.tableName],content:table.comment||"数据库探查生成的表结构页面",sqlContent:null,antiExamples:null,verified:false,owner:null,verifiedAt:null,updatedAt:table.lastProbeAt,grade:table.grade});
     }
     for(const relation of store.listRelations(sourceId)) {
-      const slug=`${relation.fromTable}-${relation.fromCol}-${relation.toTable}-${relation.toCol}`;
-      pushIfMissing(pages,keys,{id:`join:${relation.id}`,sourceId,pageType:"join",slug,title:`${relation.fromTable}.${relation.fromCol} → ${relation.toTable}.${relation.toCol}`,aliases:[],tables:[relation.fromTable,relation.toTable],content:`${relation.cardinality} · 值域重叠 ${relation.overlapRatio==null?"待探针":`${(relation.overlapRatio*100).toFixed(2)}%`}`,sqlContent:`${relation.fromTable}.${relation.fromCol} = ${relation.toTable}.${relation.toCol}`,antiExamples:"N 侧聚合到实体时检查 DISTINCT。",verified:relation.status==="confirmed",owner:null,verifiedAt:null,updatedAt:null});
+      const slug=relationSlug(relation);
+      pushIfMissing(pages,keys,{id:`join:${relation.id}`,sourceId,pageType:"join",slug,title:formatRelation(relation),aliases:[],tables:[relation.fromTable,relation.toTable],content:`${relation.cardinality} · ${describeRelationEvidence(relation)}`,sqlContent:formatRelation(relation),antiExamples:"N 侧聚合到实体时检查 DISTINCT。",verified:relation.status==="confirmed",owner:null,verifiedAt:null,updatedAt:null});
     }
     for(const rule of store.listRules(sourceId)) {
       const slug=slugify(rule.name);
@@ -57,7 +59,7 @@ export function createKnowledgeService({store,wikiDir,embeddingIndex}) {
   }
 
   function assertCatalogOwnership(sourceId,page) {
-    if(page.pageType==="join"&&store.listRelations(sourceId,false,true).some((relation)=>page.slug===`${relation.fromTable}-${relation.fromCol}-${relation.toTable}-${relation.toCol}`)) {
+    if(page.pageType==="join"&&store.listRelations(sourceId,false,true).some((relation)=>page.slug===relationSlug(relation))) {
       throw httpError(409,"该关系由数据源与本体维护，请在关系确认中更新，避免生成两份定义");
     }
     if(page.pageType==="rule"&&store.listRules(sourceId).some((rule)=>[slugify(rule.name),`catalog-rule-${rule.id}`].includes(page.slug))) {

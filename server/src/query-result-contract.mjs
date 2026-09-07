@@ -1,6 +1,7 @@
 // A query result contract sits above the SQL safety guard. The guard proves a
 // statement is safe to execute; this module proves its result shape and physical
 // lineage still satisfy the business capabilities extracted from the question.
+import { relationPairs } from "./physical-relation.mjs";
 
 export const QUERY_RESULT_CONTRACT_VERSION="result-contract-v1";
 
@@ -44,6 +45,7 @@ export function buildQueryResultContract(intent,retrievalEvidence=[],semanticCon
     closedWorldRowDomain:closedWorldRowDomainEnabled(intent),
     slots,
     semanticBinding:semanticBinding.binding,
+    semanticRelationBindings:semanticBinding.relations||[],
     bindingErrors:semanticBinding.errors,
     blockingAmbiguities:(intent?.ambiguities||[]).filter((item)=>item.blocking),
   };
@@ -413,6 +415,12 @@ function expectedValidityPredicates(slot,shape) {
 }
 
 function validateClosedWorldRowDomain(contract,shape,slots,errors) {
+  const roleAtoms=new Set();
+  for(const relation of contract.semanticRelationBindings||[]){
+    const matches=semanticRelationAtoms(relation,shape);
+    if(!matches)errors.push(issue("ONTOLOGY_ROLE_RELATION_MISMATCH","角色关系必须保留完整列组和对应表实例",{relationId:relation.relationId,fromAlias:relation.fromAlias,toAlias:relation.toAlias}));
+    else for(const atom of matches)roleAtoms.add(atom);
+  }
   const allowedPairs=new Set(slots.flatMap((slot)=>(slot.bindingPaths||[]).flatMap((path)=>path.slice(1).map((table,index)=>relationTablePair(path[index],table)))));
   const allowedGroupColumns=new Set(slots.filter((slot)=>slot.kind==="dimension"||slot.kind==="time"&&contract?.shape?.kind==="trend").flatMap((slot)=>slot.columns||[]).map(normalizeColumnKey));
   const validityKeys=new Set(slots.flatMap((slot)=>[
@@ -445,7 +453,7 @@ function validateClosedWorldRowDomain(contract,shape,slots,errors) {
     if(atom.kind==="unsupported") {unauthorized.push({...atom,reason:atom.reason||"unprovable_predicate"});continue;}
     if(atom.kind==="relation") {
       const pair=relationTablePair(atom.left?.table,atom.right?.table);
-      if(atom.source!=="join_on"||!relationIdentifier(atom.relationId)||!allowedPairs.has(pair))unauthorized.push({...atom,reason:"relation_not_declared_by_binding_path"});
+      if(!roleAtoms.has(atom)&&(atom.source!=="join_on"||!relationIdentifier(atom.relationId)||!allowedPairs.has(pair)))unauthorized.push({...atom,reason:"relation_not_declared_by_binding_path"});
       continue;
     }
     if(atom.kind==="predicate") {
@@ -481,13 +489,26 @@ function validateClosedWorldRowDomain(contract,shape,slots,errors) {
   ));
 }
 
+function semanticRelationAtoms(relation,shape){
+  const instance=(table,alias)=>{const matches=[...shape.activeInstances.entries()].filter(([,item])=>item.table===table&&item.alias===alias);return matches.length===1?matches[0][0]:null;};
+  const from=instance(relation.fromTable,relation.fromAlias),to=instance(relation.toTable,relation.toAlias);
+  if(!from||!to||from===to)return null;
+  const matches=relation.columnPairs.map(pair=>(shape.rowDomainAtoms||[]).find(atom=>{
+    if(atom.kind!=="relation"||atom.source!=="join_on")return false;
+    const direct=atom.left?.instance===from&&atom.right?.instance===to,reverse=atom.right?.instance===from&&atom.left?.instance===to;
+    const left=direct?atom.left:reverse?atom.right:null,right=direct?atom.right:reverse?atom.left:null;
+    return left?.column===`${relation.fromTable}.${pair.fromCol}`&&right?.column===`${relation.toTable}.${pair.toCol}`;
+  }));
+  return matches.every(Boolean)?matches:null;
+}
+
 function matchesSemanticRowDomain(atom,slot,shape) {
   if(atom?.kind!=="predicate"||atom.source!=="where"||atom.expressionKind!=="direct_column")return false;
   const expectedColumn=normalizeColumnKey((slot.columns||[])[0]||slot.column);
   const column=normalizeColumnKey(atom.column);
   if(!expectedColumn||column!==expectedColumn)return false;
   const table=column.split(".")[0];
-  const instances=[...(shape.activeInstances||new Map()).entries()].filter(([,item])=>item.table===table).map(([id])=>id);
+  const instances=[...(shape.activeInstances||new Map()).entries()].filter(([,item])=>item.table===table&&(!slot.alias||item.alias===slot.alias)).map(([id])=>id);
   if(instances.length!==1||(atom.origins||[]).length!==1||atom.origins[0]!==instances[0])return false;
   const expected=(slot.values||[]).map(semanticLiteralKey).sort();
   if(!expected.length)return false;
@@ -768,8 +789,9 @@ function aggregationMatches(expected,item) {
 function relationCatalogFromVerdict(verdict) {
   const result=new Map();const joins=verdict?.joins||[];const ids=verdict?.joinRelationIds||[];
   for(let index=0;index<joins.length&&index<ids.length;index++) {
-    const relationId=relationIdentifier(ids[index]);const endpoints=parsePhysicalJoin(joins[index]);
-    if(relationId&&endpoints)result.set(relationEdgeKey(endpoints[0],endpoints[1]),relationId);
+    const relationId=relationIdentifier(ids[index]);
+    const parts=String(joins[index]||"").split(/\s+AND\s+/i).map(parsePhysicalJoin);
+    if(relationId&&parts.length&&parts.every(Boolean))for(const endpoints of parts)result.set(relationEdgeKey(endpoints[0],endpoints[1]),relationId);
   }
   return result;
 }
@@ -1188,7 +1210,7 @@ function limitSpec(limit){const values=limit?.value||[];const numbers=values.map
 
 function publicShape(shape) {return {selectedColumns:[...shape.selectedColumns],whereColumns:[...shape.whereColumns],rangePredicates:shape.rangePredicates,filterPredicates:shape.filterPredicates,rowDomainAtoms:shape.rowDomainAtoms,groupColumns:[...shape.groupColumns],groupBuckets:shape.groupBuckets,groupItems:shape.groupItems,aggregates:shape.aggregates.map(publicAggregate),ratioExpressions:shape.ratioExpressions,ratioColumns:[...shape.ratioColumns],ratioSignatures:shape.ratioSignatures,orderBy:shape.orderBy,effectiveTables:[...shape.effectiveTables],activeInstances:publicInstances(shape.activeInstances),activeJoinEdges:publicJoinEdges(shape.activeJoinEdges),requestedLimit:shape.requestedLimit,requestedOffset:shape.requestedOffset,limit:shape.limit,offset:shape.offset};}
 function publicAggregate(item){return {name:item.name,distinct:item.distinct,columns:item.columns,alias:item.alias};}
-function publicSlot(slot){return {id:slot.id,kind:slot.kind,value:slot.value,values:slot.values,role:slot.role,required:slot.required,immutable:slot.immutable,source:slot.source,evidenceLevel:slot.evidenceLevel,ontologySchemaVersion:slot.ontologySchemaVersion,rootObject:slot.rootObject,object:slot.object,owner:slot.owner,table:slot.table,column:slot.column,tables:slot.tables,columns:slot.columns,filterBindings:slot.filterBindings||[],labelColumns:slot.labelColumns,identityColumns:slot.identityColumns,bindingTables:slot.bindingTables,bindingColumns:slot.bindingColumns,bindingRelationIds:slot.bindingRelationIds,bindingValidityPredicates:slot.bindingValidityPredicates,executionValidityPredicates:slot.executionValidityPredicates};}
+function publicSlot(slot){return {id:slot.id,kind:slot.kind,value:slot.value,values:slot.values,role:slot.role,required:slot.required,immutable:slot.immutable,source:slot.source,evidenceLevel:slot.evidenceLevel,ontologySchemaVersion:slot.ontologySchemaVersion,rootObject:slot.rootObject,object:slot.object,owner:slot.owner,alias:slot.alias,table:slot.table,column:slot.column,tables:slot.tables,columns:slot.columns,filterBindings:slot.filterBindings||[],labelColumns:slot.labelColumns,identityColumns:slot.identityColumns,bindingTables:slot.bindingTables,bindingColumns:slot.bindingColumns,bindingRelationIds:slot.bindingRelationIds,bindingValidityPredicates:slot.bindingValidityPredicates,executionValidityPredicates:slot.executionValidityPredicates};}
 function issue(code,message,details={}) {return {code,stage:"intent",retryable:true,message,details};}
 function requirementCode(kind){return {subject:"INTENT_SUBJECT_DROPPED",dimension:"INTENT_DIMENSION_DROPPED",measure:"INTENT_MEASURE_DROPPED",time:"INTENT_TIME_ROLE_DROPPED"}[kind]||"INTENT_REQUIREMENT_DROPPED";}
 function kindLabel(kind){return {subject:"业务对象",dimension:"分析维度",measure:"统计指标",time:"时间角色"}[kind]||"语义要求";}
@@ -1228,7 +1250,14 @@ function normalizeSemanticContract(value) {
     ids.add(id);
     slots.push({...raw,id,table,column:columnName,tables:[table],columns:[column],values,operator:values.length===1?"eq":"in",required:true,immutable:true});
   }
-  return {binding,slots,errors};
+  const relations=[];
+  for(const raw of (Array.isArray(value.relationBindings)?value.relationBindings:[]).slice(0,120)){
+    try{
+      if(!binding.ontologySchemaVersion||!binding.rootObject||!binding.immutable||!relationIdentifier(raw.relationId)||!raw.fromTable||!raw.toTable||!raw.fromAlias||!raw.toAlias||raw.fromAlias===raw.toAlias)throw new Error("invalid");
+      relations.push({...raw,fromTable:normalizeTableName(raw.fromTable),toTable:normalizeTableName(raw.toTable),fromAlias:normalize(raw.fromAlias),toAlias:normalize(raw.toAlias),columnPairs:relationPairs(raw).map(pair=>({fromCol:normalize(pair.fromCol),toCol:normalize(pair.toCol)}))});
+    }catch{errors.push({message:"角色关系缺少有效的版本、根对象、表实例或完整列组绑定"});}
+  }
+  return {binding,slots,errors,relations};
 }
 function semanticLiteralKey(item) {
   const valueType=String(item?.valueType||"").toLowerCase();

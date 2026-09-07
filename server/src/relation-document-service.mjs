@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { callLlmJson, isLlmConfigured } from "./llm-client.mjs";
-import { sampleRelationOverlap } from "./discovery-service.mjs";
+import { sampleRelationEvidence, describeRelationEvidence } from "./relation-data-evidence.mjs";
+import { relationPairs } from "./physical-relation.mjs";
 import { _internal as relationCandidateInternal } from "./relation-candidates.mjs";
 
 const ALLOWED_EXTENSIONS=new Set([".md",".markdown",".txt"]);
@@ -69,10 +70,12 @@ async function validateAndPersist({store,connector,source,assertion,fileName,see
   if(seen.has(key)||seen.has(reverse))return {...base,reason:"DUPLICATE_IN_DOCUMENT"};
   if(store.getRelationByKey(source.id,assertion.fromTable,assertion.fromColumn,assertion.toTable,assertion.toColumn)||store.getRelationByKey(source.id,assertion.toTable,assertion.toColumn,assertion.fromTable,assertion.fromColumn))return {...base,reason:"RELATION_ALREADY_EXISTS"};
   seen.add(key);seen.add(reverse);
-  const overlapRatio=await sampleRelationOverlap(connector,source,{tableName:assertion.fromTable,columnName:assertion.fromColumn},{tableName:assertion.toTable,columnName:assertion.toColumn},sampleLimit,{timeoutMs:overlapTimeoutMs});
+  if(store.listRelations(source.id,false,true).some(relation=>relationPairs(relation).length>1&&relationPairs(relation).some(pair=>(relation.fromTable===assertion.fromTable&&relation.toTable===assertion.toTable&&pair.fromCol===assertion.fromColumn&&pair.toCol===assertion.toColumn)||(relation.fromTable===assertion.toTable&&relation.toTable===assertion.fromTable&&pair.fromCol===assertion.toColumn&&pair.toCol===assertion.fromColumn))))return {...base,reason:"COMPOSITE_CONSTRAINT_REQUIRES_ALL_COLUMNS"};
+  const dataEvidence=await sampleRelationEvidence(connector,source,{tableName:assertion.fromTable,columnName:assertion.fromColumn},{tableName:assertion.toTable,columnName:assertion.toColumn},sampleLimit,{timeoutMs:overlapTimeoutMs});
+  const overlapRatio=dataEvidence.matchRatio;
   const quote=normalizeDocument(metadataText(assertion.evidenceQuote,500));const confidence=Math.max(0,Math.min(1,.5+(overlapRatio??0)*.3));
-  const relation=store.upsertRelation({sourceId:source.id,fromTable:assertion.fromTable,fromCol:assertion.fromColumn,toTable:assertion.toTable,toCol:assertion.toColumn,cardinality:assertion.cardinality,confidence,overlapRatio,status:"review",inferenceSource:"document",modelDecision:"relation",modelConfidence:.5,modelReason:`文档 ${metadataText(fileName,160)}：${quote||"明确关系断言"}`,modelName:"relation-document-v1",structuralScore:null,structuralReason:"文档断言经目录与类型校验"});
-  store.addQuestion({sourceId:source.id,kind:"JOIN 路径",scope:"table",tableName:relation.fromTable,columnName:relation.fromCol,relationId:relation.id,question:`${relation.fromTable}.${relation.fromCol} 是否关联 ${relation.toTable}.${relation.toCol}？`,evidence:`上传文档 ${metadataText(fileName,160)} 的关系断言：${quote||"无短引用"}；${overlapRatio==null?"未取得本地样本":`本地样本值域重叠 ${(overlapRatio*100).toFixed(2)}%`}。该关系必须经人工确认后才进入 JOIN 白名单。`,options:["确认该关联","保留候选","不允许关联"]});
+  const relation=store.upsertRelation({sourceId:source.id,fromTable:assertion.fromTable,fromCol:assertion.fromColumn,toTable:assertion.toTable,toCol:assertion.toColumn,cardinality:assertion.cardinality,confidence,overlapRatio,dataEvidence,status:"review",inferenceSource:"document",modelDecision:"relation",modelConfidence:.5,modelReason:`文档 ${metadataText(fileName,160)}：${quote||"明确关系断言"}`,modelName:"relation-document-v1",structuralScore:null,structuralReason:"文档断言经目录与类型校验"});
+  store.addQuestion({sourceId:source.id,kind:"JOIN 路径",scope:"table",tableName:relation.fromTable,columnName:relation.fromCol,relationId:relation.id,question:`${relation.fromTable}.${relation.fromCol} 是否关联 ${relation.toTable}.${relation.toCol}？`,evidence:`上传文档 ${metadataText(fileName,160)} 的关系断言：${quote||"无短引用"}；${describeRelationEvidence(relation)}。该关系必须经人工确认后才进入 JOIN 白名单。`,options:["确认该关联","保留候选","不允许关联"]});
   return {...base,accepted:true,relationId:relation.id,overlapRatio};
 }
 

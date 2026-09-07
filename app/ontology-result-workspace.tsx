@@ -59,11 +59,12 @@ export function OntologyResultWorkspace({sourceId,status,role,onRefresh,onQuery,
         {canEdit&&<button className="primary-button" disabled={busy} onClick={()=>void continueBuild(undefined,true)}>确认这次变化并继续</button>}
       </section>}
       {!update?.busy&&questions.length>0&&<section className="ontology-clarifications">
-        <div className="ontology-section-heading"><h3>{questions.some((item)=>["definition","conflict"].includes(item.kind))?"需要补充的说明":"本次更新需要处理"}</h3><span>{questions.length} 项</span></div>
+        <div className="ontology-section-heading"><h3>{questions.some((item)=>["definition","conflict","relation"].includes(item.kind))?"需要补充的说明":"本次更新需要处理"}</h3><span>{questions.length} 项</span></div>
         {record&&<p>这些问题属于本次更新，当前可用版本继续保留。</p>}
         {questions.map((issue)=><Clarification key={issue.id} issue={issue} disabled={!canEdit||busy} onAnswer={(answer)=>continueBuild([answer])}/>)}
-        {update?.canResume&&canEdit&&!questions.some((item)=>["definition","conflict"].includes(item.kind))&&<button className="secondary-button" disabled={busy} onClick={()=>void continueBuild()}>继续未完成部分</button>}
+        {update?.canResume&&canEdit&&!questions.some((item)=>["definition","conflict","relation"].includes(item.kind))&&<button className="secondary-button" disabled={busy} onClick={()=>void continueBuild()}>继续未完成部分</button>}
       </section>}
+      {update?.relationCoverage&&<p className="ontology-update-note">本次已确认关系：{update.relationCoverage.coveredRelationCount} / {update.relationCoverage.confirmedRelationCount} 条已有业务定义{Boolean(update.relationCoverage.bridgePathCount)&&`；中间表业务关系 ${update.relationCoverage.coveredBridgePathCount||0} / ${update.relationCoverage.bridgePathCount}`}{update.relationCoverage.bridgePathLimitReached&&"；业务路径已达到本轮预算，仍有路径未纳入"}</p>}
       {!update?.busy&&update?.summary&&["ready","unchanged"].includes(update.phase)&&<p className="ontology-update-note"><Icon name="check" size={14}/>{update.summary}</p>}
       {record&&<>
         <div className="ontology-section-heading"><h3>业务对象</h3><button className="ontology-text-button" disabled={!canEdit||busy||!status.modelingEnabled} onClick={onSelectTables}>更新数据范围 <Icon name="plus" size={14}/></button></div>
@@ -81,7 +82,7 @@ function Clarification({issue,disabled,onAnswer}:{issue:OntologyBuildIssue;disab
     {!!issue.domains?.length&&<small>涉及 {issue.domains.length} 个范围：{issue.domains.join("、")}</small>}
     {issue.definitions?.map((definition,index)=><blockquote key={index}><strong>{definition.name}</strong><p>{definition.description}</p>{!!definition.reasons?.length&&<small>{definition.reasons.join("；")}</small>}</blockquote>)}
     {issue.kind==="definition"&&<label>补充业务说明<textarea rows={3} maxLength={3000} value={text} disabled={disabled} onChange={(event)=>setText(event.target.value)} placeholder="例如：这张表记录产品账号，客户可拥有多个账号，手机号只是联系方式。"/></label>}
-    {issue.kind==="conflict"&&<fieldset disabled={disabled}><legend>此次更新如何处理？</legend>{issue.options?.map((option)=><label key={option.value}><input type="radio" name={issue.id} checked={resolution===option.value} onChange={()=>setResolution(option.value)}/>{option.label}</label>)}</fieldset>}
-    {["definition","conflict"].includes(issue.kind)&&<button className="primary-button" disabled={disabled||(issue.kind==="definition"?!text.trim():!resolution)} onClick={()=>void onAnswer({questionId:issue.id,text,resolution})}>保存并继续整理</button>}
+    {["conflict","relation"].includes(issue.kind)&&<fieldset disabled={disabled}><legend>此次更新如何处理？</legend>{issue.options?.map((option)=><label key={option.value}><input type="radio" name={issue.id} checked={resolution===option.value} onChange={()=>setResolution(option.value)}/>{option.label}</label>)}</fieldset>}
+    {["definition","conflict","relation"].includes(issue.kind)&&<button className="primary-button" disabled={disabled||(issue.kind==="definition"?!text.trim():!resolution)} onClick={()=>void onAnswer({questionId:issue.id,text,resolution})}>保存并继续整理</button>}
   </article>;
 }

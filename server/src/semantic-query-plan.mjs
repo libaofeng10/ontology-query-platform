@@ -1,3 +1,6 @@
+import { relationPairs } from "./physical-relation.mjs";
+import { primaryKeyProperties } from "./catalog-identity.mjs";
+import { orientRelationPath } from "./relation-path.mjs";
 import { buildQueryColumnSemantics, columnSemanticKind } from "./query-column-semantics.mjs";
 
 const API_NAME_PATTERN=/^[a-z][a-z0-9_]*$/;
@@ -10,8 +13,10 @@ export function validateSemanticQueryPlan(input,schema) {
   const raw=isRecord(input?.plan)?input.plan:isRecord(input)?input:{};
   if(!isRecord(input)) add(errors,"QUERY_PLAN_INVALID","$","Query Plan 必须是 JSON 对象");
   const model=createModel(schema);
+  const roles=bindQueryRoles(model,raw.roles,text(raw.rootObject),errors);
   const plan={
     rootObject:text(raw.rootObject),
+    ...(roles?{roles}:{}),
     dimensions:[],
     metrics:[],
     filters:[],
@@ -38,12 +43,19 @@ export function validateSemanticQueryPlan(input,schema) {
   for(const [index,item] of metrics.slice(0,20).entries()) {
     const aggregation=text(item?.aggregation).toLowerCase();
     const property=text(item?.property);
+    const properties=Array.isArray(item?.properties)?item.properties.map(text):[];
     const alias=text(item?.alias)||text(item?.apiName)||`${aggregation||"metric"}_${lastPart(property)||"all"}`;
     if(!AGGREGATIONS.has(aggregation)) add(errors,"QUERY_PLAN_AGGREGATION_INVALID",`metrics[${index}].aggregation`,`不支持的聚合 ${aggregation||"(空)"}`);
-    if(aggregation!=="count"&&!property) add(errors,"QUERY_PLAN_METRIC_PROPERTY_REQUIRED",`metrics[${index}].property`,`${aggregation||"该聚合"} 必须指定属性`);
+    if(aggregation!=="count"&&!property&&!properties.length) add(errors,"QUERY_PLAN_METRIC_PROPERTY_REQUIRED",`metrics[${index}].property`,`${aggregation||"该聚合"} 必须指定属性`);
+    if(item?.properties!=null){
+      if(aggregation!=="count_distinct"||property||properties.length<2||properties.length>8||new Set(properties).size!==properties.length)add(errors,"QUERY_PLAN_METRIC_TUPLE_INVALID",`metrics[${index}].properties`,"多个属性仅用于 count_distinct，须提供 2～8 个不重复属性，且不能同时指定 property");
+      const resolved=properties.map(ref=>resolveProperty(model,ref,`metrics[${index}].properties`,errors));
+      const object=resolved[0]?.object;
+      if(object&&(!resolved.every(item=>item?.object===object)||properties.length!==primaryKeyProperties(object.primaryKey).length||!primaryKeyProperties(object.primaryKey).every(name=>properties.includes(`${object.apiName}.${name}`))))add(errors,"QUERY_PLAN_METRIC_TUPLE_INVALID",`metrics[${index}].properties`,"元组计数必须使用同一对象的完整联合标识");
+    }
     if(property) resolveProperty(model,property,`metrics[${index}].property`,errors);
     validateAlias(alias,`metrics[${index}].alias`,errors);
-    plan.metrics.push({aggregation,property:property||null,alias});
+    plan.metrics.push({aggregation,property:property||null,...(properties.length?{properties}:{}),alias});
   }
 
   const filters=Array.isArray(raw.filters)?raw.filters:[];
@@ -89,7 +101,7 @@ export function validateSemanticQueryPlan(input,schema) {
   const referencedObjects=new Set([plan.rootObject]);
   for(const ref of [
     ...plan.dimensions.map((item)=>item.property),
-    ...plan.metrics.map((item)=>item.property).filter(Boolean),
+    ...plan.metrics.flatMap((item)=>item.properties||[item.property]).filter(Boolean),
     ...plan.filters.map((item)=>item.property),
     ...(plan.timeDimension?[plan.timeDimension.property]:[]),
   ]) {
@@ -118,11 +130,12 @@ export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500,ontol
   if(!validation.ok) throw new SemanticQueryPlanError("QUERY_PLAN_VALIDATION_FAILED",validation.errors.map((item)=>item.message).join("；"),validation.errors);
   const plan=validation.plan;
   const model=createModel(schema);
+  bindQueryRoles(model,plan.roles,plan.rootObject,[]);
   const rootObject=model.objects.get(plan.rootObject);
   const queryColumnSemantics=buildQueryColumnSemantics(catalog.columnsByTable||{});
   const referencedProperties=[
     ...plan.dimensions.map((item)=>item.property),
-    ...plan.metrics.map((item)=>item.property).filter(Boolean),
+    ...plan.metrics.flatMap((item)=>item.properties||[item.property]).filter(Boolean),
     ...plan.filters.map((item)=>item.property),
     ...(plan.timeDimension?[plan.timeDimension.property]:[]),
   ].map((ref)=>model.properties.get(ref));
@@ -143,14 +156,15 @@ export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500,ontol
     for(const relation of catalog.relations||[]) if(isConfirmed(relation)&&tables.has(relation.fromTable)&&tables.has(relation.toTable)) candidateRelations.set(Number(relation.id),relation);
   }
 
-  const primaryProperty=rootObject.properties.get(rootObject.primaryKey);
+  const primaryProperty=rootObject.properties.get(primaryKeyProperties(rootObject.primaryKey)[0]);
   if(!primaryProperty?.mapping?.table) throw new SemanticQueryPlanError("QUERY_PLAN_ROOT_MAPPING_MISSING",`根对象 ${rootObject.apiName} 缺少主键映射`);
   const rootTable=primaryProperty.mapping.table;
   const discriminatorSpecs=uniqueDiscriminatorSpecs(semanticPath.objects.flatMap((objectName)=>model.objects.get(objectName).discriminators.map((item)=>({objectName,...item}))));
   const requiredTables=new Set([rootTable,...referencedProperties.map((item)=>item.property.mapping.table),...discriminatorSpecs.map((item)=>item.property.mapping.table)]);
-  const physicalPath=resolvePhysicalPath(rootTable,requiredTables,[...candidateRelations.values()]);
-  const aliases=new Map([[rootTable,"t0"]]);
-  const joins=[];
+  const roleStructure=model.roleBindings?buildRoleStructure(model,semanticPath,catalog,referencedProperties):null;
+  const physicalPath=roleStructure?{relations:[]}:resolvePhysicalPath(rootTable,requiredTables,[...candidateRelations.values()]);
+  const aliases=roleStructure?.aliases||new Map([[rootTable,"t0"]]);
+  const joins=roleStructure?.joins||[];
   const joined=new Set([rootTable]);
   const pending=[...physicalPath.relations];
   while(pending.length) {
@@ -162,7 +176,9 @@ export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500,ontol
     joined.add(nextTable);
     joins.push({relation,nextTable});
   }
-  for(const table of requiredTables) if(!joined.has(table)) throw new SemanticQueryPlanError("QUERY_PLAN_TABLE_UNREACHABLE",`映射表 ${table} 无法从根对象连接`);
+  if(!roleStructure)for(const table of requiredTables) if(!joined.has(table)) throw new SemanticQueryPlanError("QUERY_PLAN_TABLE_UNREACHABLE",`映射表 ${table} 无法从根对象连接`);
+  const aliasFor=(table,object)=>aliases.get(instanceKey(object?.roleName,table));
+  const tableInstances=roleStructure?.tableInstances||[...aliases].map(([table,alias])=>({table,alias}));
 
   const columnInfo=(propertyRef)=>{
     const item=model.properties.get(propertyRef);
@@ -170,8 +186,8 @@ export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500,ontol
     const {table,column}=item.property.mapping;
     const physical=(catalog.columnsByTable?.[table]||[]).find((entry)=>entry.columnName===column);
     if(!physical) throw new SemanticQueryPlanError("QUERY_PLAN_MAPPING_STALE",`属性 ${propertyRef} 的物理映射已失效`);
-    if(!aliases.has(table)) throw new SemanticQueryPlanError("QUERY_PLAN_TABLE_UNREACHABLE",`属性 ${propertyRef} 的映射表无法连接`);
-    return {item,physical,sql:`${aliases.get(table)}.${quoteId(column)}`};
+    if(!aliasFor(table,item.object)) throw new SemanticQueryPlanError("QUERY_PLAN_TABLE_UNREACHABLE",`属性 ${propertyRef} 的映射表无法连接`);
+    return {item,physical,sql:`${aliasFor(table,item.object)}.${quoteId(column)}`};
   };
 
   const selects=[];
@@ -188,19 +204,20 @@ export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500,ontol
   }
   for(const metric of plan.metrics) selects.push(`${metricExpression(metric,columnInfo)} AS ${quoteId(metric.alias)}`);
 
-  const sqlParts=[`SELECT ${selects.join(", ")}`,`FROM ${quoteId(rootTable)} AS ${aliases.get(rootTable)}`];
-  for(const {relation,nextTable} of joins) {
+  const sqlParts=[`SELECT ${selects.join(", ")}`,`FROM ${quoteId(rootTable)} AS ${aliasFor(rootTable,rootObject)}`];
+  for(const {relation,nextTable,fromAlias,toAlias,nextAlias} of joins) {
     const table=nextTable;
-    const left=`${aliases.get(relation.fromTable)}.${quoteId(relation.fromCol)}`;
-    const right=`${aliases.get(relation.toTable)}.${quoteId(relation.toCol)}`;
-    sqlParts.push(`JOIN ${quoteId(table)} AS ${aliases.get(table)} ON ${left} = ${right}`);
+    for(const pair of relationPairs(relation))if(!(catalog.columnsByTable?.[relation.fromTable]||[]).some(column=>column.columnName===pair.fromCol)||!(catalog.columnsByTable?.[relation.toTable]||[]).some(column=>column.columnName===pair.toCol))throw new SemanticQueryPlanError("QUERY_PLAN_RELATION_STALE","物理 JOIN 的完整关联字段已失效");
+    const predicates=relationPairs(relation).map(pair=>`${fromAlias||aliases.get(relation.fromTable)}.${quoteId(pair.fromCol)} = ${toAlias||aliases.get(relation.toTable)}.${quoteId(pair.toCol)}`);
+    sqlParts.push(`JOIN ${quoteId(table)} AS ${nextAlias||aliases.get(table)} ON ${predicates.join(" AND ")}`);
   }
   const mandatoryFilters=discriminatorSpecs.map((item)=>{
     const {table,column}=item.property.mapping;
-    if(!aliases.has(table)) throw new SemanticQueryPlanError("QUERY_PLAN_TABLE_UNREACHABLE",`子类型 ${item.objectName} 的判别字段无法连接`);
+    const alias=aliasFor(table,model.objects.get(item.objectName));
+    if(!alias) throw new SemanticQueryPlanError("QUERY_PLAN_TABLE_UNREACHABLE",`子类型 ${item.objectName} 的判别字段无法连接`);
     const values=[...item.values];
-    const columnSql=`${aliases.get(table)}.${quoteId(column)}`;
-    return {object:item.objectName,owner:item.owner,table,column,values,expression:values.length===1?`${columnSql} = ${literal(values[0])}`:`${columnSql} IN (${values.map(literal).join(", ")})`};
+    const columnSql=`${alias}.${quoteId(column)}`;
+    return {object:item.objectName,owner:item.owner,table,column,values,...(roleStructure?{alias}:{}),expression:values.length===1?`${columnSql} = ${literal(values[0])}`:`${columnSql} IN (${values.map(literal).join(", ")})`};
   });
   // A planner may restate the subtype discriminator as an ordinary filter.  It
   // is the same immutable ontology requirement, so compile one canonical atom
@@ -214,20 +231,20 @@ export function compileSemanticQueryPlan(input,{schema,catalog,maxRows=500,ontol
   const limit=Math.min(Math.max(1,plan.limit),Math.max(1,Number(maxRows)||500));
   sqlParts.push(`LIMIT ${limit}`);
 
-  const usedRelations=joins.map((item)=>item.relation);
-  const usedTables=[...aliases.keys()];
+  const usedRelations=[...new Map(joins.map((item)=>[item.relation.id,item.relation])).values()];
+  const usedTables=[...new Set(tableInstances.map(item=>item.table))];
   const allowedColumns=Object.fromEntries(usedTables.map((table)=>[table,queryColumnSemantics.allowedColumns[table]||[]]));
   const columnKinds=Object.fromEntries(Object.entries(queryColumnSemantics.columnKinds).filter(([key])=>usedTables.includes(key.split(".")[0])));
   const enums={};
   for(const [key,values] of Object.entries(catalog.enums||{})) {
     const [table,column]=key.split(".");
-    if(aliases.has(table)) enums[`${aliases.get(table)}.${column}`]=values;
+    for(const instance of tableInstances.filter(item=>item.table===table))enums[`${instance.alias}.${column}`]=values;
   }
   return {
     sql:sqlParts.join("\n"),
     plan,
-    semanticPath:{...semanticPath,mandatoryFilters:mandatoryFilters.map(publicMandatoryFilter),relations:usedRelations.map((item)=>({id:item.id,fromTable:item.fromTable,fromCol:item.fromCol,toTable:item.toTable,toCol:item.toCol}))},
-    semanticContract:semanticRowDomainContract({ontologySchemaVersion,rootObject:plan.rootObject,mandatoryFilters}),
+    semanticPath:{...semanticPath,...(roleStructure?{roles:tableInstances,links:[...new Set(semanticPath.links.map(name=>model.links.get(name).originalLink.apiName))]}:{}),mandatoryFilters:mandatoryFilters.map(publicMandatoryFilter),relations:usedRelations.map((item)=>({id:item.id,fromTable:item.fromTable,fromCol:item.fromCol,toTable:item.toTable,toCol:item.toCol,columnPairs:relationPairs(item)}))},
+    semanticContract:semanticRowDomainContract({ontologySchemaVersion,rootObject:plan.rootObject,mandatoryFilters,roleRelations:roleStructure?joins:[]}),
     policy:{allowedTables:usedTables,allowedColumns,columnKinds,allowedRelations:usedRelations,enums,mandatoryFilters:mandatoryFilters.map(publicMandatoryFilter),maxRows:limit},
   };
 }
@@ -237,6 +254,7 @@ export function semanticPlanningView(schema,catalog=null) {
   return {
     name:schema?.name||"",
     displayName:schema?.displayName||"",
+    queryCapabilities:{roles:"roles=[{name,from,link,direction:'forward'|'reverse'}]；from 为根对象或前置角色，使用角色名.属性引用，同一对象可有多个角色",tupleDistinct:"count_distinct 可用 properties:[对象.属性,...] 引用完整联合 primaryKey；不能同时指定 property"},
     description:schema?.description||"",
     objectTypes:[...model.objects.values()].map((object)=>({
       apiName:object.apiName,displayName:object.displayName,description:object.description||"",primaryKey:object.primaryKey,...(object.parent?{parent:object.parent,specializes:`${object.parent} (${object.discriminators.map((item)=>`${item.property.apiName} ∈ ${item.values.join(", ")}`).join("; ")})`}:{}),...(object.termBinding?{termBinding:object.termBinding}:{}),
@@ -276,6 +294,89 @@ function createModel(schema) {
   return {objects,properties,links};
 }
 
+function bindQueryRoles(model,rawRoles,root,errors){
+  if(rawRoles==null||Array.isArray(rawRoles)&&!rawRoles.length)return null;
+  if(!Array.isArray(rawRoles)||rawRoles.length>12){add(errors,"QUERY_PLAN_ROLES_INVALID","roles","roles 必须是最多 12 项的数组");return null;}
+  const original={objects:new Map(model.objects),links:new Map(model.links)};
+  const rootObject=original.objects.get(root);if(!rootObject)return null;
+  model.objects=new Map();model.properties=new Map();model.links=new Map();model.roleBindings=[];
+  const install=(name,object)=>{
+    const role={...object,apiName:name,originalApiName:object.apiName,roleName:name,parent:undefined};
+    model.objects.set(name,role);
+    for(const property of role.properties.values())model.properties.set(`${name}.${property.apiName}`,{object:role,property});
+    return role;
+  };
+  install(root,rootObject);
+  const normalized=[];
+  for(const [index,raw] of rawRoles.entries()){
+    const name=text(raw?.name),from=text(raw?.from),requested=text(raw?.link),direction=text(raw?.direction)||"forward";
+    if(!API_NAME_PATTERN.test(name)||model.objects.has(name)||!model.objects.has(from)||!["forward","reverse"].includes(direction)){add(errors,"QUERY_PLAN_ROLE_INVALID",`roles[${index}]`,"角色名须唯一，from 须指向根对象或前面已定义的角色，direction 须为 forward/reverse");continue;}
+    const link=[...original.links.values()].find(link=>link.apiName===requested||link.inverseApiName===requested);
+    const reversed=(direction==="reverse")!==(link?.inverseApiName===requested);
+    const sourceOriginal=model.objects.get(from).originalApiName;
+    const expected=link&&(reversed?link.target:link.source);
+    if(!link||sourceOriginal!==expected&&!isAncestorObject(original,expected,sourceOriginal)){add(errors,"QUERY_PLAN_ROLE_LINK_INVALID",`roles[${index}].link`,"角色 Link 不存在或方向与源对象不匹配");continue;}
+    const target=original.objects.get(reversed?link.source:link.target);
+    if(!target){add(errors,"QUERY_PLAN_ROLE_LINK_INVALID",`roles[${index}].link`,"角色的目标对象已失效");continue;}
+    install(name,target);
+    const binding={name,from,link:link.apiName,direction:reversed?"reverse":"forward"};normalized.push(binding);model.roleBindings.push(binding);
+    const internalName=`${link.apiName}__role_${name}`;
+    model.links.set(internalName,{...link,apiName:internalName,source:from,target:name,originalLink:link,roleBinding:binding});
+  }
+  return normalized;
+}
+
+function instanceKey(role,table){return role?`${role}\0${table}`:table;}
+
+function buildRoleStructure(model,semanticPath,catalog,referencedProperties){
+  const aliases=new Map(),joins=[],tableInstances=[];
+  const required=new Map([...model.objects.values()].map(object=>[object.roleName,new Set([
+    ...primaryKeyProperties(object.primaryKey).map(name=>object.properties.get(name)?.mapping?.table).filter(Boolean),
+    ...object.discriminators.map(item=>item.property.mapping.table),
+    ...referencedProperties.filter(item=>item.object===object).map(item=>item.property.mapping.table),
+  ])]));
+  const byId=new Map((catalog.relations||[]).map(relation=>[Number(relation.id),relation]));
+  const paths=new Map();
+  for(const binding of model.roleBindings.filter(binding=>semanticPath.objects.includes(binding.name))){
+    const link=[...model.links.values()].find(link=>link.roleBinding===binding);
+    const relations=link.relationMappings.map(mapping=>byId.get(Number(mapping.relationId)));
+    if(relations.some(relation=>!relation||!isConfirmed(relation)))throw new SemanticQueryPlanError("QUERY_PLAN_RELATION_STALE","角色关系的物理 JOIN 已失效");
+    const path=orientRelationPath(relations,model.objects.get(binding.from).tables,model.objects.get(binding.name).tables,{reverse:binding.direction==="reverse"});
+    if(!path)throw new SemanticQueryPlanError("QUERY_PLAN_ROLE_PATH_INVALID","角色关系的全部映射必须组成一条完整路径");
+    paths.set(binding,path);required.get(binding.from).add(path[0].fromTable);required.get(binding.name).add(path.at(-1).toTable);
+  }
+  const allocate=(role,table)=>{
+    const key=instanceKey(role,table);
+    if(!aliases.has(key)){const alias=`t${aliases.size}`;aliases.set(key,alias);tableInstances.push({role,table,alias});}
+    return aliases.get(key);
+  };
+  const append=(step,fromAlias,role)=>{
+    const nextAlias=allocate(role,step.toTable);
+    joins.push({relation:step.relation,nextTable:step.toTable,nextAlias,fromAlias:step.reversed?nextAlias:fromAlias,toAlias:step.reversed?fromAlias:nextAlias});
+    return nextAlias;
+  };
+  const attachObject=(role,startTable)=>{
+    const object=model.objects.get(role),relations=(catalog.relations||[]).filter(relation=>isConfirmed(relation)&&object.tables.has(relation.fromTable)&&object.tables.has(relation.toTable));
+    const pending=[...resolvePhysicalPath(startTable,required.get(role),relations).relations];
+    while(pending.length){
+      const index=pending.findIndex(relation=>aliases.has(instanceKey(role,relation.fromTable))!==aliases.has(instanceKey(role,relation.toTable)));
+      if(index<0)throw new SemanticQueryPlanError("QUERY_PLAN_ROLE_PATH_INVALID","角色对象内部的物理映射无法连接");
+      const relation=pending.splice(index,1)[0],reversed=aliases.has(instanceKey(role,relation.toTable));
+      const fromTable=reversed?relation.toTable:relation.fromTable,toTable=reversed?relation.fromTable:relation.toTable;
+      append({relation,fromTable,toTable,reversed},aliases.get(instanceKey(role,fromTable)),role);
+    }
+  };
+  const root=model.objects.get(semanticPath.rootObject),rootTable=root.properties.get(primaryKeyProperties(root.primaryKey)[0])?.mapping?.table;
+  if(!rootTable)throw new SemanticQueryPlanError("QUERY_PLAN_ROOT_MAPPING_MISSING","根对象缺少主键映射");
+  allocate(root.roleName,rootTable);attachObject(root.roleName,rootTable);
+  for(const [binding,path] of paths){
+    let fromAlias=aliases.get(instanceKey(binding.from,path[0].fromTable));
+    for(const [index,step] of path.entries())fromAlias=append(step,fromAlias,index===path.length-1?binding.name:`${binding.name}:via:${index}`);
+    attachObject(binding.name,path.at(-1).toTable);
+  }
+  return {aliases,joins,tableInstances};
+}
+
 function descendantNames(model,parentName) {
   const result=[];
   for(const object of model.objects.values()) if(isAncestorObject(model,parentName,object.apiName)) result.push(object.apiName);
@@ -308,6 +409,7 @@ function discriminatorConflict(object,property,filter) {
 }
 
 function validatePathObjectCompatibility(model,objectNames,errors) {
+  if(model.roleBindings)return; // Each role is a different row instance; subtype domains need not intersect.
   for(let left=0;left<objectNames.length;left++) for(let right=left+1;right<objectNames.length;right++) {
     const leftName=objectNames[left],rightName=objectNames[right];
     if(isAncestorObject(model,leftName,rightName)||isAncestorObject(model,rightName,leftName)) {
@@ -344,33 +446,36 @@ function discriminatorDomains(object) {
   }
   return domains;
 }
-function publicMandatoryFilter(item){return {object:item.object,owner:item.owner,table:item.table,column:item.column,values:item.values};}
+function publicMandatoryFilter(item){return {object:item.object,owner:item.owner,table:item.table,column:item.column,values:item.values,...(item.alias?{alias:item.alias}:{})};}
 function uniqueDiscriminatorSpecs(values) {
   const result=new Map();
   for(const item of values) {
     const mapping=item.property?.mapping||{};
-    const key=`${item.owner}|${mapping.table}|${mapping.column}|${(item.values||[]).map(typedLiteralKey).sort().join("\u0000")}`;
+    const key=`${item.objectName}|${item.owner}|${mapping.table}|${mapping.column}|${(item.values||[]).map(typedLiteralKey).sort().join("\u0000")}`;
     if(!result.has(key))result.set(key,item);
   }
   return [...result.values()].sort((left,right)=>left.objectName.localeCompare(right.objectName)||left.owner.localeCompare(right.owner));
 }
 function filterRestatesMandatoryDiscriminator(filter,mandatory,model) {
   const property=model.properties.get(filter.property)?.property;
+  if(model.roleBindings&&model.properties.get(filter.property)?.object.apiName!==mandatory.object)return false;
   if(!property||property.mapping?.table!==mandatory.table||property.mapping?.column!==mandatory.column)return false;
   const expected=(mandatory.values||[]).map(typedLiteralKey).sort();
   const actual=filter.operator==="eq"?[typedLiteralKey(filter.value)]:filter.operator==="in"&&Array.isArray(filter.value)?filter.value.map(typedLiteralKey).sort():[];
   return expected.length===actual.length&&expected.every((value,index)=>value===actual[index]);
 }
-function semanticRowDomainContract({ontologySchemaVersion,rootObject,mandatoryFilters}) {
+function semanticRowDomainContract({ontologySchemaVersion,rootObject,mandatoryFilters,roleRelations=[]}) {
   const slots=mandatoryFilters.map((filter)=>({
-    id:`ontology:${ontologySchemaVersion??"unbound"}:${rootObject}:discriminator:${filter.owner}:${filter.table}.${filter.column}`,
+    id:`ontology:${ontologySchemaVersion??"unbound"}:${rootObject}:discriminator:${filter.owner}:${filter.table}.${filter.column}${filter.alias?`:${filter.alias}`:""}`,
     kind:"semantic_row_domain",role:"ontology_subtype_discriminator",required:true,immutable:true,
     source:"published_ontology",ontologySchemaVersion:ontologySchemaVersion??null,rootObject,
     object:filter.object,owner:filter.owner,table:filter.table,column:filter.column,
+    ...(filter.alias?{alias:filter.alias}:{}),
     columns:[`${filter.table}.${filter.column}`],operator:filter.values.length===1?"eq":"in",
     values:filter.values.map((value)=>({value,valueType:literalValueType(value)})),
   }));
-  return {version:"semantic-row-domain-v1",ontologySchemaVersion:ontologySchemaVersion??null,rootObject,immutable:true,rowDomainSlots:slots};
+  return {version:"semantic-row-domain-v1",ontologySchemaVersion:ontologySchemaVersion??null,rootObject,immutable:true,rowDomainSlots:slots,
+    ...(roleRelations.length?{relationBindings:roleRelations.map(({relation,fromAlias,toAlias})=>({relationId:relation.id,fromTable:relation.fromTable,toTable:relation.toTable,columnPairs:relationPairs(relation),fromAlias,toAlias}))}:{})};
 }
 function typedLiteralKey(value){return `${literalValueType(value)}:${String(value)}`;}
 function literalValueType(value){if(value===null)return "null";if(typeof value==="number")return "number";if(typeof value==="boolean")return "boolean";return "string";}
@@ -423,6 +528,7 @@ function resolvePhysicalPath(rootTable,requiredTables,relations) {
 }
 
 function metricExpression(metric,columnInfo) {
+  if(metric.properties?.length)return `COUNT(DISTINCT ${metric.properties.map(ref=>columnInfo(ref).sql).join(", ")})`;
   const expression=metric.property?columnInfo(metric.property).sql:"*";
   if(metric.aggregation==="count_distinct") return `COUNT(DISTINCT ${expression})`;
   return `${metric.aggregation.toUpperCase()}(${expression})`;

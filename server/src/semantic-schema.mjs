@@ -1,3 +1,6 @@
+import { relationPairs } from "./physical-relation.mjs";
+import { canonicalPrimaryKey, primaryKeyProperties, uniqueColumnSets } from "./catalog-identity.mjs";
+import { orientRelationPath } from "./relation-path.mjs";
 import { findKnowledgeOntologyConflicts, schemaMappedColumns } from "./knowledge-column-refs.mjs";
 
 const API_NAME_PATTERN=/^[a-z][a-z0-9_]*$/;
@@ -45,7 +48,7 @@ export function validateSemanticSchema(input,catalog={}) {
     const freshness=text(objectRaw.freshness).toLowerCase();
     const parent=text(objectRaw.parent);
     const objectType={
-      apiName:text(objectRaw.apiName),displayName:text(objectRaw.displayName),description:text(objectRaw.description),primaryKey:text(objectRaw.primaryKey),
+      apiName:text(objectRaw.apiName),displayName:text(objectRaw.displayName),description:text(objectRaw.description),primaryKey:canonicalPrimaryKey(objectRaw.primaryKey),
       ...(namespace?{namespace}:{}),...(freshness?{freshness}:{}),...(parent?{parent}:{}),
       ...(objectRaw.discriminator!=null?{discriminator:normalizeDiscriminator(objectRaw.discriminator,`${objectPath}.discriminator`,errors)}:{}),
       ...(objectRaw.termBinding!=null?{termBinding:normalizeTermBinding(objectRaw.termBinding,`${objectPath}.termBinding`,errors)}:{}),
@@ -125,7 +128,7 @@ export function validateSemanticSchema(input,catalog={}) {
     if(!target) add(errors,"ONTOLOGY_LINK_TARGET_NOT_FOUND",`${linkPath}.target`,`目标对象类型 ${linkType.target||"(空)"} 不存在`);
     if(source&&target&&(isAncestor(source,target,objectByName)||isAncestor(target,source,objectByName))) add(errors,"ONTOLOGY_LINK_HIERARCHY_AMBIGUOUS",linkPath,"同一 Link 的两个端点不能同时引用父类型及其子类型");
     if(source&&target&&source===target&&!inverseApiName) warnings.push(issue("ONTOLOGY_LINK_SELF_INVERSE_MISSING",`${linkPath}.inverseApiName`,`自引用关系 ${linkType.apiName} 应显式提供 inverseApiName 以区分两个方向`));
-    validateLinkMappings(linkType,linkPath,source,target,relationById,errors,warnings);
+    validateLinkMappings(linkType,linkPath,source,target,relationById,columnsByTable,errors,warnings);
     schema.linkTypes.push(linkType);
   }
 
@@ -168,7 +171,7 @@ function validateHierarchy(schema,objectByName,catalog,errors,warnings) {
     object._tables=new Set([...effective.values()].map((property)=>property.mapping.table).filter(Boolean));
     const parent=object.parent?objectByName.get(object.parent):null;
     if(parent) {
-      if(object.primaryKey&&object.primaryKey!==parent.primaryKey) add(errors,"ONTOLOGY_PRIMARY_KEY_INHERITED",`${path}.primaryKey`,`子类型必须继承父类型主键 ${parent.primaryKey}，不支持覆盖`);
+      if(object.primaryKey&&JSON.stringify(object.primaryKey)!==JSON.stringify(parent.primaryKey)) add(errors,"ONTOLOGY_PRIMARY_KEY_INHERITED",`${path}.primaryKey`,`子类型必须继承父类型主键 ${parent.primaryKey}，不支持覆盖`);
       object.primaryKey=parent.primaryKey;
       validateDiscriminator(object,parent,path,catalog,errors,warnings);
     }
@@ -212,13 +215,20 @@ function validateDiscriminator(object,parent,path,catalog,errors,warnings) {
 }
 
 function validatePrimaryKey(object,path,columnsByTable,errors) {
-  if(!object.primaryKey) { add(errors,"ONTOLOGY_PRIMARY_KEY_REQUIRED",`${path}.primaryKey`,`primaryKey 必填`);return; }
-  const property=object._propertyByName.get(object.primaryKey);
-  if(!property) { add(errors,"ONTOLOGY_PRIMARY_KEY_NOT_FOUND",`${path}.primaryKey`,`主键属性 ${object.primaryKey} 未在可见 properties 中定义`);return; }
-  if(!property.required) add(errors,"ONTOLOGY_PRIMARY_KEY_NOT_REQUIRED",`${path}.primaryKey`,`主键属性 ${object.primaryKey} 必须标记 required`);
-  if(!property.mapping.table||!property.mapping.column) add(errors,"ONTOLOGY_PRIMARY_KEY_NOT_MAPPED",`${path}.primaryKey`,`主键属性 ${object.primaryKey} 必须映射物理字段`);
-  const column=(columnsByTable[property.mapping.table]||[]).find((item)=>item.columnName===property.mapping.column);
-  if(column&&!column.isPrimary&&!column.isUnique) add(errors,"ONTOLOGY_PRIMARY_KEY_NOT_UNIQUE",`${path}.primaryKey`,`主键映射 ${property.mapping.table}.${property.mapping.column} 不是已知主键或唯一字段`);
+  const names=primaryKeyProperties(object.primaryKey);
+  if(!names.length) { add(errors,"ONTOLOGY_PRIMARY_KEY_REQUIRED",`${path}.primaryKey`,`primaryKey 必填`);return; }
+  if(names.length>8||new Set(names).size!==names.length||names.some(name=>!API_NAME_PATTERN.test(name)))add(errors,"ONTOLOGY_PRIMARY_KEY_INVALID",`${path}.primaryKey`,"主键应包含 1～8 个不重复的属性名");
+  const properties=names.map(name=>object._propertyByName.get(name));
+  for(const [index,property] of properties.entries()){
+    if(!property){add(errors,"ONTOLOGY_PRIMARY_KEY_NOT_FOUND",`${path}.primaryKey`,`主键属性 ${names[index]} 未在可见 properties 中定义`);continue;}
+    if(!property.required)add(errors,"ONTOLOGY_PRIMARY_KEY_NOT_REQUIRED",`${path}.primaryKey`,`主键属性 ${names[index]} 必须标记 required`);
+    if(!property.mapping.table||!property.mapping.column)add(errors,"ONTOLOGY_PRIMARY_KEY_NOT_MAPPED",`${path}.primaryKey`,`主键属性 ${names[index]} 必须映射物理字段`);
+  }
+  if(properties.some(property=>!property))return;
+  const tables=new Set(properties.map(property=>property.mapping.table));
+  const columns=columnsByTable[properties[0].mapping.table]||[],mapped=properties.map(property=>property.mapping.column);
+  if(tables.size!==1||new Set(mapped).size!==mapped.length||!uniqueColumnSets(columns).some(key=>key.length===mapped.length&&key.every(name=>mapped.includes(name))))add(errors,"ONTOLOGY_PRIMARY_KEY_NOT_UNIQUE",`${path}.primaryKey`,`主键映射必须覆盖同一物理表的完整主键或唯一键：${mapped.join("、")}`);
+  if(names.length>1&&columns.some(column=>mapped.includes(column.columnName)&&(column.nullable===1||column.nullable==="YES")))add(errors,"ONTOLOGY_PRIMARY_KEY_NULLABLE",`${path}.primaryKey`,"联合标识成员不能是物理可空字段");
 }
 
 function validatePhysicalMapping(property,path,tableByName,columnsByTable,errors,warnings) {
@@ -244,7 +254,7 @@ function validateObjectTableConnectivity(object,path,relations,errors) {
   if(missing.length) add(errors,"ONTOLOGY_OBJECT_TABLES_DISCONNECTED",`${path}.properties`,`对象 ${object.apiName} 映射的物理表缺少已确认 JOIN：${missing.join("、")}`);
 }
 
-function validateLinkMappings(link,path,source,target,relationById,errors,warnings) {
+function validateLinkMappings(link,path,source,target,relationById,columnsByTable,errors,warnings) {
   if(!link.relationMappings.length) { add(errors,"ONTOLOGY_LINK_MAPPING_REQUIRED",`${path}.relationMappings`,`Link Type 必须绑定至少一条已确认物理 JOIN`);return; }
   const mapped=[];const ids=new Set();
   for(const [index,mapping] of link.relationMappings.entries()) {
@@ -255,11 +265,17 @@ function validateLinkMappings(link,path,source,target,relationById,errors,warnin
     const relation=relationById.get(mapping.relationId);
     if(!relation) { add(errors,"ONTOLOGY_RELATION_NOT_FOUND",targetPath,`物理 JOIN ${mapping.relationId} 不存在或已失效`);continue; }
     if(!isConfirmedRelation(relation)) { add(errors,"ONTOLOGY_RELATION_NOT_CONFIRMED",targetPath,`物理 JOIN ${mapping.relationId} 尚未确认，当前状态为 ${relation.status||"unknown"}`);continue; }
+    try {
+      if(!relationPairs(relation).every((pair)=>
+        (columnsByTable[relation.fromTable]||[]).some((column)=>column.columnName===pair.fromCol)&&
+        (columnsByTable[relation.toTable]||[]).some((column)=>column.columnName===pair.toCol))) {
+        add(errors,"ONTOLOGY_RELATION_COLUMN_NOT_FOUND",targetPath,`物理 JOIN ${mapping.relationId} 的完整关联字段已失效`);continue;
+      }
+    } catch { add(errors,"ONTOLOGY_RELATION_COLUMNS_INVALID",targetPath,`物理 JOIN ${mapping.relationId} 的列组无效`);continue; }
     mapped.push(relation);
   }
   if(!source||!target||!mapped.length) return;
-  const reached=reachableTables(new Set(source._tables),mapped);
-  if(![...target._tables].some((table)=>reached.has(table))) add(errors,"ONTOLOGY_LINK_PATH_DISCONNECTED",`${path}.relationMappings`,`物理 JOIN 无法连接 ${link.source} 与 ${link.target}`);
+  if(!orientRelationPath(mapped,source._tables,target._tables)) add(errors,"ONTOLOGY_LINK_PATH_DISCONNECTED",`${path}.relationMappings`,`全部物理 JOIN 必须组成连接 ${link.source} 与 ${link.target} 的完整路径（最多 8 段）`);
   if(mapped.length===1) {
     const observed=orientedCardinality(mapped[0],source._tables,target._tables);
     if(observed&&link.cardinality&&observed!==link.cardinality) warnings.push(issue("ONTOLOGY_CARDINALITY_MISMATCH",`${path}.cardinality`,`声明基数 ${link.cardinality} 与已探查基数 ${observed} 不一致`));

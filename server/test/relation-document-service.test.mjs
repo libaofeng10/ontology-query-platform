@@ -13,7 +13,7 @@ async function fixture(){
   const source=store.createSource({name:"sales",kind:"mysql",host:"db",port:3306,dbName:"sales",userName:"ro",credential:"encrypted",isDemo:false});
   for(const table of [{tableName:"sales_order",grade:"A",active:1},{tableName:"crm_customer",grade:"A",active:1}])store.upsertTable({sourceId:source.id,...table});
   for(const column of [{tableName:"sales_order",columnName:"customer_id",dataType:"bigint"},{tableName:"sales_order",columnName:"email",dataType:"varchar(255)",isSensitive:1},{tableName:"crm_customer",columnName:"id",dataType:"bigint",isPrimary:1,isUnique:1}])store.upsertColumn({sourceId:source.id,...column});
-  const connector={query:async(_source,sql)=>sql.includes("sales_order")?[[{value:1},{value:2}]]:[[{value:1},{value:3}]]};
+  const connector={query:async(_source,sql)=>sql.includes("matchCount")?[[{value:1,matchCount:1},{value:2,matchCount:0}]]:sql.includes("sales_order")?[[{value:1},{value:2}]]:[[{value:1},{value:3}]]};
   return {root,store,source,connector};
 }
 
@@ -67,3 +67,13 @@ test("relation document API enforces editor uploads and hides the server path",a
 async function callApi(app,path,token,body,method="POST"){
   const payload=body==null?"":JSON.stringify(body);const request=Readable.from(payload?[payload]:[]);request.method=method;request.url=path;request.headers={authorization:`Bearer ${token}`,"content-type":"application/json","content-length":String(Buffer.byteLength(payload))};request.socket={remoteAddress:"127.0.0.1"};let raw="";const response={statusCode:200,headers:{},setHeader(name,value){this.headers[String(name).toLowerCase()]=value;},end(value){raw=value?String(value):"";}};await app.handler(request,response);return {status:response.statusCode,body:raw?JSON.parse(raw):{}};
 }
+
+test("文档中的单个联合外键成员不能建立独立的可确认关联",async()=>{
+  const {root,store,source,connector}=await fixture();try{
+    for(const tableName of ["sales_order","crm_customer"])store.upsertColumn({sourceId:source.id,tableName,columnName:"tenant_id",dataType:"bigint"});
+    const relation=store.upsertRelation({sourceId:source.id,fromTable:"sales_order",fromCol:"tenant_id",toTable:"crm_customer",toCol:"tenant_id",columnPairs:[{fromCol:"tenant_id",toCol:"tenant_id"},{fromCol:"customer_id",toCol:"id"}],status:"confirmed",inferenceSource:"foreign_key"});
+    const service=createRelationDocumentService({store,connector,wikiDir:join(root,"wiki"),llm:{}});
+    const result=await service.upload(source,{filename:"partial.txt",content:"sales_order.customer_id = crm_customer.id"},"editor");
+    assert.equal(result.acceptedCount,0);assert.equal(result.assertions[0].reason,"COMPOSITE_CONSTRAINT_REQUIRES_ALL_COLUMNS");assert.deepEqual(store.listRelations(source.id,true).map(item=>item.id),[relation.id]);
+  }finally{store.close();}
+});

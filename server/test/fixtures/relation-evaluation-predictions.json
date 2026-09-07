@@ -1,0 +1,10 @@
+{
+  "candidates": [
+    {"fromTable":"orders","toTable":"customer","columnPairs":[{"fromCol":"tenant_id","toCol":"tenant_id"},{"fromCol":"customer_code","toCol":"code"}]},
+    {"fromTable":"orders","toTable":"unrelated","columnPairs":[{"fromCol":"id","toCol":"id"}]}
+  ],
+  "predictions": [
+    {"fromTable":"orders","toTable":"customer","columnPairs":[{"fromCol":"tenant_id","toCol":"tenant_id"},{"fromCol":"customer_code","toCol":"code"}],"decision":"relation","confidence":0.9,"cardinality":"N:1"},
+    {"fromTable":"orders","toTable":"unrelated","columnPairs":[{"fromCol":"id","toCol":"id"}],"decision":"relation","confidence":0.6,"cardinality":"N:1"}
+  ]
+}

@@ -8,8 +8,9 @@ export type QueryResultSet = { name:string; columns:QueryColumn[]; rows:QueryRow
 export type QueryIntent = { version:string; rawQuestion:string; normalizedQuestion:string; subjects:string[]; entities:Array<{type:string;text:string;sourceText:string;immutable:boolean;span:{start:number;end:number}}>; filters:Array<{kind:string;operator:string;value:string;immutable:boolean;sourceText:string}>; timeRange:{kind:string;sourceText:string;start:string;endExclusive:string}|null; scope:{exhaustive:boolean;products:string[]}; ambiguities:Array<{code:string;message:string;blocking:boolean}>; retrievalTerms:string[] };
 export type SemanticQueryPlan = {
   rootObject:string;
+  roles?:Array<{name:string;from:string;link:string;direction:"forward"|"reverse"}>;
   dimensions:Array<{property:string;alias:string}>;
-  metrics:Array<{aggregation:"count"|"count_distinct"|"sum"|"avg"|"min"|"max";property:string|null;alias:string}>;
+  metrics:Array<{aggregation:"count"|"count_distinct"|"sum"|"avg"|"min"|"max";property:string|null;properties?:string[];alias:string}>;
   filters:Array<{property:string;operator:string;value?:unknown}>;
   timeDimension:{property:string;grain:"day"|"week"|"month"|"quarter"|"year";alias:string}|null;
   orderBy:Array<{field:string;direction:"asc"|"desc"}>;
@@ -25,7 +26,9 @@ export type QueryStreamEvent =
   | {type:"thought";step:number;text:string}
   | {type:"tool_call";step:number;tool:string;thought?:string;detail?:string;operation?:string;sql?:string;tables?:string[];sample?:{table:string;columns:string[]}}
   | {type:"tool_result";step:number;tool:string;ok:boolean;summary:string;durationMs:number;thought?:string;detail?:string;operation?:string;sql?:string;pages?:string[];tables?:Array<{name:string;fieldCount:number}>;sample?:{table:string;columns:string[]}}
-  | {type:"final"|"refused"|"clarification";result:QueryResponse};
+  | {type:"final";result:QueryAnswer}
+  | {type:"refused";result:QueryRefusal}
+  | {type:"clarification";result:QueryClarification};
 export type Evidence = {
   pages:string[]; rules:string[]; tables:string[]; joins?:string[]; sql:string; durationMs:number; scannedRows:number;
   sqls?:Array<{name:string;sql:string;tables:string[];joins:string[];scannedRows:number;durationMs:number;rowCount:number}>;
@@ -88,8 +91,8 @@ export type BackgroundTask = {
   result:DiscoverySummary|EvaluationSummary|EvaluationGateSummary|OntologyDomainModelingResult|null; createdAt:string; startedAt:string|null; finishedAt:string|null;
 };
 export type SchemaSnapshot = { id:number; sourceId:number; version:number; checksum:string; createdAt:string };
-export type OntologyBuildIssue={id:string;kind:string;title:string;detail:string;tables:string[];retryable:boolean;domains?:string[];definitions?:Array<{name:string;description:string;reasons?:string[]}>;options?:Array<{value:"keep_existing"|"use_candidate";label:string}>};
-export type OntologyBuildAnswer={questionId:string;text?:string;resolution?:"keep_existing"|"use_candidate"};
+export type OntologyBuildIssue={id:string;kind:string;title:string;detail:string;tables:string[];retryable:boolean;domains?:string[];definitions?:Array<{name:string;description:string;reasons?:string[]}>;options?:Array<{value:"keep_existing"|"use_candidate"|"confirm_relation"|"deny_relation";label:string}>};
+export type OntologyBuildAnswer={questionId:string;text?:string;resolution?:"keep_existing"|"use_candidate"|"confirm_relation"|"deny_relation"};
 export type OntologyBuildRecord={
   id:string;phase:string;busy:boolean;legacy:boolean;createdAt:string;finishedAt:string|null;progress:number;currentStep:string|null;
   summary:string|null;error:string|null;questions:OntologyBuildIssue[];events:Array<{phase:string;label:string;at:string}>;tableNames:string[];versionId:number|null;
@@ -98,7 +101,7 @@ export type OntologyBuildRecord={
 export type SourceOntologyBuildStatus={
   task:BackgroundTask|null;modelingEnabled:boolean;profilingEnabled:boolean;activeVersion:SemanticSchemaVersion|null;
   availability:{canQuery:boolean;tableNames:string[];objectCount:number};
-  update:{id:string;phase:string;busy:boolean;questions:OntologyBuildIssue[];changes:SemanticSchemaDiff|null;changeChecksum:string|null;draftVersionId:number|null;summary:string|null;events:Array<{phase:string;label:string;at:string}>;canResume:boolean;error:{kind:string;message:string;retryable:boolean}|null}|null;
+  update:{relationCoverage?:{confirmedRelationCount:number;coveredRelationCount:number;missingRelationIds:number[];bridgePathCount?:number;bridgePathLimitReached?:boolean;coveredBridgePathCount?:number;missingBridgePaths?:Array<{pathId:string;fromTable:string;toTable:string;bridgeTable:string;relationIds:number[]}>}|null;id:string;phase:string;busy:boolean;questions:OntologyBuildIssue[];changes:SemanticSchemaDiff|null;changeChecksum:string|null;draftVersionId:number|null;summary:string|null;events:Array<{phase:string;label:string;at:string}>;canResume:boolean;error:{kind:string;message:string;retryable:boolean}|null}|null;
   history:Array<{id:string;createdAt:string;finishedAt:string|null;phase:string;summary:string|null;versionId:number|null;selectedTableCount:number|null}>;
   versions:SemanticSchemaVersion[];
 };
@@ -175,7 +178,7 @@ export type SemanticProperty = {
 };
 export type TermBinding={vocabulary:string;canonicalId:string;match:"exact"|"close"|"broader"};
 export type TermAnchor={id:number;vocabulary:string;canonicalId:string;prefLabelZh:string|null;prefLabelEn:string|null;altLabels:string[];kind:"object"|"property"|"metric";broaderCanonicalId:string|null;note:string|null;createdAt:string;updatedAt:string};
-export type SemanticObjectType = { apiName:string; displayName:string; description?:string; namespace?:string; freshness?:"realtime"|"hourly"|"daily"|"batch"; primaryKey:string; properties:SemanticProperty[];parent?:string;discriminator?:{property:string;values:Array<string|number>};termBinding?:TermBinding };
+export type SemanticObjectType = { apiName:string; displayName:string; description?:string; namespace?:string; freshness?:"realtime"|"hourly"|"daily"|"batch"; primaryKey:string|string[]; properties:SemanticProperty[];parent?:string;discriminator?:{property:string;values:Array<string|number>};termBinding?:TermBinding };
 export type SemanticLinkType = {
   apiName:string; displayName:string; description?:string; source:string; target:string;
   cardinality:"one_to_one"|"one_to_many"|"many_to_one"|"many_to_many";
@@ -195,7 +198,7 @@ export type SemanticSchemaVersion = {
 export type OntologyCatalogTable = { sourceId:number; tableName:string; rowEstimate:number; grade:"A"|"B"|"C"; gradeOverride:"A"|"B"|"C"|null; active:number; comment:string|null };
 export type ColumnProfile={sampleValues:string[];formatPattern:string|null;distinctCount:number;nullRatio:number;minMax:{min:number|string;max:number|string}|null;sensitiveValuesSuppressed:boolean;sampledAt:string;sampleSize:number;profileVersion:string};
 export type OntologyCatalogColumn = { sourceId:number; tableName:string; columnName:string; dataType:string; nullable:number; isSensitive:number; comment:string|null; isPrimary:number; isUnique:number; isIndexed:number;profile?:ColumnProfile|null };
-export type OntologyCatalogRelation = { id:number; fromTable:string; fromCol:string; toTable:string; toCol:string; cardinality:string|null; confidence:number; status:string; inferenceSource:string|null };
+export type OntologyCatalogRelation = { columnPairs?:Array<{fromCol:string;toCol:string}>; id:number; fromTable:string; fromCol:string; toTable:string; toCol:string; cardinality:string|null; confidence:number; status:string; inferenceSource:string|null };
 export type OntologyCatalog = { tables:OntologyCatalogTable[]; columnsByTable:Record<string,OntologyCatalogColumn[]>; relations:OntologyCatalogRelation[];termAnchors?:TermAnchor[];enums?:Record<string,string[]> };
 export type OntologyGenerationScopePlan = {
   sourceId:number;mode:"selected_tables";tableNames:string[];limits:{maxTables:number;maxFields:number};

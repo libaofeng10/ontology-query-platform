@@ -31,7 +31,7 @@ export function createOntologyDomainModelingService({domainPlanner,candidates}={
       const span=Math.max(1,Math.floor(90/domains.length));
       const domainLabel=domain.batchCount>1?`${domain.name}（${domain.batchIndex}/${domain.batchCount}）`:domain.name;
       onProgress({progress:start,total:100,currentStep:`正在建模 ${domainLabel}：Object 与 Link`});
-      let runRecord=priorRuns.find((item)=>item.scope?.domainPlanId===domain.id&&item.status==="succeeded")||priorRuns.find((item)=>item.scope?.domainPlanId===domain.id&&["queued","running"].includes(item.status))||null;
+      let runRecord=priorRuns.find((item)=>item.scope?.domainPlanId===domain.id&&item.status==="succeeded"&&item.catalogCurrent!==false)||priorRuns.find((item)=>item.scope?.domainPlanId===domain.id&&["queued","running"].includes(item.status))||null;
       try {
         if(!runRecord)runRecord=candidates.createRun({
           sourceId:source.id,

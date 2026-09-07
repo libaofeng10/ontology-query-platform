@@ -1,3 +1,5 @@
+import { linkPathIdentity } from "./ontology-bridge-paths.mjs";
+import { primaryKeyProperties } from "./catalog-identity.mjs";
 import { normalizeOntologyNamespace } from "./ontology-candidate-score.mjs";
 
 const APPLICABLE_STATUSES=new Set(["auto_confirmed","confirmed"]);
@@ -29,12 +31,12 @@ export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCan
   }
 
   const linkByApi=new Map(schema.linkTypes.map((link)=>[link.apiName,link]));const linkByRelation=new Map();
-  for(const link of schema.linkTypes)for(const id of relationIds(link))if(!linkByRelation.has(id))linkByRelation.set(id,link);
+  for(const link of schema.linkTypes)linkByRelation.set(linkPathIdentity(link),link);
   for(const candidate of links) {
     const payload=structuredClone(candidate.payload);
-    if(incremental){payload.source=objectAliases.get(payload.source)||payload.source;payload.target=objectAliases.get(payload.target)||payload.target;}
+    if(incremental){payload.source=objectAliases.get(payload.source)||objectByTable.get(run.scope?.endpointTables?.[payload.source])?.apiName||payload.source;payload.target=objectAliases.get(payload.target)||objectByTable.get(run.scope?.endpointTables?.[payload.target])?.apiName||payload.target;}
     if(!objectByApi.has(payload.source)||!objectByApi.has(payload.target)){conflicts.push(resolvedConflict({candidate,candidateType:"link",reason:"link_endpoint_missing",source:payload.source,target:payload.target,allowedResolutions:["keep_existing"],conflictResolutions}));continue;}
-    const relationId=relationIds(payload)[0]||null;const byApi=linkByApi.get(payload.apiName);const byRelation=relationId?linkByRelation.get(relationId):null;const existing=byApi||byRelation;
+    const relationId=linkPathIdentity(payload);const byApi=linkByApi.get(payload.apiName);const byRelation=relationId?linkByRelation.get(relationId):null;const existing=byApi||byRelation;
     if(existing) {
       if(incremental&&!conflictResolutions[candidate.id]&&equalJson([existing.source,existing.target,existing.cardinality,relationIds(existing)],[payload.source,payload.target,payload.cardinality,relationIds(payload)])){includedCandidates.push(candidate);continue;}
       if(equalJson(linkCore(existing),linkCore(payload))){includedCandidates.push(candidate);continue;}
@@ -55,7 +57,8 @@ export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCan
 function mergeAdditiveObject(existing,candidate) {
   if(!equalJson(mappedTables(existing),mappedTables(candidate)))return null;
   const key=(property)=>JSON.stringify([property?.mapping?.table,property?.mapping?.column]);
-  if(key(existing.properties?.find((p)=>p.apiName===existing.primaryKey))!==key(candidate.properties?.find((p)=>p.apiName===candidate.primaryKey)))return null;
+  const identity=object=>primaryKeyProperties(object.primaryKey).map(name=>key(object.properties?.find(property=>property.apiName===name))).sort();
+  if(!equalJson(identity(existing),identity(candidate)))return null;
   const properties=structuredClone(existing.properties||[]);
   for(const property of candidate.properties||[]) {
     const previous=properties.find((item)=>key(item)===key(property));
@@ -86,7 +89,7 @@ function resolvedConflict({candidate,candidateType,reason,existingApiName,source
 
 function replaceItem(items,existing,replacement){const index=items.indexOf(existing);if(index>=0)items.splice(index,1,replacement);}
 function rebuildObjectIndexes(objects,byApi,byTable){byApi.clear();byTable.clear();for(const object of objects){byApi.set(object.apiName,object);for(const table of mappedTables(object))if(!byTable.has(table))byTable.set(table,object);}}
-function rebuildLinkIndexes(links,byApi,byRelation){byApi.clear();byRelation.clear();for(const link of links){byApi.set(link.apiName,link);for(const id of relationIds(link))if(!byRelation.has(id))byRelation.set(id,link);}}
+function rebuildLinkIndexes(links,byApi,byRelation){byApi.clear();byRelation.clear();for(const link of links){byApi.set(link.apiName,link);byRelation.set(linkPathIdentity(link),link);}}
 function propertyCount(objects){return (objects||[]).reduce((sum,object)=>sum+(object?.properties?.length||0),0);}
 
 function objectCore(object) { return {apiName:object?.apiName,displayName:object?.displayName||object?.apiName,description:object?.description||"",namespace:object?.namespace||null,freshness:object?.freshness||null,parent:object?.parent||null,discriminator:object?.discriminator||null,termBinding:object?.termBinding||null,primaryKey:object?.primaryKey,properties:(object?.properties||[]).map((property)=>({apiName:property.apiName,displayName:property.displayName||property.apiName,description:property.description||"",type:property.type,required:Boolean(property.required),freshness:property.freshness||null,termBinding:property.termBinding||null,constraints:property.constraints||{},mapping:{table:property.mapping?.table,column:property.mapping?.column}})).sort((left,right)=>String(left.apiName).localeCompare(String(right.apiName)))}; }

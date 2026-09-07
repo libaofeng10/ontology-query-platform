@@ -1,3 +1,4 @@
+import { relationPairs, relationKey, reverseRelation } from "./physical-relation.mjs";
 import { randomUUID, createHash } from "node:crypto";
 import { guardSql, guardReadOnlySql } from "./sql-guard.mjs";
 import { buildQueryColumnSemantics, detectQuestionValueKinds } from "./query-column-semantics.mjs";
@@ -550,9 +551,7 @@ function relationPolicyKeys(relation) {
   const toTable = relation.toTable ?? relation.to_table;
   const toCol = relation.toCol ?? relation.toColumn ?? relation.to_col;
   if ([fromTable, fromCol, toTable, toCol].every((item) => String(item ?? "").trim())) {
-    const left = `${normalizeIdentifier(fromTable)}.${normalizeIdentifier(fromCol)}`;
-    const right = `${normalizeIdentifier(toTable)}.${normalizeIdentifier(toCol)}`;
-    keys.push(`edge:${left}>${right}`, `edge:${right}>${left}`);
+    try{const normalized={fromTable:normalizeIdentifier(fromTable),toTable:normalizeIdentifier(toTable),columnPairs:relationPairs({...relation,fromCol,toCol}).map(pair=>({fromCol:normalizeIdentifier(pair.fromCol),toCol:normalizeIdentifier(pair.toCol)}))};keys.push(`edge:${relationKey(normalized)}`,`edge:${relationKey(reverseRelation(normalized))}`);}catch{return [];}
   }
   return keys;
 }

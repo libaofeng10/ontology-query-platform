@@ -17,9 +17,11 @@ export function createOntologyDomainDraftService({store,candidates,semanticSchem
     const domainDefinitions=declared.length?declared.map((item,index)=>({
       id:String(item.domainId||item.runId||`domain-${index+1}`),name:String(item.domainName||`业务域 ${index+1}`),declared:item,
     })):uniqueDomains(allRuns);
+    const buildRunIds=task.payload?.sourceBuild?.workflowVersion===2?new Set(task.payload.sourceBuild.generation?.runIds||[]):null;
+    for(const run of allRuns.filter(item=>item.scope.scopeKind==="global_links"&&(!buildRunIds||buildRunIds.has(item.id))))if(!domainDefinitions.some(item=>item.id===run.scope.domainPlanId))domainDefinitions.push({id:run.scope.domainPlanId,name:run.scope.domainName,declared:null});
     const domains=domainDefinitions.map((definition)=>{
       const matching=allRuns.filter((run)=>String(run.scope?.domainPlanId||run.id)===definition.id).sort(newestFirst);
-      const succeeded=matching.find((run)=>run.status==="succeeded")||null;
+      const succeeded=matching.find((run)=>run.id===definition.declared?.runId&&run.status==="succeeded")||matching.find((run)=>run.status==="succeeded"&&candidates.getRun(run.id).catalogCurrent!==false)||null;
       const active=matching.find((run)=>["queued","running"].includes(run.status))||null;
       const latest=matching[0]||null;
       return {
@@ -28,7 +30,7 @@ export function createOntologyDomainDraftService({store,candidates,semanticSchem
         error:succeeded?null:active?null:latest?.error||definition.declared?.error||"该域尚未成功生成",
       };
     });
-    const selectedRuns=domains.map((domain)=>domain.run).filter(Boolean);
+    const selectedRuns=domains.map((domain)=>domain.run).filter(Boolean).sort((a,b)=>Number(a.scope.scopeKind==="global_links")-Number(b.scope.scopeKind==="global_links"));
     const runCandidates=new Map(selectedRuns.map((run)=>[run.id,store.listOntologyCandidates({runId:run.id,limit:2000})]));
     const allCandidates=selectedRuns.flatMap((run)=>runCandidates.get(run.id)||[]);
     const statusCount=(status)=>allCandidates.filter((candidate)=>status.includes(candidate.status)).length;
@@ -149,7 +151,8 @@ export function createOntologyDomainDraftService({store,candidates,semanticSchem
       const runItems=state.runCandidates.get(run.id)||[];
       const eligibleItems=options.repairDraftId?runItems.filter((candidate)=>(candidate.status==="applied"&&Number(candidate.appliedSchemaVersionId)===Number(options.repairDraftId))||ACCEPTED_STATUSES.has(candidate.status)):runItems;
       const repairResolutions=options.repairDraftId?Object.fromEntries(eligibleItems.map((candidate)=>[candidate.id,candidate.status==="applied"?"use_candidate":"keep_existing"])):conflictResolutions;
-      const assembled=assembleOntologyDraft({run,candidates:eligibleItems,baseSchema:schema,excludeCandidateIds:excludedCandidateIds,conflictResolutions:repairResolutions,incremental:Boolean(options.build),...(options.repairDraftId?{applicableStatuses:new Set(["applied",...ACCEPTED_STATUSES])}:{})});
+      const endpointTables=run.scope.scopeKind==="global_links"?Object.fromEntries((run.scope.endpointRunIds||[]).flatMap(id=>store.listOntologyCandidates({runId:id,candidateType:"object",limit:2000})).filter(item=>ACCEPTED_STATUSES.has(item.status)||item.status==="applied").map(item=>[item.payload.apiName,item.payload.properties?.[0]?.mapping?.table])):{};
+      const assembled=assembleOntologyDraft({run:{...run,scope:{...run.scope,endpointTables}},candidates:eligibleItems,baseSchema:schema,excludeCandidateIds:excludedCandidateIds,conflictResolutions:repairResolutions,incremental:Boolean(options.build),...(options.repairDraftId?{applicableStatuses:new Set(["applied",...ACCEPTED_STATUSES])}:{})});
       schema=assembled.schema;includedCandidates.push(...assembled.includedCandidates);conflicts.push(...assembled.conflicts);renamedLinkCount+=assembled.renamedLinks?.length||0;
     }
     const validation=semanticSchemas.validate(state.task.sourceId,schema);const diff=diffSemanticSchemas(validation.schema,originalBase);

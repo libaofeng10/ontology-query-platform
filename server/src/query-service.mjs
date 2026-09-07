@@ -1,3 +1,4 @@
+import { formatRelation } from "./physical-relation.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import { demoQuery } from "./demo-query.mjs";
 import { guardSql } from "./sql-guard.mjs";
@@ -714,7 +715,7 @@ async function buildRetrievalVector(sourceId,question,{embeddingIndex,retrieval}
 
 async function planSql(llm,question,context,conversationHistory,errorFeedback,timeoutMs,signal,canExplore=false,template=QUERY_PROMPT_DEFAULTS.legacySqlPlanner) {
   const schema=context.tables.map((table)=>`TABLE ${table.tableName} (${context.columns[table.tableName].map((column)=>{const key=`${table.tableName}.${column.columnName}`;const note=[column.comment,context.columnKinds?.[key]?`字段语义 ${context.columnKinds[key]}`:null].filter(Boolean).join("；");return `${column.columnName} ${column.dataType}${note?` /* ${note} */`:""}`;}).join(", ")})`).join("\n");
-  const relations=context.relations.map((r)=>`${r.fromTable}.${r.fromCol} = ${r.toTable}.${r.toCol}`).join("\n");
+  const relations=context.relations.map(formatRelation).join("\n");
   const rules=context.rules.map((r)=>`${r.name}: ${r.content}`).join("\n");
   const knowledge=context.knowledge.map((page)=>`[${page.pageType}] ${page.title}\n定义: ${page.content||""}\nSQL: ${page.sqlContent||""}\n反例: ${page.antiExamples||""}`).join("\n\n");
   const contract=canExplore

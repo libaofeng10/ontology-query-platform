@@ -64,6 +64,7 @@ export function createConnector({ appSecret, timeoutMs, mysqlClient=mysql }) {
 async function executeOnce(pool,sql,params,signal,timeoutMs) {
   if(signal?.aborted) throw abortError();
   const connection=await pool.getConnection();
+  if(signal?.aborted){connection.release();throw abortError();}
   let timer;
   let timedOut=false;
   let aborted=false;

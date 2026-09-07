@@ -13,7 +13,7 @@ import { createTaskService } from "../src/task-service.mjs";
 import { createSemanticSchemaService } from "../src/semantic-schema-service.mjs";
 import { evalSetChecksum } from "../src/evaluation-evidence.mjs";
 
-async function fixture({mode="review",pausePlan=Promise.resolve(),firstBuild=false,candidateTransform=(candidate)=>candidate,onGenerate=()=>{},similarity=()=>.9}={}) {
+async function fixture({mode="review",pausePlan=Promise.resolve(),firstBuild=false,candidateTransform=(candidate)=>candidate,onGenerate=()=>{},similarity=()=>.9,splitDomains=false,generateLinks=null}={}) {
   const root=await mkdtemp(join(tmpdir(),"ontoquery-source-build-"));
   const app=createApp({
     dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"source-build-test-secret",nodeEnv:"test",claudeBridge:null,
@@ -26,9 +26,10 @@ async function fixture({mode="review",pausePlan=Promise.resolve(),firstBuild=fal
     ontologyDomainPlanner:{plan:async()=>{
       await pausePlan;
       const tables=app.store.listTables(1).filter((table)=>["A","B"].includes(table.grade)&&!app.store.excludedTableNames(1).has(table.tableName));
+      if(splitDomains)return {domains:tables.map(table=>({id:table.tableName,domainKey:table.tableName,name:table.tableName,batchIndex:1,batchCount:1,tables:[table]}))};
       return {domains:[{id:"selected-domain",domainKey:"selected",name:"已选业务域",batchIndex:1,batchCount:1,tables}]};
     }},
-    ontologyCandidateGenerator:{generateObjects:async({run,onCandidate,phase="auto",knowledgePages=[]})=>{
+    ontologyCandidateGenerator:{...(generateLinks?{generateLinks}:{}),generateObjects:async({run,onCandidate,phase="auto",knowledgePages=[]})=>{
       await onGenerate({run,phase,knowledgePages});
       const items=[];
       for(const table of run.scope.tableNames){
@@ -404,3 +405,60 @@ async function api(app,path,body,method="POST",token="editor") {
   await app.handler(request,response);return {status:response.statusCode,body:raw?JSON.parse(raw):{}};
 }
 async function waitForTask(app,id){for(let index=0;index<300;index++){const task=app.store.getTask(id);if(!["queued","running"].includes(task.status))return task;await new Promise((resolve)=>setTimeout(resolve,10));}throw new Error("任务等待超时");}
+
+function completeLinks({catalog,endpoints,onCandidate}) {
+  const byTable=new Map(endpoints.map(item=>[item.payload.properties[0].mapping.table,item]));
+  return Promise.all(catalog.relations.filter(item=>["confirmed","accepted"].includes(item.status)&&byTable.has(item.fromTable)&&byTable.has(item.toTable)).map(relation=>{
+    const source=byTable.get(relation.fromTable),target=byTable.get(relation.toTable);
+    return onCandidate({candidateType:"link",sourceStableKey:source.stableKey,targetStableKey:target.stableKey,modelConfidence:.99,evidence:[{kind:"physical_relation",verified:true,refId:`relation:${relation.id}`}],payload:{apiName:`related_${relation.id}`,displayName:"订单所属客户",description:"订单关联客户",source:source.payload.apiName,target:target.payload.apiName,inverseApiName:`inverse_${relation.id}`,inverseDisplayName:"客户订单",relationKind:"references",cardinality:"many_to_one",relationMappings:[{relationId:relation.id}]}});
+  })).then(candidates=>({candidates,calls:[],normalizationIssues:[],tokenUsage:{},eligibleRelationCount:candidates.length}));
+}
+
+test("跨域关系进入最终生效草稿，补边运行不要求重复生成对象",async()=>{
+  const {app,close}=await fixture({mode:"auto_draft",firstBuild:true,splitDomains:true,generateLinks:completeLinks});
+  try{
+    const started=await api(app,"/api/sources/1/ontology-build",{selections:[{tableName:"crm_customer",included:true},{tableName:"sales_order",included:true}]});
+    const task=await waitForTask(app,started.body.id);
+    assert.equal(task.payload.sourceBuild.phase,"ready",JSON.stringify(task.payload.sourceBuild.questions));
+    const published=app.store.getPublishedOntologySchema(1);
+    assert.equal(published.schema.objectTypes.length,2);assert.equal(published.schema.linkTypes.length,1);
+    assert.equal(task.payload.sourceBuild.relationCoverage.coveredRelationCount,1);
+    assert.equal(app.store.listOntologyGenerationRuns(1).filter(run=>run.scope.scopeKind==="global_links").length,1);
+  }finally{await close();}
+});
+
+test("待确认物理关系在对象生成前可见，回答后刷新依据并继续同一构建",async()=>{
+  let calls=0;
+  const {app,close}=await fixture({mode:"auto_draft",firstBuild:true,splitDomains:true,generateLinks:completeLinks,onGenerate:()=>{calls++;}});
+  try{
+    const relation=app.store.listRelations(1,true).find(item=>item.fromTable==="sales_order"&&item.toTable==="crm_customer");
+    app.store.setRelationStatus(relation.id,"review");
+    const started=await api(app,"/api/sources/1/ontology-build",{selections:[{tableName:"crm_customer",included:true},{tableName:"sales_order",included:true}]});
+    let task=await waitForTask(app,started.body.id);
+    const question=task.payload.sourceBuild.questions.find(item=>item.kind==="relation");
+    assert.ok(question,JSON.stringify(task.payload.sourceBuild));assert.equal(calls,0);assert.equal(app.store.getPublishedOntologySchema(1),null);
+    const resumed=await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:question.id,resolution:"confirm_relation"}]});
+    assert.equal(resumed.status,202,JSON.stringify(resumed.body));assert.equal(resumed.body.id,task.id);
+    task=await waitForTask(app,task.id);assert.equal(task.payload.sourceBuild.phase,"ready",JSON.stringify(task.payload.sourceBuild));
+    assert.equal(app.store.listRelations(1,true).find(item=>item.id===relation.id).status,"confirmed");
+    assert.equal(app.store.getPublishedOntologySchema(1).schema.linkTypes.length,1);assert.equal(calls,2);
+    const before=app.store.listOntologyGenerationRuns(1).length;
+    await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id});await waitForTask(app,task.id);
+    assert.equal(app.store.listOntologyGenerationRuns(1).length,before);
+  }finally{await close();}
+});
+
+test("历史版本缺少关系时，结构未变也不能直接报告无需更新",async()=>{
+  let calls=0;const {app,close}=await fixture({mode:"auto_draft",firstBuild:true,splitDomains:true,generateLinks:completeLinks,onGenerate:()=>{calls++;}});
+  try{
+    const selections=[{tableName:"crm_customer",included:true},{tableName:"sales_order",included:true}];
+    const first=await api(app,"/api/sources/1/ontology-build",{selections});await waitForTask(app,first.body.id);
+    const legacy=app.store.getPublishedOntologySchema(1),schema=structuredClone(legacy.schema);schema.linkTypes=[];
+    // A fixture for the old behavior: table coverage was complete but the link was lost.
+    app.store.db.prepare("UPDATE ds_ontology_schema_version SET schema_json=? WHERE id=?").run(JSON.stringify(schema),legacy.id);
+    const before=calls,started=await api(app,"/api/sources/1/ontology-build",{selections}),task=await waitForTask(app,started.body.id);
+    assert.notEqual(task.payload.sourceBuild.phase,"unchanged");assert.ok(calls>before);
+    assert.equal(task.payload.sourceBuild.relationCoverage.coveredRelationCount,1);
+    assert.equal(app.store.getOntologySchemaVersion(task.payload.sourceBuild.draftVersionId).schema.linkTypes.length,1);
+  }finally{await close();}
+});

@@ -81,21 +81,23 @@ function isEnumDictionary(columnName,distinctCount,estimatedRows,sampleLimit,max
 async function attachProfiles(connector,source,table,columns,{sampleLimit,timeoutMs}={}) {
   const safeLimit=Math.max(1,Math.min(1000,Math.floor(Number(sampleLimit)||1000)));
   const sampled=columns.filter((column)=>!column.enums?.length);
-  let rows=[];
+  let rows=[];let samplingMethod="enum_nonnull_counts";
   let sampledOk=sampled.length===0;
   if(sampled.length) {
     const select=sampled.map((column)=>quoteIdentifier(column.columnName)).join(", ");
     const orderColumn=columns.find((column)=>column.isPrimary)||columns.find((column)=>TIME_TYPE.test(column.dataType)&&/(?:updated?|modified|created|paid|refund).*?(?:at|time|date)$/i.test(column.columnName));
     const order=orderColumn?` ORDER BY ${quoteIdentifier(orderColumn.columnName)} DESC`:"";
+    samplingMethod=orderColumn?`ordered_desc:${orderColumn.columnName}`:"bounded_unordered_rows";
     const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),Math.max(100,Number(timeoutMs)||10_000));
     try { [rows]=await connector.query(source,`SELECT ${select} FROM ${quoteIdentifier(table.tableName)}${order} LIMIT ${safeLimit}`,[],controller.signal);sampledOk=true; }
     catch { rows=[];sampledOk=false; }
     finally { clearTimeout(timer); }
   }
   for(const column of columns) {
-    if(!column.enums?.length&&!sampledOk){column.profile=null;continue;}
+    if(!column.enums?.length&&!sampledOk){column.profile=null;column.profileUnavailableReason="query_failed";continue;}
     const values=column.enums?.length?[]:rows.map((row)=>row?.[column.columnName]);
     column.profile=buildColumnProfile({values,dataType:column.dataType,enums:column.enums});
+    column.profile.profile.status="sampled";column.profile.profile.samplingMethod=column.enums?.length?"enum_nonnull_counts":samplingMethod;
   }
 }
 

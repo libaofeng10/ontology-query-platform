@@ -116,7 +116,14 @@ function parseSseBlock(block:string):QueryStreamEvent|null{
   let eventName="";const data=[];
   for(const line of block.split("\n")){if(line.startsWith("event:"))eventName=line.slice(6).trim();else if(line.startsWith("data:"))data.push(line.slice(5).trimStart());}
   if(!data.length)return null;
-  try{const parsed=JSON.parse(data.join("\n")) as QueryStreamEvent;return parsed.type?parsed:{...parsed,type:eventName} as QueryStreamEvent;}catch{return null;}
+  try{
+    const parsed:unknown=JSON.parse(data.join("\n"));
+    if(!parsed||typeof parsed!=="object"||Array.isArray(parsed))return null;
+    const type="type" in parsed?parsed.type:eventName;
+    if(typeof type!=="string"||!["step","thought","tool_call","tool_result","final","refused","clarification"].includes(type))return null;
+    if(["final","refused","clarification"].includes(type)&&(!("result" in parsed)||!parsed.result||typeof parsed.result!=="object"||Array.isArray(parsed.result)))return null;
+    return {...parsed,type} as QueryStreamEvent;
+  }catch{return null;}
 }
 
 function currentToken(){if(runtimeToken)return runtimeToken;if(typeof window!=="undefined"){const stored=window.sessionStorage.getItem(TOKEN_KEY);if(stored)return stored;}return ENV_TOKEN;}

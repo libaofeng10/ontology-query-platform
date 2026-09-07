@@ -1,11 +1,14 @@
+import { relationPairs } from "./physical-relation.mjs";
+import { findBridgeRelationPaths, missingBridgePaths } from "./ontology-bridge-paths.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import {
   createOntologyCandidateScorer,
+  createObjectStableKey,
   cosineSimilarity,
   normalizeOntologyNamespace,
   ONTOLOGY_CANDIDATE_SCORING_VERSION,
 } from "./ontology-candidate-score.mjs";
-import { buildObjectGenerationScope, ONTOLOGY_OBJECT_PROMPT_VERSION } from "./ontology-candidate-generator.mjs";
+import { buildLinkGenerationScope, buildObjectGenerationScope, ONTOLOGY_OBJECT_PROMPT_VERSION } from "./ontology-candidate-generator.mjs";
 import { assembleOntologyDraft } from "./ontology-draft-assembler.mjs";
 import { assertLosslessOntologyDraft } from "./ontology-draft-integrity.mjs";
 import { diffSemanticSchemas } from "./semantic-schema-diff.mjs";
@@ -35,13 +38,13 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     return {sourceId,tables,columnsByTable,enumsByTable,relations,termAnchors};
   }
 
-  function prepareGenerationScope(input,{allowEmpty=false}={}) {
+  function prepareGenerationScope(input,{allowEmpty=false,linkOnly=false}={}) {
     const source=store.getSource(Number(input?.sourceId));
     if(!source)throw httpError(404,"数据源不存在");
     const mode=String(input?.mode||"selected_tables");
     if(mode!=="selected_tables")throw httpError(400,"首期只支持 selected_tables 生成方式");
     const tableNames=[...new Set((input?.tableNames||[]).map((item)=>String(item).trim()).filter(Boolean))].sort();
-    const maxTables=boundedInteger(aiConfig.maxTables,1,20,20);
+    const maxTables=linkOnly?20:boundedInteger(aiConfig.maxTables,1,20,20);
     if((!allowEmpty&&!tableNames.length)||tableNames.length>maxTables)throw httpError(400,`tableNames 必须选择 1 到 ${maxTables} 张表`);
     const selectedCatalog=catalog(source.id,tableNames);
     const found=new Set(selectedCatalog.tables.map((table)=>table.tableName));
@@ -67,9 +70,9 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     };
   }
 
-  function createRun(input,createdBy,{id=randomUUID(),taskId=null}={}) {
+  function createRun(input,createdBy,{id=randomUUID(),taskId=null,linkContext=null}={}) {
     ensureEnabled(aiConfig);
-    const {source,mode,tableNames,maxTables,maxFields,selectedCatalog,generationScope}=prepareGenerationScope(input);
+    const {source,mode,tableNames,maxTables,maxFields,selectedCatalog,generationScope}=prepareGenerationScope(input,{linkOnly:Boolean(linkContext)});
     const nonSensitiveFieldCount=generationScope.totalNonSensitiveFields;
     if(store.listOntologyGenerationRuns(source.id,20).some((run)=>["queued","running"].includes(run.status)))throw httpError(409,"同一数据源已有正在执行的本体生成批次");
     const publishedAtStart=store.getPublishedOntologySchema(source.id);
@@ -84,7 +87,7 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     const effectiveAutoConfirmScore=boundedInteger(sourceAutoConfirmScore,0,100,boundedInteger(aiConfig.autoConfirmScore,0,100,85));
     const run=store.createOntologyGenerationRun({
       id,sourceId:source.id,taskId,mode,
-      scope:{tableNames,domainName:String(input?.domainName||"").trim(),domainDescription:String(input?.domainDescription||"").trim(),namespace,nonSensitiveFieldCount,batches:generationScope.batches,limits:{maxTables,maxFields},modelingMode:aiConfig.mode,autoConfirmScore:effectiveAutoConfirmScore,llmTimeoutMs:boundedInteger(aiConfig.timeoutMs,1_000,600_000,300_000),embeddingModel,publishedSchemaVersionIdAtStart:publishedAtStart?.id||null,...domainOrchestrationScope(input)},
+      scope:{tableNames,domainName:String(input?.domainName||"").trim(),domainDescription:String(input?.domainDescription||"").trim(),namespace,nonSensitiveFieldCount,batches:generationScope.batches,limits:{maxTables,maxFields},modelingMode:aiConfig.mode,autoConfirmScore:effectiveAutoConfirmScore,llmTimeoutMs:boundedInteger(aiConfig.timeoutMs,1_000,600_000,300_000),embeddingModel,publishedSchemaVersionIdAtStart:publishedAtStart?.id||null,...domainOrchestrationScope(input),...(linkContext?{...linkContext,scopeKind:"global_links",batches:[]}: {})},
       catalogChecksum:ontologyCatalogChecksum(selectedCatalog),baseSchemaVersionId,
       modelName:String(config?.llm?.model||"").trim()||null,promptVersion:ONTOLOGY_OBJECT_PROMPT_VERSION,
       scoringVersion:`${ONTOLOGY_CANDIDATE_SCORING_VERSION}:embedding=${embeddingModel}`,createdBy:String(createdBy||"system"),summary:{tableCount:tableNames.length,nonSensitiveFieldCount,includedFieldCount:generationScope.includedFieldCount,truncatedFieldCount:generationScope.truncatedFieldCount,batchCount:generationScope.batchCount,confirmedRelationCount:generationScope.confirmedRelationCount,includedRelationCount:generationScope.includedRelationCount,crossBatchRelationCount:generationScope.crossBatchRelationCount,excludedSensitiveRelationCount:generationScope.excludedSensitiveRelationCount,excludedInvalidRelationCount:generationScope.excludedInvalidRelationCount,candidateCount:0,autoConfirmedCount:0,reviewRequiredCount:0,blockedCount:0},
@@ -97,7 +100,7 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     const run=requiredRun(runId);
     if(!["queued","running"].includes(run.status)&&!(run.status==="succeeded"&&(input?.candidateType==="link"||repair)))throw httpError(409,"当前批次状态不允许写入该候选");
     const currentCatalog=validatedRunCatalog(run);
-    const acceptedObjects=store.listOntologyCandidates({runId:run.id,candidateType:"object"}).filter((item)=>ACCEPTED_STATUSES.has(item.status));
+    const acceptedObjects=acceptedRunObjects(run);
     const baseSchema=run.baseSchemaVersionId?store.getOntologySchemaVersion(run.baseSchemaVersionId)?.schema:null;
     const candidate={...input,payload:normalizeCandidatePayload(input?.payload,{candidateType:input?.candidateType,namespace:run.scope.namespace,catalog:currentCatalog}),sourceId:run.sourceId,namespace:run.scope.namespace};
     const result=await candidateScorer.score(candidate,{sourceId:run.sourceId,catalog:currentCatalog,acceptedObjects,baseSchema,mode:run.scope.modelingMode||aiConfig.mode,autoConfirmScore:run.scope.autoConfirmScore??aiConfig.autoConfirmScore,embeddingModel:run.scope.embeddingModel,scoringVersion:run.scoringVersion});
@@ -117,7 +120,7 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
 
   async function evaluateBatchAndStore(runId,inputs,actor="system",options={}) {
     if(!inputs.length)return [];
-    const run=requiredRun(runId);const currentCatalog=validatedRunCatalog(run);const acceptedObjects=store.listOntologyCandidates({runId:run.id,candidateType:"object"}).filter((item)=>ACCEPTED_STATUSES.has(item.status));
+    const run=requiredRun(runId);const currentCatalog=validatedRunCatalog(run);const acceptedObjects=acceptedRunObjects(run);
     const prepared=inputs.map((input,index)=>({...input,criticId:`${run.id}:${input.candidateType}:${index}:${createHash("sha256").update(JSON.stringify(input.payload||{})).digest("hex").slice(0,12)}`}));
     const inspected=critic?.inspect?await critic.inspect(prepared,{catalog:currentCatalog,acceptedObjects}):{results:new Map(),skipped:true,error:null};
     const stats=criticStats.get(run.id)||{batches:0,flagged:0,skipped:0,errors:[]};stats.batches++;if(inspected.skipped)stats.skipped++;if(inspected.error)stats.errors.push(inspected.error);
@@ -173,13 +176,13 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
       const termAnchorSelection=await selectTermAnchors(run,currentCatalog);const generationCatalog={...currentCatalog,termAnchors:termAnchorSelection.anchors};
       const baseSchema=run.baseSchemaVersionId?store.getOntologySchemaVersion(run.baseSchemaVersionId)?.schema:null;
       reportProgress({progress:5,total:100,currentStep:"准备目录快照与业务语料"});
-      const generated=await generator.generateObjects({run,catalog:generationCatalog,knowledgePages,baseSchema,onCandidate:(candidate)=>evaluateAndStore(run.id,candidate,"model"),onCandidates:(candidates)=>evaluateBatchAndStore(run.id,candidates,"model"),onProgress:reportProgress});
-      const autoEndpoints=store.listOntologyCandidates({runId:run.id,candidateType:"object"}).filter((candidate)=>candidate.status==="auto_confirmed");
+      const generated=run.scope.scopeKind==="global_links"?emptyGenerationResult():await generator.generateObjects({run,catalog:generationCatalog,knowledgePages,baseSchema,onCandidate:(candidate)=>evaluateAndStore(run.id,candidate,"model"),onCandidates:(candidates)=>evaluateBatchAndStore(run.id,candidates,"model"),onProgress:reportProgress});
+      const autoEndpoints=acceptedRunObjects(run);
       const existingLinkKeys=store.listOntologyCandidates({runId:run.id,candidateType:"link"}).map((candidate)=>candidate.stableKey);
-      const links=generator.generateLinks?await generator.generateLinks({run,catalog:currentCatalog,endpoints:autoEndpoints,knowledgePages,phase:"auto",existingStableKeys:existingLinkKeys,onCandidate:(candidate)=>evaluateAndStore(run.id,candidate,"model"),onCandidates:(candidates)=>evaluateBatchAndStore(run.id,candidates,"model"),onProgress:reportProgress}):emptyGenerationResult();
+      const links=generator.generateLinks?await generator.generateLinks({run,catalog:linkCatalog(run,currentCatalog),endpoints:autoEndpoints,knowledgePages,phase:"auto",existingStableKeys:existingLinkKeys,onCandidate:(candidate)=>evaluateAndStore(run.id,candidate,"model"),onCandidates:(candidates)=>evaluateBatchAndStore(run.id,candidates,"model"),onProgress:reportProgress}):emptyGenerationResult();
       const candidates=store.listOntologyCandidates({runId:run.id});
       const normalizationIssues=[...generated.normalizationIssues,...links.normalizationIssues];
-      const summary={...run.summary,...summarizeCandidates(candidates,run.scope.tableNames),linkEligibleRelationCount:links.eligibleRelationCount,knowledgeRetrievalMode:knowledgeSelection.mode,termAnchorRetrievalMode:termAnchorSelection.mode,termAnchorCount:termAnchorSelection.anchors.length,normalizationIssueCount:normalizationIssues.length,normalizationIssues:normalizationIssues.slice(0,100),critic:criticStats.get(run.id)||{batches:0,flagged:0,skipped:0,errors:[]},modelCalls:[...generated.calls,...links.calls]};
+      const summary={...run.summary,...summarizeCandidates(candidates,run.scope.scopeKind==="global_links"?[]:run.scope.tableNames),linkEligibleRelationCount:links.eligibleRelationCount,knowledgeRetrievalMode:knowledgeSelection.mode,termAnchorRetrievalMode:termAnchorSelection.mode,termAnchorCount:termAnchorSelection.anchors.length,normalizationIssueCount:normalizationIssues.length,normalizationIssues:normalizationIssues.slice(0,100),critic:criticStats.get(run.id)||{batches:0,flagged:0,skipped:0,errors:[]},modelCalls:[...generated.calls,...links.calls]};
       const tokenUsage=mergeUsage(generated.tokenUsage,links.tokenUsage);
       const completed=store.transitionOntologyGenerationRun({id:run.id,expectedStatus:"running",status:"succeeded",progress:100,summary,tokenUsage});
       if(!completed.ok)throw new Error("生成批次完成时状态已变化");
@@ -199,12 +202,12 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     if(run.status!=="succeeded")throw new Error("只有已完成 Object 阶段的批次可以补充生成 Link");
     try {
       const currentCatalog=validatedRunCatalog(run);
-      const endpoints=store.listOntologyCandidates({runId:run.id,candidateType:"object"}).filter((candidate)=>ACCEPTED_STATUSES.has(candidate.status));
+      const endpoints=acceptedRunObjects(run);
       const knowledgeSelection=await selectKnowledgePages(run.sourceId,currentCatalog);const knowledgePages=knowledgeSelection.pages;
       const existingLinkKeys=store.listOntologyCandidates({runId:run.id,candidateType:"link"}).map((candidate)=>candidate.stableKey);
-      const generated=await generator.generateLinks({run,catalog:currentCatalog,endpoints,knowledgePages,phase:"supplemental",existingStableKeys:existingLinkKeys,onCandidate:(candidate)=>evaluateAndStore(run.id,candidate,"model"),onCandidates:(candidates)=>evaluateBatchAndStore(run.id,candidates,"model"),onProgress});
+      const generated=await generator.generateLinks({run,catalog:linkCatalog(run,currentCatalog),endpoints,knowledgePages,phase:"supplemental",existingStableKeys:existingLinkKeys,onCandidate:(candidate)=>evaluateAndStore(run.id,candidate,"model"),onCandidates:(candidates)=>evaluateBatchAndStore(run.id,candidates,"model"),onProgress});
       const candidates=store.listOntologyCandidates({runId:run.id});const normalizationIssues=[...(run.summary.normalizationIssues||[]),...generated.normalizationIssues].slice(0,100);
-      const summary={...run.summary,...summarizeCandidates(candidates,run.scope.tableNames),supplementalLinkEligibleRelationCount:generated.eligibleRelationCount,knowledgeRetrievalMode:knowledgeSelection.mode,normalizationIssueCount:Number(run.summary.normalizationIssueCount||0)+generated.normalizationIssues.length,normalizationIssues,critic:criticStats.get(run.id)||run.summary.critic||{batches:0,flagged:0,skipped:0,errors:[]},modelCalls:[...(run.summary.modelCalls||[]),...generated.calls],lastSupplementalLinkError:null};
+      const summary={...run.summary,...summarizeCandidates(candidates,run.scope.scopeKind==="global_links"?[]:run.scope.tableNames),supplementalLinkEligibleRelationCount:generated.eligibleRelationCount,knowledgeRetrievalMode:knowledgeSelection.mode,normalizationIssueCount:Number(run.summary.normalizationIssueCount||0)+generated.normalizationIssues.length,normalizationIssues,critic:criticStats.get(run.id)||run.summary.critic||{batches:0,flagged:0,skipped:0,errors:[]},modelCalls:[...(run.summary.modelCalls||[]),...generated.calls],lastSupplementalLinkError:null};
       const tokenUsage=mergeUsage(run.tokenUsage,generated.tokenUsage);
       const updated=store.transitionOntologyGenerationRun({id:run.id,expectedStatus:"succeeded",status:"succeeded",progress:100,summary,tokenUsage});
       if(!updated.ok)throw new Error("补充 Link 完成时批次状态已变化");
@@ -230,7 +233,7 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     let payload=current.payload;let score=current.score;let scoreBreakdown=current.scoreBreakdown;let validation=current.validation;let forcedReviewReasons=current.forcedReviewReasons;
     if(edited){
       payload=normalizeCandidatePayload(input.candidate,{candidateType:current.candidateType,namespace:run.scope.namespace,catalog:currentCatalog});
-      const acceptedObjects=store.listOntologyCandidates({runId:run.id,candidateType:"object"}).filter((item)=>ACCEPTED_STATUSES.has(item.status));
+      const acceptedObjects=acceptedRunObjects(run);
       const baseSchema=run.baseSchemaVersionId?store.getOntologySchemaVersion(run.baseSchemaVersionId)?.schema:null;
       const rescored=await candidateScorer.score({...current,payload,namespace:run.scope.namespace},{sourceId:run.sourceId,catalog:currentCatalog,acceptedObjects,baseSchema,mode:"review",autoConfirmScore:run.scope.autoConfirmScore??aiConfig.autoConfirmScore,embeddingModel:run.scope.embeddingModel,scoringVersion:run.scoringVersion});
       if(!rescored.validation.ok)throw httpError(422,"人工修订后的候选未通过确定性校验");
@@ -322,6 +325,79 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
   function getCandidate(id) { const candidate=store.getOntologyCandidate(id);if(!candidate)return null;const calibration=store.listOntologyCandidateCalibrationLabels(candidate.sourceId).find((item)=>item.candidateId===candidate.id)||null;return {...candidate,calibration}; }
   function listCandidates(filters) { const candidates=store.listOntologyCandidates(filters);if(!candidates.length)return candidates;const labels=new Map(store.listOntologyCandidateCalibrationLabels(candidates[0].sourceId).map((item)=>[item.candidateId,item]));return candidates.map((candidate)=>({...candidate,calibration:labels.get(candidate.id)||null})); }
 
+
+  function acceptedRunObjects(run) {
+    const ids=run.scope.scopeKind==="global_links"?run.scope.endpointRunIds||[]:[run.id];
+    const tables=new Set(run.scope.tableNames);
+    const objects=ids.flatMap(id=>{
+      const owner=requiredRun(id);
+      validatedRunCatalog(owner);
+      if(owner.sourceId!==run.sourceId||id!==run.id&&owner.scope.orchestrationId!==run.scope.orchestrationId)throw httpError(409,"关系端点不属于本次构建");
+      return store.listOntologyCandidates({runId:id,candidateType:"object",limit:2000}).filter(item=>ACCEPTED_STATUSES.has(item.status)&&objectTables(item.payload).some(table=>tables.has(table)));
+    });
+    if(run.scope.scopeKind==="global_links"&&run.baseSchemaVersionId){
+      const base=store.getOntologySchemaVersion(run.baseSchemaVersionId)?.schema;
+      const covered=new Set(objects.flatMap(item=>objectTables(item.payload)));
+      for(const payload of base?.objectTypes||[])if(objectTables(payload).every(table=>tables.has(table))&&!objectTables(payload).some(table=>covered.has(table)))objects.push({id:`base:${run.baseSchemaVersionId}:${payload.apiName}`,sourceId:run.sourceId,candidateType:"object",status:"applied",payload,stableKey:createObjectStableKey({namespace:payload.namespace||"default",payload})});
+    }
+    return objects;
+  }
+
+  function buildCandidates(run,endpointRunIds=run.scope.endpointRunIds) {
+    const allowed=endpointRunIds?new Set(endpointRunIds):null;
+    const cache=new Map();
+    const belongs=(item)=>!allowed||(item.scope.scopeKind==="global_links"?(item.scope.endpointRunIds||[]).length===allowed.size&&(item.scope.endpointRunIds||[]).every(id=>allowed.has(id)):allowed.has(item.id));
+    return store.listOntologyGenerationRuns(run.sourceId,500).filter(item=>item.scope.orchestrationId===run.scope.orchestrationId&&item.status==="succeeded"&&belongs(item)&&runCatalogCurrent(item,cache)).flatMap(item=>store.listOntologyCandidates({runId:item.id,limit:2000}));
+  }
+  function coveredRelationIds(items,baseSchema) {
+    return new Set([...items.filter(item=>item.candidateType==="link"&&ACCEPTED_STATUSES.has(item.status)).flatMap(item=>item.payload.relationMappings||[]),...(baseSchema?.linkTypes||[]).flatMap(item=>item.relationMappings||[])].map(item=>Number(item.relationId??item)));
+  }
+  function linkCatalog(run,currentCatalog) {
+    if(run.scope.scopeKind!=="global_links")return currentCatalog;
+    const allowed=new Set(run.scope.relationIds),base=run.baseSchemaVersionId?store.getOntologySchemaVersion(run.baseSchemaVersionId)?.schema:null;
+    const covered=coveredRelationIds(buildCandidates(run).filter(item=>item.runId!==run.id),base);
+    const links=buildCandidates(run).filter(item=>item.runId!==run.id&&item.candidateType==="link"&&ACCEPTED_STATUSES.has(item.status)).map(item=>item.payload);
+    const missing=missingBridgePaths(findBridgeRelationPaths(currentCatalog),[...links,...(base?.linkTypes||[])]);
+    return {...currentCatalog,relations:currentCatalog.relations.filter(item=>allowed.has(item.id)),excludedDirectRelationIds:run.scope.pathIds?.length?[...allowed]:[...covered],pathIds:(run.scope.pathIds||[]).filter(id=>missing.some(path=>path.pathId===id))};
+  }
+  async function completeBuildLinks({sourceId,orchestrationId,runIds,tableNames,actor="system",extraRounds=0,onProgress=()=>{}}) {
+    const objectRuns=runIds.map(requiredRun).filter(run=>run.scope.scopeKind!=="global_links");
+    if(!objectRuns.length)return {runIds:[],coverage:{confirmedRelationCount:0,coveredRelationCount:0,missingRelationIds:[]}};
+    for(const run of objectRuns)if(run.sourceId!==sourceId||run.scope.orchestrationId!==orchestrationId)throw httpError(409,"关系补充范围与本次构建不一致");
+    const selected=catalog(sourceId,tableNames),relations=selected.relations.filter(item=>["confirmed","accepted"].includes(item.status)).sort((a,b)=>a.id-b.id);
+    const baseId=objectRuns[0].baseSchemaVersionId,base=baseId?store.getOntologySchemaVersion(baseId)?.schema:null;
+    const globalRuns=[],paths=findBridgeRelationPaths(selected),work=[];
+    // Ten relationships need at most twenty endpoint tables per model batch.
+    for(let offset=0;offset<relations.length;offset+=10){
+      const chunk=relations.slice(offset,offset+10);
+      work.push({relationIds:chunk.map(item=>item.id),pathIds:[],domainPlanId:`global-links:${chunk.map(item=>item.id).join(",")}`,endpointTables:[...new Set(chunk.flatMap(item=>[item.fromTable,item.toTable]))]});
+    }
+    // Six bridge paths need at most eighteen tables, including the bridges.
+    for(let offset=0;offset<paths.length;offset+=6){
+      const chunk=paths.slice(offset,offset+6);
+      work.push({relationIds:[...new Set(chunk.flatMap(item=>item.relationIds))],pathIds:chunk.map(item=>item.pathId),domainPlanId:`global-paths:${chunk.map(item=>item.pathId).join(",")}`,endpointTables:[...new Set(chunk.flatMap(item=>[item.fromTable,item.bridgeTable,item.toTable]))]});
+    }
+    for(const {relationIds,pathIds,domainPlanId,endpointTables} of work){
+      const prior=store.listOntologyGenerationRuns(sourceId,500).filter(item=>item.scope.orchestrationId===orchestrationId&&item.scope.domainPlanId===domainPlanId);
+      const reusable=prior.filter(item=>runCatalogCurrent(item)&&JSON.stringify([...(item.scope.endpointRunIds||[])].sort())===JSON.stringify(objectRuns.map(run=>run.id).sort()));
+      let run=reusable.find(item=>item.status==="succeeded")||reusable.find(item=>["queued","running"].includes(item.status));
+      const covered=coveredRelationIds(buildCandidates(objectRuns[0],objectRuns.map(item=>item.id)),base);
+      const links=buildCandidates(objectRuns[0],objectRuns.map(item=>item.id)).filter(item=>item.candidateType==="link"&&ACCEPTED_STATUSES.has(item.status)).map(item=>item.payload);
+      const pendingPaths=missingBridgePaths(paths,[...links,...(base?.linkTypes||[])]);
+      if(!run&&(pathIds.length?!pathIds.some(id=>pendingPaths.some(path=>path.pathId===id)):relationIds.every(id=>covered.has(id))))continue;
+      if(!run){
+        run=createRun({sourceId,tableNames:endpointTables,domainName:pathIds.length?"中间表业务关系":"跨域关系补充",orchestrationId,domainPlanId,baseSchemaVersionId:baseId},actor,{taskId:orchestrationId,linkContext:{endpointRunIds:objectRuns.map(item=>item.id),relationIds,pathIds}});
+      }
+      if(run.status!=="succeeded")await runGeneration({payload:{runId:run.id},onProgress});
+      const spent=store.listOntologyGenerationRuns(sourceId,500).filter(item=>item.scope.orchestrationId===orchestrationId).reduce((sum,item)=>sum+Number(item.summary.repairAttempts||0),0);
+      await refineRun(run.id,{extraRounds,remainingRounds:Math.max(0,20-spent),onProgress});
+      globalRuns.push(run.id);
+    }
+    const covered=coveredRelationIds(buildCandidates(objectRuns[0],objectRuns.map(item=>item.id)),base),missing=relations.filter(item=>!covered.has(item.id));
+    const links=buildCandidates(objectRuns[0],objectRuns.map(item=>item.id)).filter(item=>item.candidateType==="link"&&ACCEPTED_STATUSES.has(item.status)).map(item=>item.payload),missingPaths=missingBridgePaths(paths,[...links,...(base?.linkTypes||[])]);
+    return {runIds:globalRuns,coverage:{confirmedRelationCount:relations.length,coveredRelationCount:relations.length-missing.length,missingRelationIds:missing.map(item=>item.id),bridgePathCount:paths.length,bridgePathLimitReached:Boolean(paths.truncated),coveredBridgePathCount:paths.length-missingPaths.length,missingBridgePaths:missingPaths.map(({pathId,fromTable,toTable,bridgeTable,relationIds})=>({pathId,fromTable,toTable,bridgeTable,relationIds}))}};
+  }
+
   async function refineRun(runId,{onProgress=()=>{},extraRounds=0,remainingRounds=20}={}) {
     ensureEnabled(aiConfig);
     let run=requiredRun(runId);
@@ -333,14 +409,15 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
     while(attempts<limit) {
       const all=store.listOntologyCandidates({runId,limit:2000});
       const pending=all.filter((item)=>["review_required","blocked"].includes(item.status));
-      const summary=summarizeCandidates(all,run.scope.tableNames);
-      if(!pending.length&&!summary.objectMissingTableCount)break;
+      const summary=summarizeCandidates(all,run.scope.scopeKind==="global_links"?[]:run.scope.tableNames);
+      const uncovered=buildLinkGenerationScope({catalog:linkCatalog(run,validatedRunCatalog(run)),endpoints:acceptedRunObjects(run),namespace:run.scope.namespace,existingStableKeys:all.filter(item=>item.candidateType==="link"&&ACCEPTED_STATUSES.has(item.status)).map(item=>item.stableKey)});
+      if(!pending.length&&!summary.objectMissingTableCount&&!uncovered.relations.length)break;
       const currentCatalog=validatedRunCatalog(run);
       const knowledgeSelection=await selectKnowledgePages(run.sourceId,currentCatalog);
       const targetTables=new Set([...summary.objectMissingTables,...pending.filter((item)=>item.candidateType==="object").flatMap((item)=>(item.payload.properties||[]).map((p)=>p.mapping.table))]);
       const batches=(run.scope.batches||[]).filter((batch)=>batch.tableNames.some((table)=>targetTables.has(table))).map((batch)=>({...batch,tableNames:batch.tableNames.filter((table)=>targetTables.has(table)),tables:batch.tables.filter((table)=>targetTables.has(table.tableName))}));
       const feedback=pending.map((item)=>({definition:item.payload,issues:item.validation?.errors||[],reasons:item.forcedReviewReasons||[],scoreBreakdown:item.scoreBreakdown}));
-      feedback.push({missingTables:summary.objectMissingTables,instruction:"本轮选定的表均需覆盖；不要忽略缺少说明的表"});
+      feedback.push({missingRelationIds:uncovered.relations.map(item=>item.relationId).filter(Boolean),missingPathIds:uncovered.relations.map(item=>item.pathId).filter(Boolean),missingTables:summary.objectMissingTables,instruction:"补齐有依据的物理关系和桥表业务路径；对不确定的业务含义明确说明，不得虚构"});
       attempts++;
       // Reserve the attempt before the network call; a crash cannot reset it.
       run=store.transitionOntologyGenerationRun({id:runId,expectedStatus:"succeeded",status:"succeeded",progress:100,summary:{...run.summary,repairAttempts:attempts},tokenUsage:run.tokenUsage}).run;
@@ -348,8 +425,8 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
       try {
         const generated=batches.length?await generator.generateObjects({run:{...run,scope:{...run.scope,batches}},catalog:currentCatalog,knowledgePages:knowledgeSelection.pages,baseSchema:run.baseSchemaVersionId?store.getOntologySchemaVersion(run.baseSchemaVersionId)?.schema:null,feedback,phase,onCandidate,onCandidates,onProgress}):emptyGenerationResult();
         const updated=store.listOntologyCandidates({runId,limit:2000});
-        const links=generator.generateLinks?await generator.generateLinks({run,catalog:currentCatalog,endpoints:updated.filter((item)=>item.candidateType==="object"&&ACCEPTED_STATUSES.has(item.status)),knowledgePages:knowledgeSelection.pages,existingStableKeys:updated.filter((item)=>item.candidateType==="link"&&ACCEPTED_STATUSES.has(item.status)).map((item)=>item.stableKey),feedback,phase,onCandidate,onCandidates,onProgress}):emptyGenerationResult();
-        const nextSummary={...run.summary,...summarizeCandidates(store.listOntologyCandidates({runId,limit:2000}),run.scope.tableNames),modelCalls:[...(run.summary.modelCalls||[]),...(generated.calls||[]),...(links.calls||[])],repairAttempts:attempts};
+        const links=generator.generateLinks?await generator.generateLinks({run,catalog:linkCatalog(run,currentCatalog),endpoints:acceptedRunObjects(run),knowledgePages:knowledgeSelection.pages,existingStableKeys:updated.filter((item)=>item.candidateType==="link"&&ACCEPTED_STATUSES.has(item.status)).map((item)=>item.stableKey),feedback,phase,onCandidate,onCandidates,onProgress}):emptyGenerationResult();
+        const nextSummary={...run.summary,...summarizeCandidates(store.listOntologyCandidates({runId,limit:2000}),run.scope.scopeKind==="global_links"?[]:run.scope.tableNames),modelCalls:[...(run.summary.modelCalls||[]),...(generated.calls||[]),...(links.calls||[])],repairAttempts:attempts};
         run=store.transitionOntologyGenerationRun({id:runId,expectedStatus:"succeeded",status:"succeeded",progress:100,summary:nextSummary,tokenUsage:mergeUsage(run.tokenUsage,generated.tokenUsage,links.tokenUsage)}).run;
       } catch(error) {
         store.transitionOntologyGenerationRun({id:runId,expectedStatus:"succeeded",status:"succeeded",progress:100,summary:{...run.summary,lastRepairError:String(error?.message||error),modelCalls:[...(run.summary.modelCalls||[]),...(error.generationCalls||[])]},tokenUsage:mergeUsage(run.tokenUsage,error.generationTokenUsage)});
@@ -360,7 +437,7 @@ export function createOntologyCandidateService({store,config,scorer,generator,cr
   }
 
   return {
-    refineRun,
+    refineRun,completeBuildLinks,
     catalog,planScope,createRun,evaluateAndStore,runGeneration,runSupplementalLinks,assertSupplementalReady,decide,bulkDecide,merge,preview,apply,
     getRun:(id)=>runView(requiredRun(id),new Map()),
     listRuns:(sourceId,limit=50,offset=0)=>{const cache=new Map();return store.listOntologyGenerationRuns(sourceId,limit,offset).map((run)=>runView(run,cache));},
@@ -374,9 +451,9 @@ export function ontologyCatalogChecksum(catalog) {
   const normalized={
     sourceId:Number(catalog?.sourceId)||null,
     tables:[...(catalog?.tables||[])].map((item)=>({tableName:item.tableName,grade:item.grade,active:item.active,comment:item.comment??null})).sort(byJson),
-    columns:Object.entries(catalog?.columnsByTable||{}).sort(([left],[right])=>left.localeCompare(right)).flatMap(([tableName,columns])=>[...columns].map((item)=>({tableName,columnName:item.columnName,dataType:item.dataType,nullable:item.nullable,isSensitive:item.isSensitive,isPrimary:item.isPrimary,isUnique:item.isUnique,isIndexed:item.isIndexed,comment:item.comment??null,...profileIdentity(item.profile)})).sort(byJson)),
+    columns:Object.entries(catalog?.columnsByTable||{}).sort(([left],[right])=>left.localeCompare(right)).flatMap(([tableName,columns])=>[...columns].map((item)=>({tableName,columnName:item.columnName,dataType:item.dataType,nullable:item.nullable,isSensitive:item.isSensitive,isPrimary:item.isPrimary,isUnique:item.isUnique,isIndexed:item.isIndexed,keyConstraints:item.keyConstraints||[],comment:item.comment??null,...profileIdentity(item.profile)})).sort(byJson)),
     enums:Object.entries(catalog?.enumsByTable||{}).sort(([left],[right])=>left.localeCompare(right)).flatMap(([tableName,items])=>[...items].map((item)=>({tableName,columnName:item.columnName,value:item.value,meaning:item.meaning??null})).sort(byJson)),
-    relations:[...(catalog?.relations||[])].map((item)=>({id:item.id,fromTable:item.fromTable,fromCol:item.fromCol,toTable:item.toTable,toCol:item.toCol,cardinality:item.cardinality,status:item.status,inferenceSource:item.inferenceSource})).sort(byJson),
+    relations:[...(catalog?.relations||[])].map((item)=>({id:item.id,fromTable:item.fromTable,fromCol:item.fromCol,toTable:item.toTable,toCol:item.toCol,columnPairs:relationPairs(item),cardinality:item.cardinality,status:item.status,inferenceSource:item.inferenceSource})).sort(byJson),
     termAnchors:[...(catalog?.termAnchors||[])].map((item)=>({vocabulary:item.vocabulary,canonicalId:item.canonicalId,prefLabelZh:item.prefLabelZh??null,prefLabelEn:item.prefLabelEn??null,altLabels:item.altLabels||[],kind:item.kind,broaderCanonicalId:item.broaderCanonicalId??null})).sort(byJson),
   };
   return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
@@ -418,3 +495,5 @@ function ensureEnabled(config) { if(config.mode==="off")throw httpError(409,"AI 
 function boundedInteger(value,min,max,fallback) { const number=Number(value);return Number.isInteger(number)&&number>=min&&number<=max?number:fallback; }
 function requireTransition(result) { if(!result.ok)throw httpError(result.reason==="not_found"?404:409,result.reason==="not_found"?"候选不存在":"候选状态已变化，请刷新后重试");return result.candidate; }
 function httpError(status,message) { const error=new Error(message);error.status=status;return error; }
+
+function objectTables(payload){return [...new Set((payload?.properties||[]).map(item=>item.mapping?.table).filter(Boolean))];}

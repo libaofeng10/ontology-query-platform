@@ -1,3 +1,4 @@
+import { formatRelation } from "./physical-relation.mjs";
 import { createHash } from "node:crypto";
 import { callLlmTools, isProtocolFormatError } from "./llm-client.mjs";
 import { retrieveKnowledge } from "./knowledge-retrieval.mjs";
@@ -36,7 +37,7 @@ export const QUERY_AGENT_TOOLS=[
   {
     name:"validate_semantic_plan",
     description:"仅在提供了发布语义模型时使用。校验对象/属性级 Query Plan，并由 Harness 确定性编译为受限只读 SQL。",
-    inputSchema:{type:"object",properties:{plan:{type:"object",properties:{rootObject:{type:"string"},dimensions:{type:"array"},metrics:{type:"array"},filters:{type:"array"},timeDimension:{type:["object","null"]},orderBy:{type:"array"},limit:{type:"integer"}},required:["rootObject"],additionalProperties:true}},required:["plan"],additionalProperties:false},
+    inputSchema:{type:"object",properties:{plan:{type:"object",properties:{rootObject:{type:"string"},roles:{type:"array",description:"显式对象角色：name/from/link/direction，用于自引用或同表多角色"},dimensions:{type:"array"},metrics:{type:"array"},filters:{type:"array"},timeDimension:{type:["object","null"]},orderBy:{type:"array"},limit:{type:"integer"}},required:["rootObject"],additionalProperties:true}},required:["plan"],additionalProperties:false},
   },
   {
     name:"run_sql",
@@ -482,7 +483,7 @@ export async function runQueryAgent({store,connector,config,source,question,cont
         columnsTruncated:catalog.columnsByTable[name].length>120,
         columns:catalog.columnsByTable[name].slice(0,120).map((column)=>({name:column.columnName,type:column.dataType,nullable:Boolean(column.nullable),comment:clipText(column.comment,300),primary:Boolean(column.isPrimary),unique:Boolean(column.isUnique),semanticKind:columnSemanticKind(column)||undefined,enum:catalog.enums[`${name}.${column.columnName}`]?.slice(0,20)||undefined})),
       })),
-      relations:catalog.relations.filter((relation)=>selected.has(relation.fromTable)&&selected.has(relation.toTable)).map((relation)=>`${relation.fromTable}.${relation.fromCol} = ${relation.toTable}.${relation.toCol}`),
+      relations:catalog.relations.filter((relation)=>selected.has(relation.fromTable)&&selected.has(relation.toTable)).map((relation)=>formatRelation(relation)),
     };
   }
 
@@ -722,7 +723,7 @@ function agentQuestionPrompt(question,context,history,semanticRuntime,template=Q
     recentConversation:history.slice(-10).map((item)=>({role:item.role,content:clipText(item.content,500)})),
     retrievedKnowledge:context.knowledge.map((page)=>({type:page.pageType,title:page.title,definition:clipText(page.content,1_500),sqlGuidance:clipText(page.sqlContent,1_000),antiExamples:clipText(page.antiExamples,800)})),
     initialSchema:context.tables.map((table)=>({name:table.tableName,comment:table.comment||"",columns:(context.columns[table.tableName]||[]).map((column)=>({name:column.columnName,type:column.dataType,comment:column.comment||"",semanticKind:columnSemanticKind(column)||undefined}))})),
-    confirmedRelations:context.relations.map((relation)=>`${relation.fromTable}.${relation.fromCol} = ${relation.toTable}.${relation.toCol}`),
+    confirmedRelations:context.relations.map((relation)=>formatRelation(relation)),
     businessRules:context.rules.map((rule)=>({name:rule.name,content:clipText(rule.content,1_000)})),
     semanticModel:semanticRuntime?.ok?{version:semanticRuntime.published.version,...semanticPlanningView(semanticRuntime.published.schema,semanticRuntime.catalog)}:undefined,
   };
@@ -862,7 +863,7 @@ function suggestConfirmedRelationPath(reason,relations,preferredTables=new Set()
       return {
         tables:current.tables,
         intermediateTables:current.tables.slice(1,-1),
-        joins:current.edges.map(({relation})=>`${relation.fromTable}.${relation.fromCol} = ${relation.toTable}.${relation.toCol}`),
+        joins:current.edges.map(({relation})=>formatRelation(relation)),
       };
     }
     if(current.edges.length>=maxHops)continue;

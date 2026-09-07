@@ -1,3 +1,5 @@
+import { primaryKeyProperties } from "./catalog-identity.mjs";
+import { relationPairs } from "./physical-relation.mjs";
 import { buildIntentRetrievalFacets, detectQueryProducts } from "./query-intent.mjs";
 import { extractKnowledgeColumnRefs } from "./knowledge-column-refs.mjs";
 
@@ -508,7 +510,7 @@ function rankOntologyFacetTables(facet,ontologyIndex,tableByName) {
       const tableName=property?.mapping?.table;const columnName=property?.mapping?.column;
       if(!tableName||!columnName||!tableByName.has(tableName))continue;
       const propertyText=ontologyPropertyText(property);
-      const identity=property.apiName===object.primaryKey||semanticIdentity(propertyText);
+      const identity=primaryKeyProperties(object.primaryKey).includes(property.apiName)||semanticIdentity(propertyText);
       const label=semanticLabel(propertyText);
       const concept=semanticConceptMatch(propertyText,facet.value);
       if(facet.kind==="dimension"&&!identity&&!label&&!concept)continue;
@@ -563,7 +565,7 @@ function ontologySubjectPriority(facet,object,table,ontologyIndex) {
   const identityText=semanticText(object?.apiName,object?.displayName);
   if(!semanticConceptMatch(identityText,facet.value)||subjectAuxiliaryName(object?.apiName)||subjectAuxiliaryComment(object?.displayName))return structural;
   const mappedTables=ontologyIndex.objectTables.get(object.apiName)||new Set();
-  const primaryTable=(object.properties||[]).find((property)=>property?.apiName===object.primaryKey)?.mapping?.table||null;
+  const primaryTable=(object.properties||[]).find((property)=>primaryKeyProperties(object.primaryKey).includes(property?.apiName))?.mapping?.table||null;
   if(primaryTable===table.tableName||mappedTables.size===1||structural===3)return 4;
   return Math.max(3,structural);
 }
@@ -727,7 +729,7 @@ function distinctSameTableReferencePairs(left,right) {
 function ontologyEndpointIdentityColumns(object,table,concept) {
   return new Set((object.properties||[]).filter((property)=>{
     if(property?.mapping?.table!==table)return false;
-    if(property.apiName===object.primaryKey)return true;
+    if(primaryKeyProperties(object.primaryKey).includes(property.apiName))return true;
     // Descriptions may mention the owning object while explaining a foreign
     // attribute (for example "线索渠道标识"). Only the property's declared
     // name/display label can promote a non-primary mapping to endpoint identity.
@@ -745,7 +747,7 @@ function semanticLabel(value) { return /名称|姓名|名字|name|label|title/i.
 function semanticConceptMatch(value,concept) { const pattern=SEMANTIC_CONCEPT_PATTERNS[concept];return pattern?pattern.test(String(value||"")):Boolean(concept&&normalize(value).includes(normalize(concept))); }
 function relationId(value) { const raw=value?.relationId??value?.id;if(raw==null||raw==="")return null;const number=Number(raw);return Number.isInteger(number)&&number>0?number:null; }
 function relationConnects(relation,leftTable,rightTable) { return relation?.fromTable===leftTable&&relation?.toTable===rightTable||relation?.fromTable===rightTable&&relation?.toTable===leftTable; }
-function relationColumnOnTable(relation,table) { return relation?.fromTable===table?relation.fromCol:relation?.toTable===table?relation.toCol:null; }
+function relationColumnOnTable(relation,table) { if(!relation||relationPairs(relation).length!==1)return null;return relation.fromTable===table?relation.fromCol:relation.toTable===table?relation.toCol:null; }
 function linkConnectsObjects(link,left,right) { return link?.source===left&&link?.target===right||link?.source===right&&link?.target===left; }
 
 const ATTRIBUTION_ROLE_PATTERN=/归属|负责|跟进|分配|指派|责任|ownership|attribution|assignment|assignee|owner/i;
