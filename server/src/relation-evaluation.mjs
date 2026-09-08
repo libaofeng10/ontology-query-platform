@@ -43,6 +43,35 @@ export function evaluateRelationDiscovery({truth,candidates=[],predictions=[],th
   };
 }
 
+export function buildRelationReview({truth,candidates=[],predictions=[],threshold=.55}){
+  validateRelationTruth(truth);
+  const proposed=new Map(candidates.map(item=>[undirectedKey(item),item]));
+  const observed=new Map();for(const item of predictions){const key=undirectedKey(item),prior=observed.get(key);if(!prior||(item.confidence||0)>(prior.confidence||0))observed.set(key,item);}
+  const labels=new Map(truth.relations.map(item=>[undirectedKey(item),item]));
+  const items=[];
+  for(const [key,label] of labels){
+    const prediction=observed.get(key),candidate=proposed.get(key);
+    let category;
+    if(label.label==="relation"){
+      if(!candidate)category="not_proposed";
+      else if(!prediction||prediction.judgmentComplete===false||!prediction.decision)category="unjudged";
+      else if(prediction.decision==="uncertain")category="uncertain";
+      else if(prediction.decision==="none")category="model_negative";
+      else if(prediction.confidence<threshold)category="below_threshold";
+      else{
+        const same=relationKey(label)===relationKey(prediction);
+        const cardinality=same?prediction.cardinality:reverseCardinality(prediction.cardinality);
+        if(!same||label.cardinality&&label.cardinality!=="unknown"&&label.cardinality!==cardinality)category="direction_or_cardinality";
+      }
+    }else if(prediction?.decision==="relation"&&prediction.confidence>=threshold)category="labelled_negative_conflict";
+    if(category)items.push({category,reference:label,prediction:prediction||null,candidate:candidate||null});
+  }
+  for(const [key,prediction] of observed)if(!labels.has(key)&&prediction.decision==="relation"&&prediction.confidence>=threshold)items.push({category:truth.complete?"unlisted_positive_conflict":"unlabelled_prediction",reference:null,prediction,candidate:proposed.get(key)||null});
+  return {version:"relation-review-v1",truthComplete:truth.complete,threshold,
+    note:"差异是待核验事项，不自动认定历史标注或模型判断正确；需独立业务证据。",
+    counts:Object.fromEntries([...new Set(items.map(item=>item.category))].map(category=>[category,items.filter(item=>item.category===category).length])),items};
+}
+
 function undirectedKey(relation){return [relationKey(relation),relationKey(reverseRelation(relation))].sort()[0];}
 function reverseCardinality(value){return ({"1:1":"1:1","N:1":"1:N","1:N":"N:1","N:N":"N:N"})[value]||"unknown";}
 function ratio(numerator,denominator){return denominator?numerator/denominator:null;}

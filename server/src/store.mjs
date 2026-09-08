@@ -1,9 +1,11 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
-import { relationKey, relationPairs, relationColumnsPresent } from "./physical-relation.mjs";
+import { relationCheckpointSummary } from "./relation-checkpoint.mjs";
+import { relationKey, relationPairs, relationColumnsPresent, reverseRelation } from "./physical-relation.mjs";
 
 const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS ds_relation_checkpoint (source_id INTEGER PRIMARY KEY,checkpoint_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`,
   `CREATE TABLE IF NOT EXISTS ds_source (
     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'mysql',
     host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 3306, db_name TEXT NOT NULL,
@@ -400,11 +402,25 @@ export function createStore(dbPath) {
     },
     upsertRelation(item) {
       const pairs=relationPairs(item);
+      // A model may rediscover the same equality in either direction. Keep the
+      // reviewed definition and its directional evidence together, including its ID.
+      const reviewed=item.inferenceSource==="model"?this.getReviewedRelation(item.sourceId,item):null;
+      if(reviewed) {
+        db.prepare("UPDATE ds_relation SET present=1 WHERE id=?").run(reviewed.id);
+        return reviewed;
+      }
       const values={cardinality:null,confidence:0,overlapRatio:null,status:"review",inferenceSource:null,modelDecision:null,modelConfidence:null,modelReason:null,modelName:null,structuralScore:null,structuralReason:null,constraintName:null,...item,...pairs[0],relationKey:relationKey(item),columnPairsJson:JSON.stringify(pairs),dataEvidenceJson:item.dataEvidence?JSON.stringify(item.dataEvidence):null};
       db.prepare(`INSERT INTO ds_relation (source_id,from_table,from_col,to_table,to_col,cardinality,confidence,overlap_ratio,status,inference_source,model_decision,model_confidence,model_reason,model_name,structural_score,structural_reason,evaluated_at,relation_key,column_pairs_json,constraint_name,data_evidence_json)
         VALUES (@sourceId,@fromTable,@fromCol,@toTable,@toCol,@cardinality,@confidence,@overlapRatio,@status,@inferenceSource,@modelDecision,@modelConfidence,@modelReason,@modelName,@structuralScore,@structuralReason,CURRENT_TIMESTAMP,@relationKey,@columnPairsJson,@constraintName,@dataEvidenceJson)
-        ON CONFLICT(source_id,relation_key) DO UPDATE SET cardinality=excluded.cardinality,confidence=excluded.confidence,overlap_ratio=excluded.overlap_ratio,status=CASE WHEN excluded.inference_source='foreign_key' THEN 'confirmed' WHEN ds_relation.status IN ('confirmed','denied') THEN ds_relation.status ELSE excluded.status END,present=1,inference_source=CASE WHEN excluded.inference_source='foreign_key' THEN excluded.inference_source WHEN ds_relation.inference_source='document' THEN ds_relation.inference_source ELSE excluded.inference_source END,model_decision=excluded.model_decision,model_confidence=excluded.model_confidence,model_reason=excluded.model_reason,model_name=excluded.model_name,structural_score=excluded.structural_score,structural_reason=excluded.structural_reason,evaluated_at=CURRENT_TIMESTAMP,column_pairs_json=excluded.column_pairs_json,constraint_name=excluded.constraint_name,data_evidence_json=excluded.data_evidence_json`).run(values);
+        ON CONFLICT(source_id,relation_key) DO UPDATE SET cardinality=excluded.cardinality,confidence=excluded.confidence,overlap_ratio=excluded.overlap_ratio,status=CASE WHEN excluded.inference_source='foreign_key' THEN 'confirmed' WHEN ds_relation.status IN ('accepted','confirmed','denied') AND COALESCE(ds_relation.inference_source,'')<>'foreign_key' THEN ds_relation.status ELSE excluded.status END,present=1,inference_source=CASE WHEN excluded.inference_source='foreign_key' THEN excluded.inference_source WHEN ds_relation.inference_source='document' THEN ds_relation.inference_source ELSE excluded.inference_source END,model_decision=excluded.model_decision,model_confidence=excluded.model_confidence,model_reason=excluded.model_reason,model_name=excluded.model_name,structural_score=excluded.structural_score,structural_reason=excluded.structural_reason,evaluated_at=CURRENT_TIMESTAMP,column_pairs_json=excluded.column_pairs_json,constraint_name=excluded.constraint_name,data_evidence_json=excluded.data_evidence_json`).run(values);
       return this.getRelationByKey(item.sourceId,item.fromTable,item.fromCol,item.toTable,item.toCol,pairs);
+    },
+    getReviewedRelation(sourceId,relation) {
+      for(const directed of [relation,reverseRelation(relation)]) {
+        const prior=this.getRelationByKey(sourceId,directed.fromTable,directed.fromCol,directed.toTable,directed.toCol,relationPairs(directed));
+        if(prior&&["accepted","confirmed","denied"].includes(prior.status)&&prior.inferenceSource!=="foreign_key")return prior;
+      }
+      return null;
     },
     listTables: (sourceId) => db.prepare(`SELECT source_id AS sourceId, table_name AS tableName, row_estimate AS rowEstimate, grade, grade_override AS gradeOverride, active, last_probe_at AS lastProbeAt, comment, days_since_write AS daysSinceWrite FROM ds_table WHERE source_id=? AND present=1 ORDER BY CASE grade WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 3 END, table_name`).all(sourceId),
     setTableGrade(sourceId, tableName, grade) { return db.prepare(`UPDATE ds_table SET grade=?,grade_override=?,active=? WHERE source_id=? AND table_name=?`).run(grade,grade,grade==="C"?0:1,sourceId,tableName).changes; },
@@ -500,8 +516,10 @@ export function createStore(dbPath) {
     // forever — nothing else expires 枚举含义. Global-scope questions carry no table and
     // are left alone.
     closeQuestionsOnExcludedTables(sourceId) { return db.prepare(`UPDATE ds_question SET status='obsolete',answered_at=CURRENT_TIMESTAMP WHERE source_id=? AND status='pending' AND ((table_name IS NOT NULL AND EXISTS (SELECT 1 FROM ds_table t WHERE t.source_id=ds_question.source_id AND t.table_name=ds_question.table_name AND (t.grade='C' OR t.active=0 OR t.present=0))) OR (relation_id IS NOT NULL AND EXISTS (SELECT 1 FROM ds_relation r WHERE r.id=ds_question.relation_id AND (r.present=0 OR EXISTS (SELECT 1 FROM ds_table t WHERE t.source_id=r.source_id AND t.table_name IN (r.from_table,r.to_table) AND (t.grade='C' OR t.active=0 OR t.present=0)) OR NOT EXISTS (SELECT 1 FROM ds_table t WHERE t.source_id=r.source_id AND t.table_name=r.from_table) OR NOT EXISTS (SELECT 1 FROM ds_table t WHERE t.source_id=r.source_id AND t.table_name=r.to_table)))))`).run(sourceId).changes; },
+    getRelationCheckpoint(sourceId) { const row=db.prepare("SELECT checkpoint_json FROM ds_relation_checkpoint WHERE source_id=?").get(sourceId);return row?JSON.parse(row.checkpoint_json):null; },
+    saveRelationCheckpoint(sourceId,state) { db.prepare("INSERT INTO ds_relation_checkpoint(source_id,checkpoint_json) VALUES(?,?) ON CONFLICT(source_id) DO UPDATE SET checkpoint_json=excluded.checkpoint_json,updated_at=CURRENT_TIMESTAMP").run(sourceId,JSON.stringify(state)); },
     saveRelationAnalysis(item) { db.prepare(`INSERT INTO ds_relation_analysis(source_id,model_status,model_name,candidate_count,judged_count,suggested_count,rejected_count,error,diagnostics_json,updated_at) VALUES(@sourceId,@modelStatus,@modelName,@candidateCount,@judgedCount,@suggestedCount,@rejectedCount,@error,@diagnosticsJson,CURRENT_TIMESTAMP) ON CONFLICT(source_id) DO UPDATE SET model_status=excluded.model_status,model_name=excluded.model_name,candidate_count=excluded.candidate_count,judged_count=excluded.judged_count,suggested_count=excluded.suggested_count,rejected_count=excluded.rejected_count,error=excluded.error,diagnostics_json=excluded.diagnostics_json,updated_at=CURRENT_TIMESTAMP`).run({diagnosticsJson:JSON.stringify(item.diagnostics||null),modelName:null,candidateCount:0,judgedCount:0,suggestedCount:0,rejectedCount:0,error:null,...item}); },
-    relationStats(sourceId) { const counts=db.prepare(`SELECT COALESCE(SUM(CASE WHEN inference_source='foreign_key' AND present=1 AND status<>'rejected' THEN 1 ELSE 0 END),0) AS explicit,COALESCE(SUM(CASE WHEN inference_source='model' AND present=1 AND status='review' THEN 1 ELSE 0 END),0) AS modelSuggested,COALESCE(SUM(CASE WHEN present=1 AND status='confirmed' THEN 1 ELSE 0 END),0) AS confirmed,COALESCE(SUM(CASE WHEN inference_source='model' AND present=1 AND status='rejected' THEN 1 ELSE 0 END),0) AS rejected FROM ds_relation WHERE source_id=?`).get(sourceId);const analysis=db.prepare(`SELECT model_status AS modelStatus,model_name AS modelName,candidate_count AS candidateCount,judged_count AS judgedCount,suggested_count AS suggestedCount,rejected_count AS rejectedCount,error,diagnostics_json AS diagnosticsJson,updated_at AS updatedAt FROM ds_relation_analysis WHERE source_id=?`).get(sourceId);if(analysis){analysis.diagnostics=safeJson(analysis.diagnosticsJson,null);delete analysis.diagnosticsJson;}return {...counts,...(analysis||{modelStatus:"not_run",modelName:null,candidateCount:0,judgedCount:0,suggestedCount:0,rejectedCount:0,error:null,updatedAt:null})}; },
+    relationStats(sourceId) { const counts=db.prepare(`SELECT COALESCE(SUM(CASE WHEN inference_source='foreign_key' AND present=1 AND status<>'rejected' THEN 1 ELSE 0 END),0) AS explicit,COALESCE(SUM(CASE WHEN inference_source='model' AND present=1 AND status='review' THEN 1 ELSE 0 END),0) AS modelSuggested,COALESCE(SUM(CASE WHEN present=1 AND status='confirmed' THEN 1 ELSE 0 END),0) AS confirmed,COALESCE(SUM(CASE WHEN inference_source='model' AND present=1 AND status='rejected' THEN 1 ELSE 0 END),0) AS rejected FROM ds_relation WHERE source_id=?`).get(sourceId);const analysis=db.prepare(`SELECT model_status AS modelStatus,model_name AS modelName,candidate_count AS candidateCount,judged_count AS judgedCount,suggested_count AS suggestedCount,rejected_count AS rejectedCount,error,diagnostics_json AS diagnosticsJson,updated_at AS updatedAt FROM ds_relation_analysis WHERE source_id=?`).get(sourceId);if(analysis){analysis.diagnostics=safeJson(analysis.diagnosticsJson,null);delete analysis.diagnosticsJson;}return {...counts,checkpoint:relationCheckpointSummary(this.getRelationCheckpoint(sourceId)),...(analysis||{modelStatus:"not_run",modelName:null,candidateCount:0,judgedCount:0,suggestedCount:0,rejectedCount:0,error:null,updatedAt:null})}; },
     createRelationDoc(item) {
       db.prepare(`INSERT INTO ds_relation_doc(id,source_id,file_name,file_path,checksum,status,assertions_json,assertion_count,accepted_count,rejected_count,error,created_by) VALUES(@id,@sourceId,@fileName,@filePath,@checksum,@status,@assertionsJson,@assertionCount,@acceptedCount,@rejectedCount,@error,@createdBy)`).run({...item,assertionsJson:JSON.stringify(item.assertions||[]),assertionCount:Number(item.assertionCount)||0,acceptedCount:Number(item.acceptedCount)||0,rejectedCount:Number(item.rejectedCount)||0,error:item.error||null,createdBy:item.createdBy||null});
       return this.getRelationDoc(item.id);
@@ -810,7 +828,12 @@ export function createStore(dbPath) {
         const knownProfiles=db.prepare(`SELECT table_name AS tableName,column_name AS columnName FROM ds_column_profile WHERE source_id=?`).all(sourceId);
         for(const profile of knownProfiles)if(!columns.has(`${profile.tableName}.${profile.columnName}`))db.prepare(`DELETE FROM ds_column_profile WHERE source_id=? AND table_name=? AND column_name=?`).run(sourceId,profile.tableName,profile.columnName);
         const knownRelations=db.prepare(`SELECT id,from_table AS fromTable,from_col AS fromCol,to_table AS toTable,to_col AS toCol,inference_source AS inferenceSource,status,column_pairs_json AS columnPairsJson FROM ds_relation WHERE source_id=?`).all(sourceId).map(parsePhysicalRelation);
-        for(const relation of knownRelations) { const key=relationKey(relation);const documentStillValid=relation.inferenceSource==="document"&&["review","confirmed","denied"].includes(relation.status)&&relationColumnsPresent(relation,columns);db.prepare(`UPDATE ds_relation SET present=? WHERE id=?`).run(relations.has(key)||documentStillValid?1:0,relation.id); }
+        for(const relation of knownRelations) {
+          const key=relationKey(relation);
+          const duplicateReview=relation.status==="review"&&this.getReviewedRelation(sourceId,relation);
+          const documentStillValid=relation.inferenceSource==="document"&&["review","confirmed","denied"].includes(relation.status)&&relationColumnsPresent(relation,columns);
+          db.prepare(`UPDATE ds_relation SET present=? WHERE id=?`).run(!duplicateReview&&(relations.has(key)||documentStillValid)?1:0,relation.id);
+        }
       })();
     },
   };

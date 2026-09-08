@@ -142,16 +142,17 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
         target.displayName=correction.displayName;target.description=correction.description;
         saveDraft(()=>semanticSchemas.saveDraft(source.id,schema,payload.actor));
       } else if(!checkpoint.draftVersionId) {
-        if(!checkpoint.discovery) {
+        if(!checkpoint.discovery||checkpoint.discovery.relationDiscovery?.checkpoint&&checkpoint.discovery.relationDiscovery.modelStatus!=="completed") {
           stage("discovering","读取所选数据结构",3);
           store.saveTableSelections(source.id,checkpoint.selections,payload.actor);store.purgeExcludedTables(source.id);
-          const discovered=await discovery.discover(source,{tableNames:checkpoint.selections.filter((item)=>item.included).map((item)=>item.tableName),onProgress:(step)=>onProgress({...step,total:100,progress:Math.round(Math.min(100,step.progress)*.25),currentStep:`读取数据结构：${step.currentStep}`})});
+          const discovered=await discovery.discover(source,{runId:task.id,resumeRelations:Boolean(checkpoint.discovery),tableNames:checkpoint.selections.filter((item)=>item.included).map((item)=>item.tableName),onProgress:(step)=>onProgress({...step,total:100,progress:Math.round(Math.min(100,step.progress)*.25),currentStep:`读取数据结构：${step.currentStep}`})});
           const after=catalogFingerprints(source.id),base=checkpoint.baseVersionId?store.getOntologySchemaVersion(checkpoint.baseVersionId):null,existingTables=new Set(mappedTables(base?.schema));
           const previous=store.listTasks(source.id,500).find((item)=>item.id!==task.id&&item.payload?.sourceBuild?.publishedVersionId===checkpoint.baseVersionId&&FINISHED.has(item.payload?.sourceBuild?.phase));
           const known=previous?.payload?.sourceBuild?.catalogFingerprints||checkpoint.beforeCatalog||{},knowledgeChanged=previous&&previous.payload.sourceBuild.knowledgeChecksum!==knowledgeChecksum(source.id);
           const changed=checkpoint.selections.filter((item)=>item.included&&(!base||!existingTables.has(item.tableName)||after[item.tableName]!==known[item.tableName]||knowledgeChanged)).map((item)=>item.tableName);
           save({discovery:discovered,catalogFingerprints:after,generationTableNames:changed});
         }
+        if(checkpoint.discovery?.relationDiscovery?.checkpoint&&checkpoint.discovery.relationDiscovery.modelStatus!=="completed")return wait("needs_input",[{id:"relation-analysis",kind:"validation",title:"关系识别尚未完成",detail:checkpoint.discovery.relationDiscovery.error||"请继续处理尚未完成的关系候选。",tables:[],retryable:true}]);
         const selectedTables=checkpoint.selections.filter((item)=>item.included).map((item)=>item.tableName);
         const baseLinks=new Set((checkpoint.baseVersionId?store.getOntologySchemaVersion(checkpoint.baseVersionId)?.schema.linkTypes||[]:[]).flatMap(link=>(link.relationMappings||[]).map(item=>Number(item.relationId))));
         const missingBaseRelations=store.listRelations(source.id,true).filter(item=>selectedTables.includes(item.fromTable)&&selectedTables.includes(item.toTable)&&!baseLinks.has(item.id));
@@ -296,7 +297,7 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
   async function runLegacy(context) {
     const {task,source,payload,onProgress}=context;let checkpoint=payload.sourceBuild;
     const save=(next)=>{checkpoint={...checkpoint,...next};store.updateTaskPayload(task.id,{...payload,sourceBuild:checkpoint});};
-    if(!checkpoint.discovery){store.saveTableSelections(source.id,checkpoint.selections,payload.actor);store.purgeExcludedTables(source.id);save({discovery:await discovery.discover(source,{tableNames:checkpoint.selections.filter((item)=>item.included).map((item)=>item.tableName),onProgress})});}
+    if(!checkpoint.discovery){store.saveTableSelections(source.id,checkpoint.selections,payload.actor);store.purgeExcludedTables(source.id);save({discovery:await discovery.discover(source,{runId:task.id,tableNames:checkpoint.selections.filter((item)=>item.included).map((item)=>item.tableName),onProgress})});}
     const generated=await modeling.run({...context,payload:{...payload,domainPlanSnapshot:checkpoint.plan},onPlan:(plan)=>{if(!checkpoint.plan)save({plan});}});
     return {...generated,discovery:checkpoint.discovery};
   }

@@ -3,11 +3,11 @@ import { randomUUID } from "node:crypto";
 export function createTaskService({store,discovery,handlers={}}) {
   const active=new Map();
   const runners=new Map(Object.entries(handlers));
-  runners.set("discovery",async({source,onProgress})=>discovery.discover(source,{onProgress}));
+  runners.set("discovery",async({task,source,payload,onProgress})=>discovery.discover(source,{onProgress,runId:task.id,resumeRelations:Boolean(payload.resumeRelations)}));
   let closing=false;
 
-  function createDiscoveryTask(source) {
-    return create({sourceId:source.id,taskType:"discovery"});
+  function createDiscoveryTask(source,{resumeRelations=false}={}) {
+    return create({sourceId:source.id,taskType:"discovery",payload:{resumeRelations}});
   }
 
   function create({id=randomUUID(),sourceId,taskType,payload={}}) {

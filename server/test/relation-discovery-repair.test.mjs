@@ -124,3 +124,26 @@ test("actual discovery carries an LLM-only composite proposal through resampling
     const stats=store.relationStats(source.id);assert.equal(stats.diagnostics.proposalCandidateCount,1);assert.equal(stats.diagnostics.resampledCount,1);assert.equal(stats.diagnostics.usage.calls,3);assert.equal(stats.diagnostics.usage.totalTokens,360);
   }finally{store.close();await rm(root,{recursive:true,force:true});}
 });
+
+test("discovery resumes a fixed build scope after reopening through the API scope, excluding view-only columns",async()=>{
+  const root=await mkdtemp(join(tmpdir(),"relation-resume-service-")),path=join(root,"store.sqlite");let store=createStore(path);
+  const source=store.createSource({name:"test",kind:"mysql",host:"test",dbName:"test",userName:"ro",credential:"test"});
+  let dataQueries=0,judgments=0,drift=false;
+  const connector={query:async(_source,sql)=>{
+    if(sql.includes("information_schema.TABLES"))return [tables];
+    if(sql.includes("information_schema.COLUMNS"))return [[...columns,{tableName:"customer_view",columnName:"id",dataType:"bigint",nullable:"NO"}].map(c=>({...c,comment:drift?"已改变":c.comment}))];
+    if(sql.includes("information_schema."))return [[]];
+    dataQueries++;return [sql.includes("matchCount")?[{value:1,matchCount:1}]:[{id:1,customer_id:1}]];
+  }};
+  const model={identity:{model:"mock"},judge:async items=>{judgments++;return {status:"completed",decisions:items.map(c=>({...decision(c.id),decision:judgments===1?"uncertain":"relation"}))};}};
+  const service=budget=>createDiscoveryService({store,connector,wikiDir:join(root,"wiki"),config:{profiling:{enabled:false},relationModel:{proposalsEnabled:false,stratifiedSampling:false,maxResampleCandidates:budget}},relationModel:model});
+  try{
+    const first=await service(0).discover(source,{runId:"durable-task",tableNames:tables.map(t=>t.tableName)});assert.equal(first.relationDiscovery.checkpoint.pendingResampleCount,1);
+    const before=dataQueries;store.close();store=createStore(path);
+    const resumed=await service(40).discover(source,{runId:"durable-task"});
+    assert.equal(resumed.relationDiscovery.modelStatus,"completed");assert.equal(dataQueries-before,1,"only the missing second sample, no table probes");assert.equal(judgments,2);
+    assert.equal(store.getLatestSchemaSnapshot(source.id).schema.columns.some(c=>c.tableName==="customer_view"),false);
+    const finished=dataQueries;await service(40).discover(source,{resumeRelations:true});assert.equal(dataQueries,finished);assert.equal(judgments,2);
+    drift=true;await assert.rejects(service(40).discover(source,{resumeRelations:true}),/检查点/);assert.equal(dataQueries,finished);
+  }finally{store.close();await rm(root,{recursive:true,force:true});}
+});

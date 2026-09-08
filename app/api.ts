@@ -14,7 +14,7 @@ export function listCapabilityGaps(sourceId:number,scope:"knowledge"|"all"="know
 export function createSource(input:SourceInput){return request<DataSource>("/sources",{method:"POST",headers:writeHeaders,body:JSON.stringify(input)},15_000);}
 export function testSource(sourceId:number){return request<{ok:boolean;readOnly:boolean;server:string;latencyMs:number}>(`/sources/${sourceId}/test`,{method:"POST",headers:writeHeaders},20_000);}
 export function rotateSourceCredential(sourceId:number,password:string){return request<{ok:boolean;sourceId:number;requiresRetest:boolean}>(`/sources/${sourceId}/credential`,{method:"POST",headers:writeHeaders,body:JSON.stringify({password})},20_000);}
-export function discoverSource(sourceId:number){return request<BackgroundTask>(`/sources/${sourceId}/discover`,{method:"POST",headers:writeHeaders},20_000);}
+export function discoverSource(sourceId:number,resume=false){return request<BackgroundTask>(`/sources/${sourceId}/discover${resume?"?resume=true":""}`,{method:"POST",headers:writeHeaders},20_000);}
 export function getOntologyBuildRecord(sourceId:number,id:string){return request<OntologyBuildRecord>(`/sources/${sourceId}/ontology-build/records/${encodeURIComponent(id)}`);}
 export function getSourceOntologyBuild(sourceId:number){return request<SourceOntologyBuildStatus>(`/sources/${sourceId}/ontology-build`);}
 export function buildSourceOntology(sourceId:number,selections:Array<{tableName:string;included:boolean}>){return request<BackgroundTask>(`/sources/${sourceId}/ontology-build`,{method:"POST",headers:writeHeaders,body:JSON.stringify({selections})},20_000);}

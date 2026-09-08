@@ -462,3 +462,21 @@ test("历史版本缺少关系时，结构未变也不能直接报告无需更�
     assert.equal(app.store.getOntologySchemaVersion(task.payload.sourceBuild.draftVersionId).schema.linkTypes.length,1);
   }finally{await close();}
 });
+
+test("incomplete relation discovery pauses the build and continues the same checkpoint before generation",async()=>{
+  const store=createStore(":memory:");let discoveries=0,generations=0;
+  const source=store.createSource({name:"test",host:"test",dbName:"test",userName:"ro",credential:"test"});
+  const payload={sourceBuild:{workflowVersion:2,baseVersionId:null,phase:"queued",selections:[{tableName:"customer",included:true}],events:[],questions:[]}};
+  store.createTask({id:"relation-build",sourceId:source.id,taskType:"ontology_domain_modeling",payloadJson:JSON.stringify(payload)});
+  const service=createSourceOntologyBuildService({store,config:{ontologyAi:{mode:"auto_draft"}},discovery:{discover:async(_source,options)=>{
+    discoveries++;assert.equal(options.runId,"relation-build");assert.equal(options.resumeRelations,discoveries>1);
+    return {relationDiscovery:{modelStatus:discoveries===1?"partial":"completed",checkpoint:{canResume:discoveries===1},error:discoveries===1?"还有补采样未完成":null}};
+  }},modeling:{run:async()=>{generations++;throw new Error("test stops after reaching generation");}}});
+  try{
+    store.startTask("relation-build");
+    const first=await service.run({task:store.getTask("relation-build"),source,payload});
+    assert.equal(first.phase,"needs_input");assert.equal(generations,0);assert.equal(store.getTask("relation-build").payload.sourceBuild.questions[0].id,"relation-analysis");
+    const task=store.getTask("relation-build");await assert.rejects(service.run({task,source,payload:task.payload}),/test stops/);
+    assert.equal(discoveries,2);assert.equal(generations,1);assert.equal(store.getPublishedOntologySchema(source.id),null);
+  }finally{store.close();}
+});

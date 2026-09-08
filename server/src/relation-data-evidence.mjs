@@ -1,12 +1,12 @@
 // SQL performs the equality comparison, preserving the database's type/collation semantics.
-// All target matches count; only the source values and returned rows are bounded.
+// Both sides count complete matching tuples; only sampled keys and returned rows are bounded.
 export async function sampleRelationEvidence(connector,source,left,right,limit,{timeoutMs=10_000,stratify=false,columns=[],maxQueries=4,round=0}={}) {
   const sampleLimit=Math.max(1,Math.min(2000,Math.floor(Number(limit)||500)));
   const configuredTimeout=Number(timeoutMs);
   const executionTimeoutMs=Number.isFinite(configuredTimeout)?Math.max(100,Math.min(4_294_967_295,Math.floor(configuredTimeout))):10_000;
   const deadlineAt=performance.now()+executionTimeoutMs;
   const sampledAt=new Date().toISOString();
-  const base={method:stratify?"source_stratified_target_lookup":"source_extremes_target_lookup",scope:"sample",sampledAt,sampleLimit,round,strata:[],strataFailures:[],queryCount:0};
+  const base={method:stratify?"source_stratified_target_lookup":"source_extremes_target_lookup",scope:"sample",sampledAt,sampleLimit,round,strata:[],strataFailures:[],queryCount:0,sourceMultipleMatchCount:null,sourceMaxMatches:null};
   const from=quoteIdentifier(left.tableName),to=quoteIdentifier(right.tableName);
   const fromCols=(left.columnNames||[left.columnName]).map(quoteIdentifier),toCols=(right.columnNames||[right.columnName]).map(quoteIdentifier);
   if(!fromCols.length||fromCols.length!==toCols.length||fromCols.length>8)throw new Error("关系采样的列组不完整");
@@ -51,12 +51,19 @@ export async function sampleRelationEvidence(connector,source,left,right,limit,{
       const count=Math.min(budgetPerPart,remaining-2);parts.push(part(predicates[index],count));bound.push(params[index]);remaining-=count;
     }
     if(remaining){const low=Math.ceil(remaining/2),high=Math.floor(remaining/2);parts.push(part("",low));if(high)parts.push(part("",high,"DESC"));}
-    const sql=`SELECT ${fromCols.map((_,index)=>`sampled.${alias(index)}`).join(", ")}, (SELECT COUNT(*) FROM ${to} AS target WHERE ${toCols.map((column,index)=>`target.${column} = sampled.${alias(index)}`).join(" AND ")}) AS matchCount FROM (${parts.join(" UNION ")}) AS sampled`;
+    const sql=`SELECT ${fromCols.map((_,index)=>`sampled.${alias(index)}`).join(", ")}, (SELECT COUNT(*) FROM ${to} AS target WHERE ${toCols.map((column,index)=>`target.${column} = sampled.${alias(index)}`).join(" AND ")}) AS matchCount, (SELECT COUNT(*) FROM ${from} AS source_rows WHERE ${fromCols.map((column,index)=>`source_rows.${column} = sampled.${alias(index)}`).join(" AND ")}) AS sourceCount FROM (${parts.join(" UNION ")}) AS sampled`;
     base.queryCount++;
     const [rows]=await query(sql,bound);
     if(!Array.isArray(rows)||rows.length>sampleLimit||rows.some(row=>!Number.isSafeInteger(Number(row.matchCount))||row.matchCount==null||Number(row.matchCount)<0))return unavailable("invalid_probe_result");
+    // Legacy connector results have no source count. Missing evidence stays unknown;
+    // a partial/malformed new result cannot be treated as a zero-duplicate sample.
+    const hasSourceCounts=rows.some(row=>Object.hasOwn(row,"sourceCount"));
+    if(hasSourceCounts&&rows.some(row=>row.sourceCount==null||!Number.isSafeInteger(Number(row.sourceCount))||Number(row.sourceCount)<1))return unavailable("invalid_probe_result");
+    const matchedRows=rows.filter(row=>Number(row.matchCount)>0);
+    const sourceMultipleMatchCount=hasSourceCounts?matchedRows.filter(row=>Number(row.sourceCount)>1).length:null;
+    const sourceMaxMatches=hasSourceCounts?Math.max(0,...matchedRows.map(row=>Number(row.sourceCount))):null;
     const sampleSize=rows.length,matchedCount=rows.filter(row=>Number(row.matchCount)>0).length,multipleMatchCount=rows.filter(row=>Number(row.matchCount)>1).length;
-    return {...base,status:sampleSize?"sampled":"empty",sampleSize,matchedCount,multipleMatchCount,maxMatches:Math.max(0,...rows.map(row=>Number(row.matchCount))),matchRatio:sampleSize?matchedCount/sampleSize:null,orphanRatio:sampleSize?1-matchedCount/sampleSize:null};
+    return {...base,status:sampleSize?"sampled":"empty",sampleSize,matchedCount,multipleMatchCount,maxMatches:Math.max(0,...rows.map(row=>Number(row.matchCount))),sourceMultipleMatchCount,sourceMaxMatches,matchRatio:sampleSize?matchedCount/sampleSize:null,orphanRatio:sampleSize?1-matchedCount/sampleSize:null};
   })().catch(error=>unavailable(controller.signal.aborted||["ER_QUERY_TIMEOUT","QUERY_TIMEOUT"].includes(error?.code)?"timeout":"query_failed"));
   const deadline=new Promise(resolve=>{timer=setTimeout(()=>{controller.abort();resolve(unavailable("timeout"));},executionTimeoutMs);});
   try{return await Promise.race([work,deadline]);}finally{clearTimeout(timer);}
@@ -78,5 +85,6 @@ export function describeRelationEvidence(relation){
   const evidence=relation.dataEvidence;
   if(!evidence)return relation.inferenceSource==="foreign_key"?"依据数据库外键约束；未执行数据匹配采样":relation.overlapRatio==null?"未取得数据匹配样本":`源值样本匹配率 ${(relation.overlapRatio*100).toFixed(2)}%（历史采样方式未记录）`;
   if(evidence.status!=="sampled")return `数据采样${evidence.status==="empty"?"为空":"不可用"}（${evidence.reason||evidence.status}）`;
-  return `源值样本 ${evidence.sampleSize} 个，目标匹配 ${evidence.matchedCount} 个，重复匹配 ${evidence.multipleMatchCount} 个；匹配率 ${(evidence.matchRatio*100).toFixed(2)}%。${evidence.method==="source_stratified_target_lookup"?`按 ${(evidence.strata||[]).map(item=>item.column).join("、")} 分层取样`:evidence.method==="source_hash_target_lookup"?"按哈希顺序补采样":"取源值两端"}后查询完整目标，采样于 ${evidence.sampledAt}${evidence.history?.length?`；已补采样 ${evidence.history.length} 轮`:""}；不代表全表统计`;
+  const sourceEvidence=Number.isSafeInteger(evidence.sourceMultipleMatchCount)?`已匹配元组中，源端重复 ${evidence.sourceMultipleMatchCount} 组，最多 ${evidence.sourceMaxMatches} 行；`:"";
+  return `源值样本 ${evidence.sampleSize} 个，目标匹配 ${evidence.matchedCount} 个，重复匹配 ${evidence.multipleMatchCount} 个；${sourceEvidence}匹配率 ${(evidence.matchRatio*100).toFixed(2)}%。${evidence.method==="source_stratified_target_lookup"?`按 ${(evidence.strata||[]).map(item=>item.column).join("、")} 分层取样`:evidence.method==="source_hash_target_lookup"?"按哈希顺序补采样":"取源值两端"}后查询完整目标，采样于 ${evidence.sampledAt}${evidence.history?.length?`；已补采样 ${evidence.history.length} 轮`:""}；不代表全表统计`;
 }

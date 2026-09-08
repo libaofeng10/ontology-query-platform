@@ -1,6 +1,7 @@
 import { describeRelationEvidence } from "./relation-data-evidence.mjs";
 import { introspectSchema } from "./db-introspect.mjs";
 import { probeTable } from "./db-probe.mjs";
+import { assertRelationCheckpoint } from "./relation-checkpoint.mjs";
 import { analyzeRelationCandidates } from "./relation-discovery-analysis.mjs";
 import { createRelationModelService } from "./relation-model-service.mjs";
 import { generateEnumMeaningQuestions } from "./enum-meaning-candidates.mjs";
@@ -18,15 +19,20 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
   const discoveryConfig={enumMaxDistinctRatio:0.05,labelDictionaryMaxRows:undefined,...config.discovery};
   const relationModel=relationModelOverride||createRelationModelService({llm:config.llm||{},batchSize:relationConfig.batchSize,timeoutMs:relationConfig.timeoutMs});
 
-  async function discover(source,{onProgress=()=>{},tableNames=null}={}) {
+  async function discover(source,{onProgress=()=>{},tableNames=null,resumeRelations=false,runId=null}={}) {
+    const previousCheckpoint=store.getRelationCheckpoint?.(source.id);
+    const checkpoint=resumeRelations||(runId&&previousCheckpoint?.runId===runId)?previousCheckpoint:null;
+    if(resumeRelations&&!checkpoint)throw new Error("没有可继续的关系检查点，请重新探查");
     const profilingConfig={enabled:false,sampleLimit:1000,maxTablesPerRefresh:20,timeoutMs:10_000,...config.profiling};
     const selected=tableNames?new Set(tableNames):null;
     const excluded=store.excludedTableNames(source.id);
     const included=(name)=>!excluded.has(name)&&(!selected||selected.has(name));
     const restrict=(schema)=>{
       schema.tables=schema.tables.filter((table)=>included(table.tableName));
-      schema.columns=schema.columns.filter((column)=>included(column.tableName));
-      schema.foreignKeys=schema.foreignKeys.filter((relation)=>included(relation.fromTable)&&included(relation.toTable));
+      // COLUMNS also contains views; only admitted base tables define this scope.
+      const admittedTables=new Set(schema.tables.map(table=>table.tableName));
+      schema.columns=schema.columns.filter((column)=>admittedTables.has(column.tableName));
+      schema.foreignKeys=schema.foreignKeys.filter((relation)=>admittedTables.has(relation.fromTable)&&admittedTables.has(relation.toTable));
       return schema;
     };
     emit(onProgress,2,"准备数据源探查");
@@ -44,6 +50,20 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
 
     emit(onProgress,5,"读取 INFORMATION_SCHEMA");
     const schema=restrict(await introspectSchema(connector,source));
+    const analysisInput=()=>{
+      const catalog=store.listTables(source.id).filter(table=>included(table.tableName));
+      const profiles=new Map(catalog.flatMap(table=>store.listColumns(source.id,table.tableName).map(column=>[`${table.tableName}.${column.columnName}`,column.profile])));
+      const explicitKeys=new Set();
+      for(const relation of schema.foreignKeys){
+        explicitKeys.add(relationKey(relation));explicitKeys.add(reverseRelationKey(relation));
+        for(const pair of relationPairs(relation)){const part={fromTable:relation.fromTable,toTable:relation.toTable,...pair};explicitKeys.add(relationKey(part));explicitKeys.add(reverseRelationKey(part));}
+      }
+      return {schema:{...schema,columns:schema.columns.map(column=>({...column,profile:profilingConfig.enabled?profiles.get(`${column.tableName}.${column.columnName}`)||null:null}))},
+        eligibleTableNames:catalog.filter(table=>table.grade!=="C").map(table=>table.tableName),
+        model:relationModel,connector,source,config:relationConfig,knowledgePages:store.listKnowledge(source.id).filter(page=>page.verified),explicitKeys,
+        context:{profiling:profilingConfig,discovery:discoveryConfig,grades:catalog.map(table=>[table.tableName,table.gradeOverride]).sort()}};
+    };
+    if(checkpoint)assertRelationCheckpoint(checkpoint,analysisInput());
     // Scope decision happens before anything else sees the schema: excluded tables are cut
     // from tables, columns AND foreign keys here, so the probe, the relation candidates, the
     // snapshot and the question generators all operate on a world where they don't exist.
@@ -61,7 +81,7 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     // probed, keeps registering enum values, and keeps seeding disambiguation questions.
     const gradeOverrideByTable=new Map(store.listTables(source.id).map((table)=>[table.tableName,table.gradeOverride]));
 
-    for(const [index,rawTable] of schema.tables.entries()) {
+    for(const [index,rawTable] of (checkpoint?[]:schema.tables).entries()) {
       emit(onProgress,10+Math.round((index/Math.max(1,schema.tables.length))*60),`探针 ${rawTable.tableName}（${index+1}/${schema.tables.length}）`);
       const table={...rawTable,sourceId:source.id,gradeOverride:gradeOverrideByTable.get(rawTable.tableName)??null,inboundRelations:inbound.get(rawTable.tableName)||0,daysSinceWrite:null};
       const initialGrade=gradeTable(table);
@@ -85,24 +105,19 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     }
 
     const relationKeys=[];
-    const explicitKeys=new Set();
     for(const fk of schema.foreignKeys) {
       const relation=store.upsertRelation({sourceId:source.id,...fk,cardinality:fk.cardinality||"N:1",confidence:1,overlapRatio:null,status:"confirmed",inferenceSource:"foreign_key"});
       relationKeys.push(relationKey(relation));
-      explicitKeys.add(relationKey(relation));
-      explicitKeys.add(reverseRelationKey(relation));
-      for(const pair of relationPairs(relation)){const part={fromTable:relation.fromTable,toTable:relation.toTable,...pair};explicitKeys.add(relationKey(part));explicitKeys.add(reverseRelationKey(part));}
     }
     const currentColumns=new Set(schema.columns.map((column)=>`${column.tableName}.${column.columnName}`));
-    for(const relation of store.listRelations(source.id).filter((item)=>item.status==="confirmed")) {
+    for(const relation of store.listRelations(source.id,false,true).filter((item)=>["accepted","confirmed","denied"].includes(item.status))) {
       if(relation.inferenceSource!=="foreign_key"&&relationColumnsPresent(relation,currentColumns)) relationKeys.push(relationKey(relation));
     }
 
     emit(onProgress,72,"生成结构关系候选");
-    const eligibleTableNames=store.listTables(source.id).filter((table)=>table.grade!=="C").map((table)=>table.tableName);
-    const profilesByColumn=new Map(store.listTables(source.id).flatMap((table)=>store.listColumns(source.id,table.tableName).map((column)=>[`${table.tableName}.${column.columnName}`,column.profile])));
-    const knowledgePages=store.listKnowledge(source.id).filter((page)=>page.verified);
-    const {candidates,modelResult,diagnostics}=await analyzeRelationCandidates({schema:{...schema,columns:schema.columns.map(column=>({...column,profile:profilingConfig.enabled?profilesByColumn.get(`${column.tableName}.${column.columnName}`)||null:null}))},eligibleTableNames,model:relationModel,connector,source,config:relationConfig,knowledgePages,explicitKeys,onProgress:({completed,total,current})=>emit(onProgress,76+Math.round((completed/Math.max(1,total))*8),current)});
+    const {candidates,modelResult,diagnostics}=await analyzeRelationCandidates({...analysisInput(),checkpoint,runId,
+      onCheckpoint:state=>store.saveRelationCheckpoint(source.id,state),
+      onProgress:({completed,total,current})=>emit(onProgress,76+Math.round((completed/Math.max(1,total))*8),current)});
     const candidatesById=new Map(candidates.map((candidate)=>[candidate.id,candidate]));
     let suggestedCount=0;
     let rejectedCount=0;
@@ -126,8 +141,8 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
         structuralScore:candidate.structuralScore,structuralReason:candidate.structuralReasons.join("；"),
       });
       relationKeys.push(relationKey(relation));
-      if(relation.status==="confirmed") continue;
-      if(status==="review") {
+      if(["accepted","confirmed","denied"].includes(relation.status)) continue;
+      if(relation.status==="review") {
         suggestedCount++;
         store.addQuestion({sourceId:source.id,kind:"JOIN 路径",scope:"table",tableName:relation.fromTable,columnName:relation.fromCol,relationId:relation.id,question:`是否确认关联 ${formatRelation(relation)}？`,evidence:modelEvidence(relation),options:["确认该关联","保留候选","不允许关联"]});
       } else rejectedCount++;
@@ -136,17 +151,20 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     const judgedIds=new Set(modelResult.decisions.map(item=>item.candidateId));
     for(const candidate of candidates.filter(item=>!judgedIds.has(item.id))){
       const prior=store.getRelationByKey(source.id,candidate.from.tableName,candidate.from.columnName,candidate.to.tableName,candidate.to.columnName,candidate.columnPairs);
-      const relation=prior&&(["confirmed","denied"].includes(prior.status)||prior.inferenceSource==="document")?prior:store.upsertRelation({sourceId:source.id,fromTable:candidate.from.tableName,fromCol:candidate.from.columnName,toTable:candidate.to.tableName,toCol:candidate.to.columnName,columnPairs:candidate.columnPairs,status:"review",inferenceSource:"model",modelDecision:"uncertain",modelReason:"模型尚未完成有效判断，请重试或补充业务依据",structuralScore:candidate.structuralScore,overlapRatio:candidate.overlapRatio,dataEvidence:candidate.dataEvidence});
+      const item={sourceId:source.id,fromTable:candidate.from.tableName,fromCol:candidate.from.columnName,toTable:candidate.to.tableName,toCol:candidate.to.columnName,columnPairs:candidate.columnPairs,status:"review",inferenceSource:"model",modelDecision:"uncertain",modelReason:"模型尚未完成有效判断，请重试或补充业务依据",structuralScore:candidate.structuralScore,overlapRatio:candidate.overlapRatio,dataEvidence:candidate.dataEvidence};
+      const relation=store.getReviewedRelation(source.id,item)||(prior?.inferenceSource==="document"?prior:store.upsertRelation(item));
       relationKeys.push(relationKey(relation));
       if(relation.status==="review")store.addQuestion({sourceId:source.id,kind:"JOIN 路径",scope:"table",tableName:relation.fromTable,columnName:relation.fromCol,relationId:relation.id,question:`是否确认关联 ${formatRelation(relation)}？`,evidence:"模型尚未完成有效判断，不能作为否定关系的依据。",options:["确认该关联","保留候选","不允许关联"]});
     }
     store.saveRelationAnalysis({sourceId:source.id,modelStatus:modelResult.status,modelName:modelResult.modelName,candidateCount:candidates.length,judgedCount:modelResult.decisions.length,suggestedCount,rejectedCount,error:modelResult.error||null,diagnostics});
     if(modelResult.status!=="completed") {
       for(const relation of store.listRelations(source.id).filter((item)=>item.status==="review")) {
+        if(store.getReviewedRelation(source.id,relation))continue;
         if(relationColumnsPresent(relation,currentColumns)) relationKeys.push(relationKey(relation));
       }
     }
     for(const relation of store.listRelations(source.id,false,true).filter((item)=>item.inferenceSource==="document"&&["review","confirmed","denied"].includes(item.status))) {
+      if(relation.status==="review"&&store.getReviewedRelation(source.id,relation))continue;
       if(relationColumnsPresent(relation,currentColumns))relationKeys.push(relationKey(relation));
     }
     store.finishSchemaRefresh(source.id,normalized,[...new Set(relationKeys)]);
@@ -238,7 +256,12 @@ function normalizeCardinality(cardinality,candidate) {
   if(fromUnique&&toUnique)return "1:1";
   if(toUnique)return "N:1";
   if(fromUnique)return "1:N";
-  if(candidate.dataEvidence?.multipleMatchCount>0&&["N:1","1:1"].includes(cardinality))return "N:N";
+  const samples=[candidate.dataEvidence,...(candidate.dataEvidence?.history||[])].filter(evidence=>evidence?.status==="sampled");
+  if(samples.some(evidence=>evidence.multipleMatchCount>0)&&["N:1","1:1"].includes(cardinality))return "N:N";
+  if(samples.some(evidence=>evidence.sourceMultipleMatchCount>0)){
+    if(cardinality==="1:N")return "N:N";
+    if(cardinality==="1:1")return "N:1";
+  }
   if(cardinality&&cardinality!=="unknown") return cardinality;
   return "N:N";
 }

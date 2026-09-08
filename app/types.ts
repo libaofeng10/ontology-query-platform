@@ -73,6 +73,7 @@ export type DiscoverySummary = {
     modelStatus:"not_run"|"not_configured"|"completed"|"partial"|"failed"|string;
     modelName:string|null; candidateCount:number; judgedCount:number;
     suggestedCount:number; rejectedCount:number; error:string|null; updatedAt:string|null;
+    checkpoint?:{canResume:boolean;expired:boolean;pendingResampleCount:number;pendingJudgmentCount:number;pendingReviewCount:number;pendingProposalBatches:number;pendingProposalCandidates:number}|null;
   };
   schemaDiff?:SchemaDiff;
 };
