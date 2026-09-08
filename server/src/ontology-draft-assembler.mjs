@@ -36,7 +36,12 @@ export function assembleOntologyDraft({run,candidates,baseSchema=null,excludeCan
     const payload=structuredClone(candidate.payload);
     if(incremental){payload.source=objectAliases.get(payload.source)||objectByTable.get(run.scope?.endpointTables?.[payload.source])?.apiName||payload.source;payload.target=objectAliases.get(payload.target)||objectByTable.get(run.scope?.endpointTables?.[payload.target])?.apiName||payload.target;}
     if(!objectByApi.has(payload.source)||!objectByApi.has(payload.target)){conflicts.push(resolvedConflict({candidate,candidateType:"link",reason:"link_endpoint_missing",source:payload.source,target:payload.target,allowedResolutions:["keep_existing"],conflictResolutions}));continue;}
-    const relationId=linkPathIdentity(payload);const byApi=linkByApi.get(payload.apiName);const byRelation=relationId?linkByRelation.get(relationId):null;const existing=byApi||byRelation;
+    const relationId=linkPathIdentity(payload);const byApi=linkByApi.get(payload.apiName);const byRelation=relationId?linkByRelation.get(relationId):null;const existing=incremental&&byRelation?byRelation:byApi||byRelation;
+    // Incremental source builds preserve every approved physical path. A shared
+    // generated name is a naming collision, not a choice between relationships.
+    if(incremental&&!conflictResolutions[candidate.id]&&byApi&&!byRelation&&relationId&&linkPathIdentity(byApi)&&linkPathIdentity(byApi)!==relationId){
+      schema.linkTypes.push(payload);linkByRelation.set(relationId,payload);includedCandidates.push(candidate);continue;
+    }
     if(existing) {
       if(incremental&&!conflictResolutions[candidate.id]&&equalJson([existing.source,existing.target,existing.cardinality,relationIds(existing)],[payload.source,payload.target,payload.cardinality,relationIds(payload)])){includedCandidates.push(candidate);continue;}
       if(equalJson(linkCore(existing),linkCore(payload))){includedCandidates.push(candidate);continue;}

@@ -34,6 +34,7 @@ import { createOntologyDomainPlanner } from "./ontology-domain-plan.mjs";
 import { createOntologyDomainModelingService } from "./ontology-domain-modeling-service.mjs";
 import { createOntologyDomainDraftService } from "./ontology-domain-draft-service.mjs";
 import { createSourceOntologyBuildService } from "./source-ontology-build-service.mjs";
+import { createOntologyActivationService } from "./ontology-activation-service.mjs";
 import { createClaudeQueryBridge } from "./claude-query-bridge.mjs";
 import { dirname, join as joinPath } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +78,7 @@ export function createApp(overrides={}) {
   queries.setDependencies({knowledge,evaluation,proposalService:knowledgeProposals});
   const tasks=createTaskService({store,discovery,handlers:{evaluation:evaluation.run,evaluation_gate:evaluation.runGate,evaluation_agent_gate:evaluation.runAgentGate,ontology_generation:ontologyCandidates.runGeneration,ontology_link_generation:ontologyCandidates.runSupplementalLinks,ontology_domain_modeling:(context)=>context.payload.sourceBuild?sourceOntologyBuild.run(context):ontologyDomainModeling.run(context),embedding_reindex:({source,onProgress})=>embeddingIndex.reindex(source.id,{onProgress:({done,total,currentStep})=>onProgress({progress:done,total:Math.max(total,1),currentStep})})}});
   const sourceOntologyBuild=createSourceOntologyBuildService({store,discovery,modeling:ontologyDomainModeling,tasks,config:settingsConfig,candidates:ontologyCandidates,drafts:ontologyDomainDrafts,semanticSchemas,evaluation,knowledge});
+  const ontologyActivation=createOntologyActivationService({store,semanticSchemas,tasks});
   tasks.recover();
   const limiter=createRateLimiter();
 
@@ -101,6 +103,8 @@ export function createApp(overrides={}) {
       const credentialMatch=url.pathname.match(/^\/api\/sources\/(\d+)\/credential$/);if(req.method==="POST"&&credentialMatch){const source=requiredSource(store,identity,credentialMatch[1],"admin");if(source.isDemo)throw badRequest("演示数据源不支持凭据轮换");const body=await readJson(req);if(!body.password||typeof body.password!=="string")throw badRequest("password 必填");store.updateSourceCredential(source.id,encryptCredential(body.password,runtime.appSecret));await connector.invalidate?.(source.id);return send(res,200,{ok:true,sourceId:source.id,requiresRetest:true});}
       const sourceBuild=url.pathname.match(/^\/api\/sources\/(\d+)\/ontology-build$/);
       if(sourceBuild){const source=requiredSource(store,identity,sourceBuild[1],req.method==="POST"?"editor":"viewer");if(req.method==="GET")return send(res,200,sourceOntologyBuild.status(source.id));if(req.method==="POST")return send(res,202,await sourceOntologyBuild.start(source,await readJson(req),identity.name));}
+      const sourceActivation=url.pathname.match(/^\/api\/sources\/(\d+)\/ontology-build\/(activation|activate)$/);
+      if(sourceActivation){const source=requiredSource(store,identity,sourceActivation[1],req.method==='POST'?'editor':'viewer');if(req.method==='GET'&&sourceActivation[2]==='activation')return send(res,200,ontologyActivation.inspect(source,url.searchParams.get('versionId')));if(req.method==='POST'&&sourceActivation[2]==='activate')return send(res,202,await ontologyActivation.activate(source,await readJson(req),identity.name));}
       const sourceBuildAction=url.pathname.match(/^\/api\/sources\/(\d+)\/ontology-build\/(resume|correct)$/);
       const sourceBuildRecord=url.pathname.match(/^\/api\/sources\/(\d+)\/ontology-build\/records\/([^/]+)$/);
       if(req.method==="GET"&&sourceBuildRecord){const source=requiredSource(store,identity,sourceBuildRecord[1]);return send(res,200,sourceOntologyBuild.record(source.id,decodeURIComponent(sourceBuildRecord[2])));}

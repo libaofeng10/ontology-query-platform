@@ -222,7 +222,7 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
           for(const runId of (checkpoint.generation.runIds||[]).filter(id=>store.getOntologyGenerationRun(id)?.scope.scopeKind!=="global_links")) {
             const spent=store.listOntologyGenerationRuns(source.id,500).filter((item)=>item.scope.orchestrationId===task.id).reduce((total,item)=>total+Number(item.summary.repairAttempts||0),0);
             await candidates.refineRun(runId,{remainingRounds:Math.max(0,20-spent),extraRounds:(checkpoint.answeredQuestions||[]).length,clarifiedCandidateIds:checkpoint.clarifiedCandidateIds||[],onProgress:(step)=>onProgress({...step,total:100,progress:70})});
-            await candidates.verifyAndRepairRun?.(runId,{retryPasses:Number(checkpoint.verificationRetryPasses||0),onProgress:step=>onProgress({...step,total:100,progress:72})});
+            await candidates.verifyAndRepairRun?.(runId,{retryPasses:Number(checkpoint.verificationRetryPasses||0),repairBusinessQuestions:true,onProgress:step=>onProgress({...step,total:100,progress:72})});
           }
           const issues=definitionIssues(task.id,{objectsOnly:true});if(issues.length)return wait("needs_input",issues);
           const completed=await candidates.completeBuildLinks({sourceId:source.id,orchestrationId:task.id,runIds:checkpoint.generation.runIds||[],tableNames:selectedTables,actor:payload.actor,extraRounds:(checkpoint.answeredQuestions||[]).length,retryPasses:Number(checkpoint.linkRetryPasses||0),verificationRetryPasses:Number(checkpoint.verificationRetryPasses||0),clarifiedCandidateIds:checkpoint.clarifiedCandidateIds||[],onProgress:step=>onProgress({...step,total:100,progress:75})});
@@ -235,11 +235,11 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
           if(workflow.draftSchemaVersionId)save({draftVersionId:workflow.draftSchemaVersionId});
           else {
             const resolutions={...checkpoint.conflictResolutions};
-            for(const runId of checkpoint.generation.runIds||[])for(const item of store.listOntologyCandidates({runId,limit:2000}))if(!resolutions[item.id]&&item.status==="auto_confirmed"&&candidates.currentVerification?.(item)?.decision==="supported")resolutions[item.id]="use_candidate";
+            for(const runId of checkpoint.generation.runIds||[])for(const item of store.listOntologyCandidates({runId,limit:2000}))if(!resolutions[item.id]&&item.status==="auto_confirmed"&&item.forcedReviewReasons?.includes("MODIFIES_BASE_SCHEMA")&&candidates.currentVerification?.(item)?.decision==="supported")resolutions[item.id]="use_candidate";
             const input={conflictResolutions:resolutions},preview=drafts.previewBuild(task.id,input),conflicts=preview.conflicts.filter((item)=>item.resolution==="unresolved");
             if(conflicts.length)return wait("needs_input",conflictIssues(conflicts));
             const missing=selectedTables.filter((table)=>!mappedTables(preview.schema).includes(table));
-            if(missing.length)return wait("needs_input",[{id:"scope",kind:"scope",title:"部分所选数据还没有业务定义",detail:`尚未覆盖：${missing.join("、")}。请补充表说明后继续整理。`,tables:missing,retryable:true}]);
+            if(missing.length)return wait("needs_input",[{id:"scope",kind:"scope",title:"部分所选数据还没有业务定义",detail:`系统合并后尚未覆盖：${missing.join("、")}。请查看执行记录并重试。`,tables:missing,retryable:true}]);
             const coveredLinks=new Set((preview.schema.linkTypes||[]).flatMap(link=>(link.relationMappings||[]).map(item=>Number(item.relationId))));
             const expectedLinks=store.listRelations(source.id,true).filter(item=>selectedTables.includes(item.fromTable)&&selectedTables.includes(item.toTable)),missingLinks=expectedLinks.filter(item=>!coveredLinks.has(item.id));
             const missingPaths=missingBridgePaths(bridgePaths,preview.schema.linkTypes||[]);
@@ -265,7 +265,7 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
       if(!checked.ok&&!checked.gateRequired)return wait("needs_input",validationIssues(checked));
       if(checked.gateRequired) {
         const impact=checked.evaluationImpact;
-        if(impact.uncoveredChanges.length)return wait("needs_input",[{id:"evaluation-coverage",kind:"evaluation",title:"这次变化还缺少验证依据",detail:`请管理员补充已审核的验证用例：${impact.uncoveredChanges.map((item)=>item.label).join("、")}`,tables:[],retryable:true}]);
+        if(impact.uncoveredChanges.length)return wait("needs_input",[{id:"evaluation-coverage",kind:"evaluation",title:"这次变化还缺少验证依据",detail:`需补充已审核的验证用例：${impact.uncoveredChanges.map((item)=>item.label).join("、")}。请在启用条件中选择补充用例或保留已有字段；重新检查不会自动补充用例。`,tables:[],retryable:true}]);
         stage("evaluating","正在验证受影响的业务问法",90);
         for(const setName of impact.missingSets||[]) {
           assertBase(source.id,checkpoint.baseVersionId);

@@ -4,16 +4,17 @@ import { useState } from "react";
 import { correctSourceOntology, resumeSourceOntology } from "./api";
 import { Icon } from "./icons";
 import { OntologyExecutionRecords } from "./ontology-ai-workbench";
+import { OntologyActivationPanel } from "./ontology-activation-panel";
 import { OntologyVersionRecords } from "./semantic-modeling";
 import { OntologyDefinitionList, type DefinitionEdit } from "./ontology-definition-list";
 import { ChangeList, formatDate } from "./ontology-workspace-shared";
-import type { OntologyBuildAnswer, OntologyBuildIssue, SourceOntologyBuildStatus } from "./types";
+import type { OntologyActivationStatus, OntologyBuildAnswer, OntologyBuildIssue, SourceOntologyBuildStatus } from "./types";
 import "./ontology-result-workspace.css";
 
 type Role="viewer"|"analyst"|"editor"|"admin";
 type Panel="result"|"execution"|"versions";
 
-export function OntologyResultWorkspace({sourceId,status,role,onRefresh,onQuery,onSelectTables}:{sourceId?:number;status:SourceOntologyBuildStatus|null;role:Role;onRefresh:()=>Promise<void>;onQuery:()=>void;onSelectTables:()=>void}) {
+export function OntologyResultWorkspace({sourceId,status,role,onRefresh,onQuery,onSelectTables,onEvaluation}:{sourceId?:number;status:SourceOntologyBuildStatus|null;role:Role;onRefresh:()=>Promise<void>;onQuery:()=>void;onSelectTables:()=>void;onEvaluation:(activation:OntologyActivationStatus)=>void}) {
   const [panel,setPanel]=useState<Panel>("result");
   const [working,setWorking]=useState(false);
   const [error,setError]=useState<string|null>(null);
@@ -21,8 +22,9 @@ export function OntologyResultWorkspace({sourceId,status,role,onRefresh,onQuery,
   const [versionId,setVersionId]=useState<number|null>(null);
   const canEdit=role==="editor"||role==="admin",update=status?.update,record=status?.activeVersion;
   const busy=working||Boolean(update?.busy),questions=update?.questions||[];
-  const isSystem=(item:OntologyBuildIssue)=>["generation","verification","validation","evaluation"].includes(item.kind);
-  const systemQuestions=questions.filter(isSystem),reviewQuestions=questions.filter(item=>!isSystem(item));
+  const isSystem=(item:OntologyBuildIssue)=>!["relation","definition","candidate_review","conflict"].includes(item.kind);
+  const activationDraft=status?.versions.find(item=>item.id===update?.draftVersionId&&item.status==="draft");
+  const systemQuestions=questions.filter(item=>isSystem(item)&&!(activationDraft&&item.kind==="evaluation")),reviewQuestions=questions.filter(item=>!isSystem(item));
   const linkReview=reviewQuestions.length>0&&reviewQuestions.every(item=>item.kind==="candidate_review"&&item.candidateType==="link");
   const openPanel=(next:Panel)=>{setPanel(next);setError(null);setNotice(null);};
   async function perform(action:()=>Promise<unknown>,message?:string) {
@@ -33,7 +35,7 @@ export function OntologyResultWorkspace({sourceId,status,role,onRefresh,onQuery,
   }
   async function continueBuild(answers?:OntologyBuildAnswer[],approve=false,retryLinks=false,retryVerification=false) {
     if(!sourceId||!update)return;
-    await perform(()=>resumeSourceOntology(sourceId,{taskId:update.id,answers,...(retryLinks?{retryLinkGeneration:true}:{}),...(retryVerification?{retryVerification:true}:{}),...(approve&&update.changeChecksum?{approveChangeChecksum:update.changeChecksum}:{})}));
+    await perform(()=>resumeSourceOntology(sourceId,{taskId:update.id,answers,...(retryLinks?{retryLinkGeneration:true}:{}),...(retryVerification?{retryVerification:true}:{}),...(approve&&update.changeChecksum?{approveChangeChecksum:update.changeChecksum}:{})}),"已提交检查，处理结果会在此页面更新。");
   }
   async function saveEdit(edit:DefinitionEdit) {
     if(!sourceId||!record)return false;
@@ -61,10 +63,12 @@ export function OntologyResultWorkspace({sourceId,status,role,onRefresh,onQuery,
         <ChangeList diff={update.changes}/>
         {canEdit&&<button className="primary-button" disabled={busy} onClick={()=>void continueBuild(undefined,true)}>确认这次变化并继续</button>}
       </section>}
+      {sourceId&&activationDraft&&update?.phase!=="awaiting_change"&&<OntologyActivationPanel key={activationDraft.id} sourceId={sourceId} versionId={activationDraft.id} canEdit={canEdit} busy={busy} revision={`${update?.phase}:${status.task?.finishedAt}`} onRefresh={onRefresh} onEvaluation={onEvaluation} onVersion={id=>{setVersionId(id);openPanel("versions");}}/>}
       {!update?.busy&&systemQuestions.length>0&&<section className="ontology-clarifications">
         <h3>系统处理任务</h3>
         {systemQuestions.map(issue=><article className="ontology-clarification" key={issue.id}><h4>{issue.title}</h4><p>{issue.detail}</p>
-          {canEdit&&issue.retryable&&<button className="secondary-button" disabled={busy} onClick={()=>void continueBuild(undefined,false,issue.kind==="generation",issue.kind==="verification")}>{issue.kind==="verification"?"继续自动核验":issue.kind==="generation"?"重试补齐关系定义":"重试系统检查"}</button>}
+          {issue.kind==="verification"&&(issue.definitions||[]).length>0&&<details><summary>查看待处理原因</summary>{[...new Set((issue.definitions||[]).map(item=>item.description))].map(reason=><p key={reason}>{reason}</p>)}</details>}
+          {canEdit&&issue.retryable&&<button className="secondary-button" disabled={busy} onClick={()=>void continueBuild(undefined,false,issue.id==="link-generation",issue.kind==="verification")}>{issue.kind==="verification"?"继续自动核验":issue.id==="link-generation"?"重试补齐关系定义":"重试系统检查"}</button>}
         </article>)}
       </section>}
       {!update?.busy&&reviewQuestions.length>0&&<section className="ontology-clarifications">
@@ -82,7 +86,7 @@ export function OntologyResultWorkspace({sourceId,status,role,onRefresh,onQuery,
       </>}
     </>}
     {panel==="execution"&&sourceId&&<OntologyExecutionRecords sourceId={sourceId} status={status} canInspect={canEdit} onResolve={()=>openPanel("result")} onVersion={(id)=>{setVersionId(id);openPanel("versions");}}/>}
-    {panel==="versions"&&<OntologyVersionRecords status={status} canEdit={canEdit} busy={busy} selectedId={versionId} onSelect={setVersionId} onRefresh={onRefresh} onEdit={()=>openPanel("result")} onExecution={()=>openPanel("execution")}/>}
+    {panel==="versions"&&<OntologyVersionRecords status={status} canEdit={canEdit} busy={busy} selectedId={versionId} onSelect={setVersionId} onRefresh={onRefresh} onEdit={()=>openPanel("result")} onExecution={()=>openPanel("execution")} onEvaluation={onEvaluation}/>}
   </div>;
 }
 

@@ -1,4 +1,15 @@
 .ontology-simple{color:var(--text);font-size:1rem;line-height:1.6;padding:1.5rem 0 3rem;min-width:0}
+.ontology-activation-panel{padding:1.25rem 1.4rem;margin:1rem 0 1.5rem;border:1px solid #e6d8a6;border-radius:12px;background:#fffdf7;min-width:0}
+.ontology-activation-panel .ontology-section-heading{margin-bottom:.6rem;flex-wrap:wrap}
+.ontology-activation-panel .ontology-section-heading>span{display:flex;align-items:center;gap:.5rem;font-size:.875rem;color:var(--muted)}
+.ontology-activation-panel ul{padding-left:1.3rem;margin:.65rem 0 1rem}
+.ontology-activation-panel li{overflow-wrap:anywhere;margin:.3rem 0}
+.ontology-activation-panel li small{font-size:.875rem;color:var(--muted);margin-left:.7rem}
+.ontology-activation-label{font-weight:600;margin-top:1rem!important}
+.ontology-retention-option{margin:1rem 0;padding:1rem;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+.ontology-retention-option p{margin:.4rem 0 .9rem!important}
+.ontology-activation-actions{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;margin:.8rem 0 .3rem}
+.ontology-activation-panel button{white-space:normal;text-align:center}
 .ontology-simple h2,.ontology-simple h3,.ontology-simple h4,.ontology-simple p{margin:0}
 .ontology-simple-toolbar,.ontology-section-heading{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1.2rem}
 .ontology-simple-toolbar h2{font-size:1.3rem}

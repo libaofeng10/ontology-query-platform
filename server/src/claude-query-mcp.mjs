@@ -120,6 +120,7 @@ export async function createClaudeQueryMcpSession(options = {}) {
     readPages: new Set(),
     readRules: new Set(),
     toolSequence: 0,
+    consecutiveEmptyQueries: 0,
     onEvent: typeof options.onEvent === "function" ? options.onEvent : null,
     server: null,
     serverClosePromise: null,
@@ -510,6 +511,8 @@ async function dbQuery(state, args = {}) {
     return failureResult(receipt?.errorCode || receipt?.code || "EXECUTION_ERROR", safeMessage(receipt?.reason || receipt?.error || "查询执行失败"), {
       retryable: Boolean(receipt?.retryable),
       failureClass: receipt?.failureClass,
+      queryBudget: queryBudget(state),
+      ...schemaRecoveryContext(state, receipt, tableNames),
     });
   }
   const tupleRows = Array.isArray(receipt) && Array.isArray(receipt[0]) ? receipt[0] : [];
@@ -552,6 +555,7 @@ async function dbQuery(state, args = {}) {
     createdAt: new Date().toISOString(),
   };
   state.runs.set(executionId, run);
+  state.consecutiveEmptyQueries = run.rowCount === 0 ? state.consecutiveEmptyQueries + 1 : 0;
   const preview = makePreview(run, state.previewRows, state.previewBytes, state.snapshot);
   return {
     ok: true,
@@ -563,9 +567,26 @@ async function dbQuery(state, args = {}) {
     resultMayBeIncomplete: Boolean(receipt.resultMayBeIncomplete ?? receipt.mayBeIncomplete ?? receipt.mayBeTruncated ?? run.mayBeTruncated ?? run.completeness?.complete === false),
     scannedRows: run.scannedRows,
     durationMs: run.durationMs,
+    queryBudget: queryBudget(state),
+    ...(run.rowCount === 0 ? { nextStep: state.consecutiveEmptyQueries >= 2
+      ? "连续查询为空。不要继续把同一 ID 依次套在不同字段上；结合原问题中的完整名称、产品定义与字段注释重新定位，保留明细查询额度。不能据此认定目标没有数据。"
+      : "空结果只说明本条 SQL 的条件未命中。若属于实体定位，结合原问题的名称核对 ID 的业务归属；不要直接认定目标没有数据。" } : {}),
     // Deliberately no `rows`/`sql` field here: the model receives only the
     // receipt.  The bridge resolves the private run from this session.
   };
+}
+
+function queryBudget(state) {
+  const stats = state.kernel?.stats?.();
+  return stats ? { used: stats.sqlCalls, limit: stats.maxSqlCalls, remaining: Math.max(0, stats.maxSqlCalls - stats.sqlCalls), schemaRepairs: stats.schemaRepairs || 0, maxSchemaRepairs: stats.maxSchemaRepairs || 0 } : undefined;
+}
+
+function schemaRecoveryContext(state, receipt, tableNames) {
+  if (!["UNKNOWN_COLUMN", "UNKNOWN_TABLE", "AMBIGUOUS_COLUMN"].includes(receipt?.code || receipt?.errorCode)) return {};
+  const ids = receipt?.verdict?.tables || tableNames;
+  let tables = [];
+  try { if (ids.length) tables = state.snapshot.read({ operation: "get_tables", ids, limit: 50 }).items || []; } catch { /* Missing catalog guidance must not become a SQL permission gate. */ }
+  return { recovery: { instruction: "数据库报告表或字段错误。按下列目录结构修正 SQL；目录可能过时，未命中时继续查阅结构。不要原样重试，也不要删除用户的筛选条件。", tables, allowanceUsed: Boolean(receipt?.schemaRecovery?.allowanceUsed) } };
 }
 
 async function executeThroughKernel(state, input) {

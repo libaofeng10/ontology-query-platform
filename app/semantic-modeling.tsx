@@ -3,20 +3,21 @@
 import { useEffect, useState } from "react";
 import { getOntologySchema, getOntologySchemaDiff, rollbackOntologySchema } from "./api";
 import { OntologyDefinitionList } from "./ontology-definition-list";
+import { OntologyActivationPanel } from "./ontology-activation-panel";
 import { ChangeList, formatDate } from "./ontology-workspace-shared";
-import type { SemanticSchemaDiff, SemanticSchemaVersion, SourceOntologyBuildStatus } from "./types";
+import type { OntologyActivationStatus, SemanticSchemaDiff, SemanticSchemaVersion, SourceOntologyBuildStatus } from "./types";
 
-export function OntologyVersionRecords({status,canEdit,busy,selectedId,onSelect,onRefresh,onEdit,onExecution}:{status:SourceOntologyBuildStatus;canEdit:boolean;busy:boolean;selectedId:number|null;onSelect:(id:number)=>void;onRefresh:()=>Promise<void>;onEdit:()=>void;onExecution:()=>void}) {
+export function OntologyVersionRecords({status,canEdit,busy,selectedId,onSelect,onRefresh,onEdit,onExecution,onEvaluation}:{status:SourceOntologyBuildStatus;canEdit:boolean;busy:boolean;selectedId:number|null;onSelect:(id:number)=>void;onRefresh:()=>Promise<void>;onEdit:()=>void;onExecution:()=>void;onEvaluation:(activation:OntologyActivationStatus)=>void}) {
   const selected=status.versions.find((item)=>item.id===selectedId)||status.activeVersion||status.versions[0];
   return <section>
     <div className="ontology-page-intro"><h3>版本记录</h3><p>系统自动保存每次业务定义更新。选择版本即可查看变化和完整定义。</p></div>
     {!selected?<p className="ontology-simple-empty">本体生成后，版本记录会自动保存在这里。</p>:<div className="ontology-record-layout">
       <nav className="ontology-saved-versions" aria-label="选择本体版本">{status.versions.map((version)=><button key={version.id} aria-current={selected.id===version.id?"true":undefined} onClick={()=>onSelect(version.id)}><span><strong>v{version.version}</strong><small>{versionLabel(version.status)}</small></span><time>{formatDate(version.createdAt)}</time><span>{version.validation.summary.objectTypes} 个对象 · {version.validation.summary.linkTypes} 条关系</span></button>)}</nav>
-      <VersionDetail key={`${selected.id}:${status.activeVersion?.id}`} selected={selected} active={status.activeVersion} canEdit={canEdit} busy={busy} onRefresh={onRefresh} onEdit={onEdit} onExecution={onExecution}/>
+      <VersionDetail key={`${selected.id}:${status.activeVersion?.id}`} selected={selected} active={status.activeVersion} canEdit={canEdit} busy={busy} revision={`${status.update?.phase}:${status.task?.finishedAt}`} onRefresh={onRefresh} onEdit={onEdit} onExecution={onExecution} onEvaluation={onEvaluation} onVersion={onSelect}/>
     </div>}
   </section>;
 }
-function VersionDetail({selected,active,canEdit,busy,onRefresh,onEdit,onExecution}:{selected:SemanticSchemaVersion;active:SemanticSchemaVersion|null;canEdit:boolean;busy:boolean;onRefresh:()=>Promise<void>;onEdit:()=>void;onExecution:()=>void}) {
+function VersionDetail({selected,active,canEdit,busy,revision,onRefresh,onEdit,onExecution,onEvaluation,onVersion}:{selected:SemanticSchemaVersion;active:SemanticSchemaVersion|null;canEdit:boolean;busy:boolean;revision:string;onRefresh:()=>Promise<void>;onEdit:()=>void;onExecution:()=>void;onEvaluation:(activation:OntologyActivationStatus)=>void;onVersion:(id:number)=>void}) {
   const [record,setRecord]=useState<SemanticSchemaVersion|null>(selected.schema?selected:null);
   const [diff,setDiff]=useState<SemanticSchemaDiff|null>(null),[loading,setLoading]=useState(true),[working,setWorking]=useState(false);
   const [error,setError]=useState<string|null>(null),[notice,setNotice]=useState<string|null>(null),[retry,setRetry]=useState(0);
@@ -38,7 +39,7 @@ function VersionDetail({selected,active,canEdit,busy,onRefresh,onEdit,onExecutio
     {notice&&<p className="ontology-inline-notice" role="status">{notice}</p>}
     {loading&&<p role="status">正在读取版本和变化…</p>}
     {!loading&&record&&<>
-      {selected.status==="draft"&&<p className="ontology-version-note">本次整理结果尚未用于问数。<button className="ontology-text-button" onClick={onExecution}>查看执行记录</button></p>}
+      {selected.status==="draft"&&<><OntologyActivationPanel sourceId={selected.sourceId} versionId={selected.id} canEdit={canEdit} busy={busy||working} revision={revision} onRefresh={onRefresh} onEvaluation={onEvaluation} onVersion={onVersion}/><button className="ontology-text-button" onClick={onExecution}>查看执行记录</button></>}
       {diff&&<section className="ontology-version-changes"><h4>{selected.status==="deprecated"?"恢复到此版本后的变化":"与当前使用版本的区别"}</h4><p>相对当前 v{active?.version}：新增 {diff.summary.added} 项，调整 {diff.summary.changed} 项，移除 {diff.summary.removed} 项。</p><ChangeList diff={diff} from={active?.schema} to={record.schema}/></section>}
       {selected.status==="deprecated"&&canEdit&&<div className="ontology-restore-action"><p>恢复后将使用上面的业务定义。系统会先检查它是否适用于当前数据结构，现有版本也会保留。</p><button className="secondary-button" disabled={busy||working||!!error||!diff} onClick={()=>void restore()}>{working?"正在检查并恢复…":"恢复到此版本"}</button></div>}
       <div className="ontology-section-heading"><h4>本版本的业务定义</h4><span>{record.schema?.objectTypes.length||0} 个对象</span></div>

@@ -57,6 +57,41 @@ async function changedObjectFixture(options={}) {
   return {...setup,original,task,issue:task.payload.sourceBuild.questions[0]};
 }
 
+test("自动构建先核验低分定义，有证据则继续构建且没有人工问题",async()=>{
+  let calls=0;
+  const {app,selections,close}=await fixture({mode:"auto_draft",firstBuild:true,similarity:()=>.4,verifier:{inspect:async inputs=>{
+    calls++;return {calls:1,results:new Map(inputs.map(input=>[input.candidateId,{decision:"supported",explanation:"客户表字段说明支持当前定义",question:null,supports:input.requirements.map(claim=>({claim,evidenceIds:input.evidence.map(item=>item.id),reason:"定义以客户标识及客户表字段为依据"}))}]))};
+  }}});
+  try{
+    const start=await api(app,"/api/sources/1/ontology-build",{selections}),task=await waitForTask(app,start.body.id);
+    assert.equal(task.status,"succeeded",task.error);assert.equal(task.payload.sourceBuild.phase,"ready");assert.deepEqual(task.payload.sourceBuild.questions,[]);assert.equal(calls,1);
+    const candidate=app.store.listOntologyCandidates({runId:task.payload.sourceBuild.generation.runIds[0]})[0];assert.ok(candidate.score<85);assert.ok(candidate.evidence.some(item=>item.kind==="automatic_verification"&&item.verified));
+  }finally{await close();}
+});
+
+test("历史待审核定义先投影为系统核验，读接口不调用模型，失败重试不要求业务说明",async()=>{
+  let calls=0;
+  const {app,selections,close}=await fixture({mode:"auto_draft",firstBuild:true,similarity:()=>.4,verifier:{inspect:async()=>{calls++;return {results:new Map(),calls:1};}}});
+  try{
+    const start=await api(app,"/api/sources/1/ontology-build",{selections});let task=await waitForTask(app,start.body.id);
+    assert.equal(task.payload.sourceBuild.phase,"needs_input");assert.deepEqual(task.payload.sourceBuild.questions.map(item=>item.kind),["verification"]);assert.equal(calls,1);
+    for(let i=0;i<3;i++)assert.equal((await api(app,"/api/sources/1/ontology-build",null,"GET")).body.update.questions[0].kind,"verification");assert.equal(calls,1);
+    for(let i=1;i<=2;i++){assert.equal((await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,retryVerification:true})).status,202);task=await waitForTask(app,task.id);assert.equal(calls,1+i);}
+    assert.equal(task.payload.sourceBuild.questions[0].retryable,false);
+    assert.equal((await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,retryVerification:true})).status,409);
+    const candidate=app.store.listOntologyCandidates({runId:task.payload.sourceBuild.generation.runIds[0]})[0];
+    app.store.db.prepare("UPDATE ds_ontology_candidate SET evidence_json='[]' WHERE id=?").run(candidate.id);
+    app.store.updateTaskPayload(task.id,{...task.payload,sourceBuild:{...task.payload.sourceBuild,questions:[{id:`candidate:${candidate.id}`,kind:"candidate_review",candidateIds:[candidate.id]}]}});
+    assert.equal((await api(app,"/api/sources/1/ontology-build",null,"GET")).body.update.questions[0].kind,"verification");assert.equal(calls,3);
+  }finally{await close();}
+});
+
+test("证据支持的兼容定义变更在合并时复用核验结论，不产生第二次人工确认",async()=>{
+  const setup=await changedObjectFixture({verifier:{inspect:async inputs=>({calls:1,results:new Map(inputs.map(input=>[input.candidateId,{decision:"supported",explanation:"客户类型字段已存在且注释明确，本次增加可选属性",question:null,supports:input.requirements.map(claim=>({claim,evidenceIds:input.evidence.map(item=>item.id),reason:"比对现有定义与字段注释，此变更增加已有分类字段"}))}]))})}});
+  try{assert.equal(setup.task.status,"succeeded",setup.task.error);assert.equal(setup.task.payload.sourceBuild.phase,"ready");assert.deepEqual(setup.task.payload.sourceBuild.questions,[]);assert.notEqual(setup.app.store.getPublishedOntologySchema(1).id,setup.original.id);}
+  finally{await setup.close();}
+});
+
 test("选表后在同一后台任务完成探查与生成，审核和启用仍是明确操作",async()=>{
   const {app,selections,close}=await fixture();
   try{
@@ -550,6 +585,17 @@ test("跨域关系进入最终生效草稿，补边运行不要求重复生成�
     assert.equal(published.schema.objectTypes.length,2);assert.equal(published.schema.linkTypes.length,1);
     assert.equal(task.payload.sourceBuild.relationCoverage.coveredRelationCount,1);
     assert.equal(app.store.listOntologyGenerationRuns(1).filter(run=>run.scope.scopeKind==="global_links").length,1);
+  }finally{await close();}
+});
+
+test("证据通过不等于授权替换同名路径：两条新关系都进入最终构建",async()=>{
+  const {app,close}=await fixture({mode:"auto_draft",firstBuild:true,splitDomains:true,similarity:candidate=>candidate.candidateType==="link"?.4:.9,
+    generateLinks:args=>completeLinks({...args,onCandidate:input=>args.onCandidate({...input,payload:{...input.payload,apiName:"shared_relation",inverseApiName:"shared_inverse"}})}),
+    verifier:{inspect:async inputs=>({calls:1,results:new Map(inputs.map(input=>[input.candidateId,{decision:"supported",explanation:"物理字段及已确认关联支持当前定义",question:null,supports:input.requirements.map(claim=>({claim,evidenceIds:input.evidence.map(item=>item.id),reason:"关联与两端业务定义一致"}))}]))})}});
+  try{
+    const start=await api(app,"/api/sources/1/ontology-build",{selections:["crm_customer","sales_order","payment_transaction"].map(tableName=>({tableName,included:true}))}),task=await waitForTask(app,start.body.id);
+    assert.equal(task.payload.sourceBuild.phase,"ready",JSON.stringify(task.payload.sourceBuild.questions));assert.equal(task.payload.sourceBuild.relationCoverage.coveredRelationCount,2);
+    const schema=app.store.getPublishedOntologySchema(1).schema;assert.equal(schema.linkTypes.length,2);assert.equal(new Set(schema.linkTypes.map(link=>link.apiName)).size,2);
   }finally{await close();}
 });
 

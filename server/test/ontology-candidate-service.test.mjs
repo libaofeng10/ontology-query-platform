@@ -7,6 +7,115 @@ import { createOntologyCandidateService, ontologyCatalogChecksum } from "../src/
 import { scoreOntologyCandidate } from "../src/ontology-candidate-score.mjs";
 import { createSemanticSchemaService } from "../src/semantic-schema-service.mjs";
 import { createStore } from "../src/store.mjs";
+import { verificationRecord } from "../src/ontology-candidate-verifier.mjs";
+
+function positiveVerification(inputs){return {results:new Map(inputs.map(input=>[input.candidateId,{decision:"supported",explanation:"字段说明和已确认关系支持当前定义",supports:input.requirements.map(claim=>({claim,evidenceIds:input.evidence.map(item=>item.id),reason:"对应表字段说明与已确认关系一致"})),question:null}])),calls:1,tokenUsage:{totalTokens:12}};}
+
+test("低分对象和关系凭完整证据自动通过，保留原评分并持久化一次审计",async()=>{
+  const fixture=await createFixture();let calls=0;
+  try{
+    const config={ontologyAi:{mode:"auto_draft",autoConfirmScore:99},llm:{model:"verifier"}};
+    const service=createOntologyCandidateService({store:fixture.store,config,scorer:{score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.7})},verifier:{inspect:async inputs=>{calls++;return positiveVerification(inputs);}}});
+    const run=service.createRun({sourceId:fixture.source.id,tableNames:["crm_customer","sales_order"]},"editor");
+    const customer=await service.evaluateAndStore(run.id,objectCandidate()),order=await service.evaluateAndStore(run.id,orderCandidate());finishRun(fixture.store,run.id);
+    await service.verifyRun(run.id);assert.equal(fixture.store.getOntologyCandidate(customer.id).status,"auto_confirmed");assert.equal(fixture.store.getOntologyCandidate(customer.id).score,customer.score);
+    const link=await service.evaluateAndStore(run.id,linkCandidate(fixture.relation.id,customer,order));assert.equal(link.status,"review_required");await service.verifyRun(run.id);
+    assert.equal(fixture.store.getOntologyCandidate(link.id).status,"auto_confirmed");assert.equal(verificationRecord(fixture.store.getOntologyCandidate(link.id)).verified,true);
+    await service.verifyRun(run.id);assert.equal(calls,2);assert.equal(service.listEvents(link.id).filter(item=>item.eventType==="evidence_verification").length,2,"一次预留加一次有效结论");
+    assert.equal(fixture.store.getOntologyGenerationRun(run.id).tokenUsage.totalTokens,24);
+  }finally{fixture.store.close();}
+});
+
+test("自动核验不覆盖并发人工决定或已变化的目录",async()=>{
+  for(const change of ["human","catalog"]){const fixture=await createFixture();try{
+    let candidate,service;
+    service=createOntologyCandidateService({store:fixture.store,config:{ontologyAi:{mode:"auto_draft",autoConfirmScore:99}},scorer:{score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9})},verifier:{inspect:async inputs=>{
+      if(change==="human")await service.decide(candidate.id,{decision:"confirm"},"human");else fixture.store.upsertColumn({sourceId:fixture.source.id,tableName:"crm_customer",columnName:"name",dataType:"varchar",nullable:0,comment:"新口径"});
+      return positiveVerification(inputs);
+    }}});
+    const run=service.createRun({sourceId:fixture.source.id,tableNames:["crm_customer"]},"editor");candidate=await service.evaluateAndStore(run.id,objectCandidate());finishRun(fixture.store,run.id);
+    await assert.rejects(service.verifyRun(run.id),/已变化/);assert.equal(fixture.store.getOntologyCandidate(candidate.id).status,change==="human"?"confirmed":"review_required");
+    assert.equal(service.listEvents(candidate.id).filter(item=>item.eventType==="evidence_verification"&&item.toStatus==="auto_confirmed").length,0);
+  }finally{fixture.store.close();}}
+});
+
+test("模型故障保持系统任务，重建服务不能重置重试预算，真实问题不重复核验",async()=>{
+  const fixture=await createFixture();let calls=0,question=false;
+  try{
+    const options={store:fixture.store,config:{ontologyAi:{mode:"auto_draft",autoConfirmScore:99}},scorer:{score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9})},verifier:{inspect:async inputs=>{calls++;if(!question)return {results:new Map()};const result=positiveVerification(inputs);for(const value of result.results.values()){value.decision="business_question";value.question="客户是付费账号还是服务联系人？";}return result;}}};
+    let service=createOntologyCandidateService(options);const run=service.createRun({sourceId:fixture.source.id,tableNames:["crm_customer"]},"editor"),candidate=await service.evaluateAndStore(run.id,objectCandidate());finishRun(fixture.store,run.id);
+    await service.verifyRun(run.id);assert.equal(service.reviewIssue(fixture.store.getOntologyCandidate(candidate.id),run,null).kind,"verification");
+    service=createOntologyCandidateService(options);await service.verifyRun(run.id);assert.equal(calls,1);
+    await service.verifyRun(run.id,{retryPasses:1});assert.equal(calls,2);question=true;
+    await service.verifyRun(run.id,{retryPasses:2});assert.equal(calls,3);
+    const issue=service.reviewIssue(fixture.store.getOntologyCandidate(candidate.id),run,null);assert.equal(issue.kind,"candidate_review");assert.match(issue.clarificationPrompt,/付费账号还是服务联系人/);
+    await service.verifyRun(run.id,{retryPasses:100});assert.equal(calls,3);
+  }finally{fixture.store.close();}
+});
+
+test("可修复结构问题由模型修正后重新核验，不改写其他待业务确认的定义",async()=>{
+  const fixture=await createFixture();let repairs=0;
+  try{
+    const service=createOntologyCandidateService({store:fixture.store,config:{ontologyAi:{mode:"auto_draft",autoConfirmScore:99}},scorer:{score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9})},
+      verifier:{inspect:async inputs=>{const result=positiveVerification(inputs);for(const input of inputs)if(input.definition.apiName==="order"){const row=result.results.get(input.candidateId);row.decision="business_question";row.question="订单金额按应付还是实付计算？";}return result;}},
+      generator:{generateObjects:async({onCandidate})=>{repairs++;const customer=await onCandidate(objectCandidate());const order=orderCandidate();order.payload.description="不应覆盖的定义";await onCandidate(order);return generationResult([customer]);}}});
+    const run=service.createRun({sourceId:fixture.source.id,tableNames:["crm_customer","sales_order"]},"editor"),bad=objectCandidate();bad.payload.primaryKey="missing_key";
+    const customer=await service.evaluateAndStore(run.id,bad),order=await service.evaluateAndStore(run.id,orderCandidate());assert.equal(customer.status,"blocked");finishRun(fixture.store,run.id);
+    await service.verifyAndRepairRun(run.id);assert.equal(repairs,1);assert.equal(fixture.store.getOntologyCandidate(customer.id).status,"auto_confirmed");
+    assert.deepEqual(fixture.store.getOntologyCandidate(order.id).payload,order.payload);assert.equal(verificationRecord(fixture.store.getOntologyCandidate(order.id)).decision,"business_question");
+    await service.verifyAndRepairRun(run.id);assert.equal(repairs,1);
+  }finally{fixture.store.close();}
+});
+
+test("业务疑点交给用户前先进行一次有界的针对性修正，恢复不会反复改写",async()=>{
+  const fixture=await createFixture();let repairs=0,checks=0;
+  try{
+    const service=createOntologyCandidateService({store:fixture.store,config:{ontologyAi:{mode:"auto_draft",autoConfirmScore:99}},scorer:{score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9})},
+      verifier:{inspect:async inputs=>{checks++;const result=positiveVerification(inputs);for(const row of result.results.values()){row.decision="business_question";row.question="客户主体是签约方还是付款方？";}return result;}},
+      generator:{generateObjects:async({onCandidate,feedback})=>{repairs++;assert.ok(feedback.some(item=>item.evidenceVerification?.question));return generationResult([await onCandidate(objectCandidate())]);}}});
+    const run=service.createRun({sourceId:fixture.source.id,tableNames:["crm_customer"]},"editor"),candidate=await service.evaluateAndStore(run.id,objectCandidate());finishRun(fixture.store,run.id);
+    await service.verifyAndRepairRun(run.id,{repairBusinessQuestions:true});assert.equal(repairs,1);assert.equal(checks,2);assert.equal(fixture.store.getOntologyCandidate(candidate.id).status,"review_required");
+    await service.verifyAndRepairRun(run.id,{repairBusinessQuestions:true});assert.equal(repairs,1);assert.equal(checks,2);
+    assert.deepEqual(fixture.store.getOntologyGenerationRun(run.id).summary.handoffRepairCandidateIds,[candidate.id]);
+  }finally{fixture.store.close();}
+});
+
+test("系统重试确实提供额外修正机会，重复恢复与越界参数不能突破持久化上限",async()=>{
+  const fixture=await createFixture();let repairs=0;
+  try{
+    const service=createOntologyCandidateService({store:fixture.store,config:{ontologyAi:{mode:"auto_draft",autoConfirmScore:99}},scorer:{score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9})},
+      verifier:{inspect:async inputs=>{const result=positiveVerification(inputs);for(const row of result.results.values()){row.decision="system_repair";row.explanation="名称应明确标识匹配的限定范围";}return result;}},generator:{generateObjects:async({onCandidate})=>{repairs++;return generationResult([await onCandidate(objectCandidate())]);}}});
+    const run=service.createRun({sourceId:fixture.source.id,tableNames:["crm_customer"]},"editor");await service.evaluateAndStore(run.id,objectCandidate());finishRun(fixture.store,run.id);
+    await service.verifyAndRepairRun(run.id);assert.equal(repairs,2);await service.verifyAndRepairRun(run.id);assert.equal(repairs,2);
+    await service.verifyAndRepairRun(run.id,{retryPasses:1});assert.equal(repairs,3);await service.verifyAndRepairRun(run.id,{retryPasses:1});assert.equal(repairs,3);
+    await service.verifyAndRepairRun(run.id,{retryPasses:100});assert.equal(repairs,4);await service.verifyAndRepairRun(run.id,{retryPasses:100});assert.equal(repairs,4);
+  }finally{fixture.store.close();}
+});
+
+test("修正后即使达到原评分门槛也必须再次核验证据，不能跳过尚未解决的疑点",async()=>{
+  const fixture=await createFixture();let checks=0;
+  try{
+    const service=createOntologyCandidateService({store:fixture.store,config:{ontologyAi:{mode:"auto_draft",autoConfirmScore:80}},scorer:{score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9})},
+      verifier:{inspect:async inputs=>{checks++;const result=positiveVerification(inputs);for(const row of result.results.values()){row.decision="business_question";row.question="客户标识实际指向签约方还是付款方？";}return result;}},generator:{generateObjects:async({onCandidate})=>generationResult([await onCandidate(objectCandidate())])}});
+    const run=service.createRun({sourceId:fixture.source.id,tableNames:["crm_customer"]},"editor"),bad=objectCandidate();bad.payload.primaryKey="missing";const candidate=await service.evaluateAndStore(run.id,bad);finishRun(fixture.store,run.id);
+    await service.verifyAndRepairRun(run.id);const after=fixture.store.getOntologyCandidate(candidate.id);assert.ok(after.score>=80);assert.equal(after.validation.ok,true);assert.equal(checks,1);assert.equal(after.status,"review_required");assert.equal(verificationRecord(after).decision,"business_question");
+  }finally{fixture.store.close();}
+});
+
+test("全局补边的同名新路径自动单独命名，旧定义及两条物理映射完整保留",async()=>{
+  const fixture=await createFixture();
+  try{
+    const second=fixture.store.upsertRelation({sourceId:fixture.source.id,fromTable:"sales_order",fromCol:"order_id",toTable:"crm_customer",toCol:"customer_id",cardinality:"N:1",confidence:1,status:"confirmed",inferenceSource:"foreign_key"});
+    const semanticSchemas=createSemanticSchemaService({store:fixture.store});
+    const oldLink=linkCandidate(fixture.relation.id,{},{}).payload;
+    const base=semanticSchemas.saveDraft(fixture.source.id,{name:"sales",displayName:"销售",objectTypes:[objectCandidate().payload,orderCandidate().payload],linkTypes:[oldLink]},"editor");fixture.store.publishOntologySchemaVersion(base.id,"editor");
+    const service=createOntologyCandidateService({store:fixture.store,config:{ontologyAi:{mode:"auto_draft",autoConfirmScore:99}},semanticSchemas,scorer:{score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:.9})},verifier:{inspect:async inputs=>positiveVerification(inputs)}});
+    const run=service.createRun({sourceId:fixture.source.id,tableNames:["crm_customer","sales_order"],orchestrationId:"test-build"},"editor",{linkContext:{endpointRunIds:[],relationIds:[second.id]}});
+    const added=await service.evaluateAndStore(run.id,linkCandidate(second.id,{},{}));assert.notEqual(added.payload.apiName,oldLink.apiName);assert.equal(added.forcedReviewReasons.includes("MODIFIES_BASE_SCHEMA"),false);finishRun(fixture.store,run.id);
+    await service.verifyRun(run.id);const preview=service.preview(run.id,{});assert.equal(preview.validation.ok,true,JSON.stringify(preview.validation));assert.equal(preview.schema.linkTypes.length,2);
+    assert.deepEqual(preview.schema.linkTypes.find(link=>link.apiName===oldLink.apiName),base.schema.linkTypes[0]);assert.deepEqual(preview.schema.linkTypes.flatMap(link=>link.relationMappings.map(mapping=>mapping.relationId)).sort((a,b)=>a-b),[fixture.relation.id,second.id]);
+  }finally{fixture.store.close();}
+});
 
 test("feature switch is off by default and prevents generation runs",async()=>{
   const fixture=await createFixture();

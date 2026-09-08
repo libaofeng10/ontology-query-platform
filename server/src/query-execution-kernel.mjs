@@ -76,6 +76,11 @@ export function createQueryExecutionKernel({
   const runs = new Map();
   let sqlCalls = 0;
   let scannedRowsTotal = 0;
+  // Database-confirmed schema mistakes may be corrected without consuming the
+  // last data-query slot. This is a small request-local allowance, not a way
+  // to retry scans, empty results, policy failures or timeouts indefinitely.
+  const maxSchemaRepairs = schemaMode === "database" ? 2 : 0;
+  let schemaRepairs = 0;
 
   async function execute({
     name = "查询",
@@ -97,14 +102,14 @@ export function createQueryExecutionKernel({
     }
     const activeSignal = executeSignal ?? resolveSignal(signal);
     throwIfAborted(activeSignal);
-    sqlCalls++;
-    if (sqlCalls > sqlCallLimit) {
+    if (sqlCalls >= sqlCallLimit) {
       return kernelFailure({
         stage: "budget",
         code: "SQL_CALL_BUDGET_EXCEEDED",
         error: `run_sql 已达到 ${sqlCallLimit} 次上限`,
       });
     }
+    sqlCalls++;
 
     const activePolicy = mergePolicy(catalogPolicy, policy || semanticPlan?.policy, {
       valueKinds: catalogPolicy.valueKinds,
@@ -191,7 +196,7 @@ export function createQueryExecutionKernel({
 
     const executionStarted = Date.now();
     const explanation = await explain(verdict.sql, { signal: activeSignal });
-    if (!explanation.ok) return explanation;
+    if (!explanation.ok) return withSchemaRecovery(explanation, verdict);
     try {
       const [rawRows, rawFields] = await connector.query(source, verdict.sql, [], activeSignal);
       const rawNormalizedRows = (Array.isArray(rawRows) ? rawRows : []).map(normalizeQueryRow);
@@ -255,7 +260,7 @@ export function createQueryExecutionKernel({
       };
     } catch (error) {
       if (activeSignal?.aborted || error?.name === "AbortError" || error?.code === "ABORT_ERR") throw error;
-      return kernelFailure({ stage: "query", code: "EXECUTION_ERROR", error: safeError(error), retryable: true });
+      return withSchemaRecovery(driverFailure("query", error), verdict);
     }
   }
 
@@ -268,7 +273,7 @@ export function createQueryExecutionKernel({
       explainRows = await connector.explain(source, sql, activeExplainSignal);
     } catch (error) {
       if (activeExplainSignal?.aborted || error?.name === "AbortError" || error?.code === "ABORT_ERR") throw error;
-      return kernelFailure({ stage: "explain", code: "EXPLAIN_ERROR", error: safeError(error), retryable: true });
+      return driverFailure("explain", error);
     }
     const scannedRows = (Array.isArray(explainRows) ? explainRows : []).reduce(
       (sum, row) => sum + Math.max(0, Number(row?.rows || 0)),
@@ -325,10 +330,23 @@ export function createQueryExecutionKernel({
     return cloneRun([...runs.values()].findLast((run) => run.sqlHashes.has(hash)));
   }
 
-  function stats() { return { sqlCalls, scannedRowsTotal, maxSqlCalls: sqlCallLimit, maxScannedRows: scanLimit, runCount: runs.size }; }
+  function driverFailure(stage, error) {
+    const schemaCode = schemaMode === "database" ? mysqlSchemaErrorCode(error) : null;
+    return kernelFailure({ stage, code: schemaCode || (stage === "explain" ? "EXPLAIN_ERROR" : "EXECUTION_ERROR"), error: safeError(error), retryable: true });
+  }
+
+  function withSchemaRecovery(failure, verdict) {
+    const correctable = ["UNKNOWN_COLUMN", "UNKNOWN_TABLE", "AMBIGUOUS_COLUMN"].includes(failure.code);
+    if (!correctable) return failure;
+    const allowanceUsed = schemaRepairs < maxSchemaRepairs;
+    if (allowanceUsed) { schemaRepairs++; sqlCalls--; }
+    return { ...failure, verdict, schemaRecovery: { allowanceUsed, remaining: maxSchemaRepairs - schemaRepairs } };
+  }
+
+  function stats() { return { sqlCalls, scannedRowsTotal, maxSqlCalls: sqlCallLimit, maxScannedRows: scanLimit, runCount: runs.size, schemaRepairs, maxSchemaRepairs }; }
 
   function clearRuns() { runs.clear(); }
-  function clear() { runs.clear(); sqlCalls = 0; scannedRowsTotal = 0; }
+  function clear() { runs.clear(); sqlCalls = 0; scannedRowsTotal = 0; schemaRepairs = 0; }
 
   return {
     execute,
@@ -352,6 +370,13 @@ export function createQueryExecutionKernel({
     clear,
     policy: catalogPolicy,
   };
+}
+
+function mysqlSchemaErrorCode(error) {
+  if (error?.code === "ER_BAD_FIELD_ERROR" || Number(error?.errno) === 1054) return "UNKNOWN_COLUMN";
+  if (error?.code === "ER_NO_SUCH_TABLE" || Number(error?.errno) === 1146) return "UNKNOWN_TABLE";
+  if (error?.code === "ER_NON_UNIQ_ERROR" || Number(error?.errno) === 1052) return "AMBIGUOUS_COLUMN";
+  return null;
 }
 
 function buildCatalogPolicy(catalog, maxRows, question, forbidSensitiveOutput) {

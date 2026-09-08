@@ -114,6 +114,12 @@ export type SourceOntologyBuildStatus={
   history:Array<{id:string;createdAt:string;finishedAt:string|null;phase:string;summary:string|null;versionId:number|null;selectedTableCount:number|null}>;
   versions:SemanticSchemaVersion[];
 };
+export type OntologyActivationStatus={
+  versionId:number;version:number;state:"ready"|"needs_cases"|"needs_evaluation"|"invalid"|"superseded"|"busy"|"blocked"|"published"|"historical";
+  detail:string;snapshotChecksum:string;baseVersion:number|null;canActivate:boolean;supersededBy:{id:number;version:number}|null;
+  errors:Array<{code:string;message:string}>;missingChanges:Array<{path:string;label:string;impact:string;detail:string}>;affectedSets:string[];
+  retention:{fieldCount:number;fields:Array<{path:string;objectName:string;objectLabel:string;propertyName:string;label:string}>}|null;
+};
 
 export type OntologyQuestion = {
   id:number; kind:string; scope:"column"|"table"|"global"; tableName:string|null;

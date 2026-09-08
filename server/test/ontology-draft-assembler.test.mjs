@@ -44,5 +44,17 @@ test("draft assembler reports a Link conflict when an endpoint is excluded",()=>
   assert.equal(result.includedCandidates[0].id,"customer");
 });
 
+test("增量合并时同名但不同已确认物理路径自动命名，两条关系均保留",()=>{
+  const run={id:"run-1",sourceId:1,scope:{namespace:"sales"}};
+  const objects=[object("institution","institution","id","机构"),object("customer","customer","id","客户"),object("user","user","id","账号")];
+  const link=(target,id)=>({apiName:"institution_leader_user",inverseApiName:"led_institution",displayName:"机构负责人",source:"institution",target,cardinality:"many_to_one",relationKind:"references",relationMappings:[{relationId:id}]});
+  const candidates=[candidate("one","link","auto_confirmed","link:1",link("customer",2911)),candidate("two","link","auto_confirmed","link:2",link("user",7139))];
+  const baseSchema={name:"sales",objectTypes:objects,linkTypes:[]};
+  const result=assembleOntologyDraft({run,candidates,baseSchema,incremental:true});
+  assert.equal(result.conflicts.length,0);assert.equal(result.schema.linkTypes.length,2);assert.equal(new Set(result.schema.linkTypes.flatMap(l=>[l.apiName,l.inverseApiName])).size,4);assert.deepEqual(result.schema.linkTypes.flatMap(l=>l.relationMappings.map(m=>m.relationId)),[2911,7139]);
+  assert.deepEqual(baseSchema.linkTypes,[]);assert.equal(assembleOntologyDraft({run,candidates,baseSchema}).conflicts.length,1,"显式人工合并模式继续要求处理替换意图");
+  const repeated=assembleOntologyDraft({run,candidates:[candidate("repeat","link","auto_confirmed","link:3",link("user",7139))],baseSchema:result.schema,incremental:true});assert.equal(repeated.conflicts.length,0);assert.equal(repeated.schema.linkTypes.length,2,"后续批次同一物理路径不会因旧名称再次冲突");
+});
+
 function candidate(id,candidateType,status,stableKey,payload) { return {id,runId:"run-1",sourceId:1,candidateType,status,stableKey,payload}; }
 function object(apiName,table,column,displayName) { return {apiName,displayName,description:"",primaryKey:column,properties:[{apiName:column,displayName:column,type:"integer",required:true,constraints:{},mapping:{table,column}}]}; }

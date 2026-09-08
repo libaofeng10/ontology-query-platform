@@ -39,14 +39,15 @@ export function createSemanticSchemaService({store}) {
     return {...record,validation:withoutSchema(validation)};
   }
 
-  function preflight(id) {
+  function publicationCheck(id,persistValidation) {
     const record=store.getOntologySchemaVersion(id);
     if(!record) return null;
     if(record.status!=="draft") { const error=new Error("只有草稿版本可以执行普通发布；历史发布版请使用回滚操作");error.status=409;throw error; }
     const validation=validate(record.sourceId,record.schema);
     const compact=withoutSchema(validation);
-    store.updateOntologySchemaValidation(record.id,compact);
-    if(!validation.ok) return {ok:false,record:store.getOntologySchemaVersion(record.id),...compact};
+    if(persistValidation)store.updateOntologySchemaValidation(record.id,compact);
+    const checkedRecord={...record,validation:compact};
+    if(!validation.ok) return {ok:false,record:checkedRecord,...compact};
     const current=store.getPublishedOntologySchema(record.sourceId);
     if(current) {
       const cases=store.listEvalCasesForImpact(record.sourceId);
@@ -64,11 +65,13 @@ export function createSemanticSchemaService({store}) {
         const subtypeNames=new Set(semanticSubtypeNames(record.schema));
         const subtypeRootCoverage=validGates.flatMap((gate)=>gate.candidate?.subtypeRootObjects||[]).filter((name,index,items)=>subtypeNames.has(name)&&items.indexOf(name)===index);
         const subtypeRootCoverageMissing=hierarchyChanged&&!subtypeRootCoverage.length;
-        if(impact.uncoveredChanges.length||missingSets.length||subtypeRootCoverageMissing) return {...compact,ok:false,gateRequired:true,record:store.getOntologySchemaVersion(record.id),evaluationImpact:{summary:{...impact.summary,hierarchyChanged,subtypeRootCoverageMissing},affectedCases:impact.affectedCases,affectedSets:impact.affectedSets,uncoveredChanges:impact.uncoveredChanges,missingSets,subtypeRootCoverage}};
+        if(impact.uncoveredChanges.length||missingSets.length||subtypeRootCoverageMissing) return {...compact,ok:false,gateRequired:true,record:checkedRecord,evaluationImpact:{summary:{...impact.summary,hierarchyChanged,subtypeRootCoverageMissing},affectedCases:impact.affectedCases,affectedSets:impact.affectedSets,uncoveredChanges:impact.uncoveredChanges,missingSets,subtypeRootCoverage}};
       }
     }
-    return {ok:true,record,...compact};
+    return {ok:true,record:checkedRecord,...compact};
   }
+  const preflight=id=>publicationCheck(id,true);
+  const inspectPublication=id=>publicationCheck(id,false);
 
   function publish(id,userName,options={}) {
     const checked=preflight(id);
@@ -97,6 +100,7 @@ export function createSemanticSchemaService({store}) {
     saveDraft,
     publish,
     preflight,
+    inspectPublication,
     rollback,
     list:(sourceId)=>store.listOntologySchemaVersions(sourceId),
     get:(id)=>store.getOntologySchemaVersion(id),

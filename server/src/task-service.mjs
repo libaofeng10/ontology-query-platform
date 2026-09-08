@@ -50,7 +50,7 @@ export function createTaskService({store,discovery,handlers={}}) {
     if(active.has(id))await active.get(id);
     const task=store.getTask(id);
     if(!task)throw new Error("待继续的任务不存在");
-    if(['queued','running'].includes(task.status))return task;
+    if(['queued','running'].includes(task.status)){if(task.status==='queued')schedule(id);return task;}
     const queued=store.resumeTask(id,payload||task.payload);
     schedule(id);
     return queued;

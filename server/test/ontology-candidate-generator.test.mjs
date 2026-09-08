@@ -148,6 +148,16 @@ test("Link prompt and normalizer enforce relation and endpoint allowlists",()=>{
   assert.equal(escaped.candidates.length,0);assert.equal(escaped.issues[0].code,"ONTOLOGY_LINK_RELATION_NOT_ALLOWED");
 });
 
+test("Link 修正使用真实关联字段说明和与核验一致的知识标识，不发送字段样本",()=>{
+  const catalog=wideCatalog(),scope=buildLinkGenerationScope({catalog,endpoints:linkEndpoints(),namespace:"account_domain"});
+  for(const columns of Object.values(catalog.columnsByTable))for(const column of columns){column.comment=`物理说明 ${column.columnName}`;column.profile={sampleValues:["PRIVATE_ROW_VALUE"]};}
+  const messages=linkGenerationMessages({run:runFor({batches:[]}),scope,catalog,knowledgePages:[{id:42,pageType:"rule",slug:"linked",content:"业务口径",tables:["wide_account"],verified:1}]});
+  const input=JSON.parse(messages[1].content.match(/<untrusted_input>(.*)<\/untrusted_input>/)[1]);
+  assert.ok(input.physicalJoinFields[0].pairs[0].from.comment.startsWith("物理说明"));assert.ok(input.physicalJoinFields[0].pairs[0].to.comment.startsWith("物理说明"));
+  assert.equal(input.verifiedKnowledge[0].verificationRefId,"knowledge:42");assert.ok(input.endpoints[0].properties[0].mapping);
+  assert.doesNotMatch(JSON.stringify(messages),/PRIVATE_ROW_VALUE/);
+});
+
 function runFor(scope) { return {id:"run-generator",modelName:"model-v1",promptVersion:"ontology-object-v1",scope:{namespace:"account_domain",domainName:"账号域",domainDescription:"账号与试用",batches:scope.batches}}; }
 
 function linkEndpoints() {
