@@ -730,7 +730,10 @@ export function createStore(dbPath) {
         const before=this.getOntologyCandidate(input.id);
         if(!before||before.status!==input.expectedStatus)return {ok:false,reason:before?"status_conflict":"not_found",candidate:before};
         const rescored=input.eventType==="model_repair"&&["review_required","blocked"].includes(before.status)&&["auto_confirmed","review_required","blocked"].includes(input.status)&&input.validation&&Number.isFinite(input.score)&&(input.status!=="auto_confirmed"||input.validation.ok);
-        if(!rescored&&!candidateTransitionAllowed(before.status,input.status))throw new Error(`不允许候选从 ${before.status} 转为 ${input.status}`);
+        const proof=input.evidence?.find(item=>item.kind==="automatic_verification");
+        const verified=input.eventType==="evidence_verification"&&["review_required","blocked"].includes(before.status)&&proof?.inputChecksum&&
+          (input.status===before.status||(before.status==="review_required"&&input.status==="auto_confirmed"&&input.validation?.ok&&proof.decision==="supported"&&proof.verified===true&&proof.supports?.length));
+        if(!rescored&&!verified&&!candidateTransitionAllowed(before.status,input.status))throw new Error(`不允许候选从 ${before.status} 转为 ${input.status}`);
         const next={
           payload:input.payload??before.payload,evidence:input.evidence??before.evidence,modelConfidence:input.modelConfidence??before.modelConfidence,
           score:input.score??before.score,scoreBreakdown:input.scoreBreakdown??before.scoreBreakdown,validation:input.validation??before.validation,

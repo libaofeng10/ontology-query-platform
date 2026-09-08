@@ -37,7 +37,7 @@ function criticInput(candidate,catalog,candidateId,acceptedObjects=[]) {
 }
 function linkEndpointPayloads(candidate,acceptedObjects){const byStableKey=new Map(acceptedObjects.map((item)=>[item?.stableKey,item?.payload]));const byApiName=new Map(acceptedObjects.map((item)=>[item?.payload?.apiName,item?.payload]));return [...new Set([byStableKey.get(candidate?.sourceStableKey)||byApiName.get(candidate?.payload?.source),byStableKey.get(candidate?.targetStableKey)||byApiName.get(candidate?.payload?.target)].filter(Boolean))];}
 function profile(value){if(!value)return null;return {formatPattern:text(value.formatPattern,160),sampleValues:(value.sampleValues||[]).slice(0,5).map((item)=>text(item,64))};}
-function normalize(output,allowed){const byId=new Map((Array.isArray(output?.results)?output.results:[]).map((item)=>[String(item?.candidateId||""),item]));return [...allowed].map((candidateId)=>{const raw=byId.get(candidateId);return {candidateId,consistent:raw?.consistent!==false,issue:raw?.consistent===false?text(raw?.issue||"critic 标记物理语义不一致",500):null};});}
+function normalize(output,allowed){const rows=Array.isArray(output?.results)?output.results:[];return [...allowed].map((candidateId)=>{const matches=rows.filter(item=>item?.candidateId===candidateId),raw=matches.length===1?matches[0]:null;return {candidateId,consistent:typeof raw?.consistent==="boolean"?raw.consistent:null,issue:raw?.consistent===false?text(raw?.issue||"critic 标记物理语义不一致",500):null};});}
 function text(value,maxLength){return value==null?null:[...String(value)].map((character)=>{const code=character.charCodeAt(0);return code<32||code===127?" ":character;}).join("").slice(0,maxLength);}
 
 export const ontologyCandidateCriticInternal={criticInput,normalize};

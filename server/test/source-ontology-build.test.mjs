@@ -12,14 +12,16 @@ import { scoreOntologyCandidate } from "../src/ontology-candidate-score.mjs";
 import { createTaskService } from "../src/task-service.mjs";
 import { createSemanticSchemaService } from "../src/semantic-schema-service.mjs";
 import { evalSetChecksum } from "../src/evaluation-evidence.mjs";
+import { buildIssueId } from "../src/ontology-build-issues.mjs";
 
-async function fixture({mode="review",pausePlan=Promise.resolve(),firstBuild=false,candidateTransform=(candidate)=>candidate,onGenerate=()=>{},similarity=()=>.9,splitDomains=false,generateLinks=null}={}) {
+async function fixture({mode="review",pausePlan=Promise.resolve(),firstBuild=false,candidateTransform=(candidate)=>candidate,onGenerate=()=>{},onScore=()=>{},similarity=()=>.9,splitDomains=false,generateLinks=null,verifier=false}={}) {
   const root=await mkdtemp(join(tmpdir(),"ontoquery-source-build-"));
   const app=createApp({
     dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"source-build-test-secret",nodeEnv:"test",claudeBridge:null,
     llm:{baseUrl:"",apiKey:"",model:""},embedding:{enabled:false},profiling:{enabled:false},
     ontologyAi:{mode,criticEnabled:false,maxTables:20,maxFields:600,auditDir:join(root,"audit")},
-    ontologyCandidateScorer:{score:async(candidate,options)=>scoreOntologyCandidate(candidate,{...options,semanticSimilarity:similarity(candidate)})},
+    ontologyCandidateVerifier:verifier,
+    ontologyCandidateScorer:{score:async(candidate,options)=>{await onScore(candidate,options);return scoreOntologyCandidate(candidate,{...options,semanticSimilarity:similarity(candidate)});}},
     apiIdentities:[{name:"viewer",role:"viewer",token:"viewer",sourceIds:[1]},{name:"editor",role:"editor",token:"editor",sourceIds:"*"}],
     connector:{close:async()=>{},query:async()=>[[],[]],explain:async()=>[]},
     rateLimits:{queryPerMinute:100,readPerMinute:1000,writePerMinute:1000},
@@ -42,6 +44,17 @@ async function fixture({mode="review",pausePlan=Promise.resolve(),firstBuild=fal
   if(firstBuild){app.store.db.prepare("DELETE FROM ds_ontology_publication WHERE source_id=1").run();app.store.db.prepare("DELETE FROM ds_ontology_schema_version WHERE source_id=1").run();}
   const selections=app.store.listTables(1).map((table)=>({tableName:table.tableName,included:table.tableName==="crm_customer"}));
   return {app,selections,close:async()=>{await app.close();await rm(root,{recursive:true,force:true});}};
+}
+
+async function changedObjectFixture(options={}) {
+  let expanded=false;
+  const setup=await fixture({...options,mode:"auto_draft",firstBuild:true,candidateTransform:input=>expanded?{...input,payload:{...input.payload,properties:[...input.payload.properties,{apiName:"customer_type",displayName:"客户类型",type:"string",required:false,mapping:{table:"crm_customer",column:"customer_type"}}]}}:input});
+  const {app,selections}=setup;
+  const first=await api(app,"/api/sources/1/ontology-build",{selections});await waitForTask(app,first.body.id);
+  const original=app.store.getPublishedOntologySchema(1);expanded=true;
+  app.store.upsertTable({...app.store.listTables(1)[0],comment:"客户档案含客户类型；用于客户分类"});
+  const started=await api(app,"/api/sources/1/ontology-build",{selections});const task=await waitForTask(app,started.body.id);
+  return {...setup,original,task,issue:task.payload.sourceBuild.questions[0]};
 }
 
 test("选表后在同一后台任务完成探查与生成，审核和启用仍是明确操作",async()=>{
@@ -218,7 +231,7 @@ test("业务说明直接保存自动启用；接入新增表继承人工修改�
   }finally{await close();}
 });
 
-test("低分定义先修正两轮，补充一次说明后继续原任务，评分规则不变",async()=>{
+test("低分候选展示审核依据，选择补充说明后继续原任务，评分规则不变",async()=>{
   const calls=[];
   const {app,selections,close}=await fixture({mode:"auto_draft",firstBuild:true,
     onGenerate:({phase})=>calls.push(phase),
@@ -230,9 +243,12 @@ test("低分定义先修正两轮，补充一次说明后继续原任务，评�
     assert.equal(task.payload.sourceBuild.phase,"needs_input",JSON.stringify(task));
     assert.deepEqual(calls,["auto","repair-1","repair-2"]);
     const issue=task.payload.sourceBuild.questions[0];
+    assert.equal(issue.kind,"candidate_review");
+    assert.equal(issue.reviewKind,"review");
+    assert.ok(issue.reviewChecksum);
     assert.equal(task.payload.sourceBuild.questions.length,1);
     assert.equal(app.store.getPublishedOntologySchema(1),null);
-    const resumed=await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:issue.id,text:"这张表记录已签约客户，编号为唯一客户标识"}],autoConfirmScore:0});
+    const resumed=await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:issue.id,resolution:"supplement_definition",reviewChecksum:issue.reviewChecksum,text:"这张表记录已签约客户，编号为唯一客户标识"}],autoConfirmScore:0});
     assert.equal(resumed.status,202);assert.equal(resumed.body.id,task.id);
     const finished=await waitForTask(app,task.id);
     assert.equal(finished.payload.sourceBuild.phase,"ready",JSON.stringify(finished));
@@ -242,6 +258,116 @@ test("低分定义先修正两轮，补充一次说明后继续原任务，评�
     assert.equal(app.store.listKnowledge(1).filter((page)=>page.slug.startsWith("ontology-")).length,1);
     assert.equal(app.store.listTasks(1).length,1);assert.equal(app.store.listOntologyPublications(1).length,1);
   }finally{await close();}
+});
+
+test("已有对象增加字段展示差异，确认后持久化并继续，不靠补写知识解除变更审核",async()=>{
+  let expanded=false;const calls=[];
+  const {app,selections,close}=await fixture({mode:"auto_draft",firstBuild:true,onGenerate:({phase})=>calls.push(phase),candidateTransform:input=>expanded?{...input,payload:{...input.payload,properties:[...input.payload.properties,{apiName:"customer_type",displayName:"客户类型",type:"string",required:false,mapping:{table:"crm_customer",column:"customer_type"}}]}}:input});
+  try {
+    const first=await api(app,"/api/sources/1/ontology-build",{selections});await waitForTask(app,first.body.id);
+    const original=app.store.getPublishedOntologySchema(1);expanded=true;calls.length=0;
+    app.store.upsertTable({...app.store.listTables(1)[0],comment:"客户档案含客户类型；用于客户分类"});
+    const started=await api(app,"/api/sources/1/ontology-build",{selections});const task=await waitForTask(app,started.body.id);
+    const issue=task.payload.sourceBuild.questions[0];
+    assert.equal(issue.kind,"candidate_review");assert.equal(issue.reviewKind,"change");
+    assert.ok(issue.changes.changes.some(change=>change.kind==="property"&&change.change==="added"&&change.path.endsWith("customer_type")));
+    assert.ok(issue.options.some(option=>option.value==="keep_existing"));
+    assert.equal(app.store.getPublishedOntologySchema(1).id,original.id);
+    assert.equal((await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:issue.id,resolution:"use_candidate"}]})).status,409);
+    const before=calls.length;
+    const accepted=await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:issue.id,resolution:"use_candidate",reviewChecksum:issue.reviewChecksum}]});assert.equal(accepted.status,202);
+    const finished=await waitForTask(app,task.id);assert.equal(finished.payload.sourceBuild.phase,"ready",JSON.stringify(finished.payload.sourceBuild.questions));
+    assert.equal(calls.length,before);
+    assert.ok(app.store.getPublishedOntologySchema(1).schema.objectTypes[0].properties.some(p=>p.apiName==="customer_type"));
+    assert.equal(app.store.listKnowledge(1).filter(p=>p.slug.startsWith("ontology-")).length,0);
+    assert.equal(finished.payload.sourceBuild.candidateReviews[issue.candidateIds[0]].resolution,"use_candidate");
+    const versions=app.store.listOntologySchemaVersions(1).length;
+    await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id});
+    assert.equal(app.store.listOntologySchemaVersions(1).length,versions);assert.equal(calls.length,before);
+  } finally {await close();}
+});
+
+test("结构校验失败显示具体错误，不能用补充说明或人工确认绕过",async()=>{
+  const {app,selections,close}=await fixture({mode:"auto_draft",firstBuild:true,candidateTransform:input=>({...input,payload:{...input.payload,primaryKey:"missing_identifier"}})});
+  try {
+    const started=await api(app,"/api/sources/1/ontology-build",{selections});const task=await waitForTask(app,started.body.id);
+    const issue=task.payload.sourceBuild.questions[0];assert.equal(issue.kind,"validation");assert.ok(issue.definitions[0].reasons.length);
+    assert.equal(issue.options,undefined);
+    const answer=await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:issue.id,resolution:"use_candidate",text:"确认这些字段"}]});assert.equal(answer.status,400);
+    assert.equal(app.store.getPublishedOntologySchema(1),null);
+  } finally {await close();}
+});
+
+test("保留已有定义不会应用新增字段，也不会重复进入同一审核问题",async()=>{
+  const {app,original,task,issue,close}=await changedObjectFixture();
+  try {
+    const resumed=await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:issue.id,resolution:"keep_existing",reviewChecksum:issue.reviewChecksum}]});assert.equal(resumed.status,202);
+    const finished=await waitForTask(app,task.id);assert.equal(finished.payload.sourceBuild.phase,"unchanged",JSON.stringify(finished));
+    assert.equal(app.store.getPublishedOntologySchema(1).id,original.id);
+    assert.deepEqual(app.store.getOntologyCandidate(issue.candidateIds[0]).payload.properties,original.schema.objectTypes[0].properties);
+    assert.equal(finished.payload.sourceBuild.candidateReviews[issue.candidateIds[0]].resolution,"keep_existing");
+    assert.equal(finished.payload.sourceBuild.questions.length,0);
+  } finally {await close();}
+});
+
+test("旧补充说明在读取时转换为审核项，过期答案被拒绝，重开数据库仍保留逐项确认",async()=>{
+  let calls=0;const {app,selections,close}=await fixture({mode:"auto_draft",firstBuild:true,similarity:()=>0,onGenerate:()=>{calls++;}});
+  try {
+    const selected=selections.map(item=>({...item,included:["crm_customer","sales_order"].includes(item.tableName)}));
+    const started=await api(app,"/api/sources/1/ontology-build",{selections:selected});const task=await waitForTask(app,started.body.id);
+    const legacy={...task.payload,sourceBuild:{...task.payload.sourceBuild,questions:task.payload.sourceBuild.questions.map(q=>({...q,id:`legacy-${q.id}`,kind:"definition",title:"请补充业务含义",reviewChecksum:undefined,options:undefined}))}};
+    app.store.db.prepare("UPDATE ds_task SET payload_json=? WHERE id=?").run(JSON.stringify(legacy),task.id);const beforeCalls=calls;
+    const state=(await api(app,"/api/sources/1/ontology-build",null,"GET")).body;
+    assert.equal(state.update.questions.length,2);assert.ok(state.update.questions.every(q=>q.kind==="candidate_review"));
+    assert.deepEqual(app.store.getTask(task.id).payload,JSON.parse(JSON.stringify(legacy)));assert.equal(calls,beforeCalls);
+    const issue=state.update.questions[0],candidate=app.store.getOntologyCandidate(issue.candidateIds[0]);
+    app.store.transitionOntologyCandidate({id:candidate.id,expectedStatus:"review_required",status:"review_required",payload:{...candidate.payload,description:"更新后的客户定义"},score:candidate.score,validation:candidate.validation,actor:"test",eventType:"model_repair"});
+    const stale=await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:issue.id,resolution:"use_candidate",reviewChecksum:issue.reviewChecksum}]});assert.equal(stale.status,409);
+    const refreshed=(await api(app,"/api/sources/1/ontology-build",null,"GET")).body.update.questions.find(q=>q.id===issue.id);
+    assert.notEqual(refreshed.reviewChecksum,issue.reviewChecksum);
+    await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:refreshed.id,resolution:"use_candidate",reviewChecksum:refreshed.reviewChecksum}]});
+    const finished=await waitForTask(app,task.id);assert.equal(finished.payload.sourceBuild.phase,"needs_input");assert.equal(finished.payload.sourceBuild.questions.length,1);
+    const reopened=createStore(app.store.db.name);
+    try {
+      const service=createSourceOntologyBuildService({store:reopened,config:{ontologyAi:{mode:"auto_draft"}},semanticSchemas:{list:()=>[]}});
+      const restored=service.status(1);assert.equal(restored.update.questions.length,1);
+      assert.ok(restored.update.questions.every(q=>!q.candidateIds.includes(candidate.id)));
+      assert.equal(reopened.getOntologyCandidate(candidate.id).status,"confirmed");
+      assert.equal(reopened.getTask(task.id).payload.sourceBuild.candidateReviews[candidate.id].reviewChecksum,refreshed.reviewChecksum);
+    } finally {reopened.close();}
+    assert.equal(calls,beforeCalls);
+  } finally {await close();}
+});
+
+test("候选确认与构建确认记录同一事务保存，记录写入失败不留下半次确认",async()=>{
+  const {app,original,task,issue,close}=await changedObjectFixture();
+  const update=app.store.updateTaskPayload;let interrupted=false;
+  app.store.updateTaskPayload=(id,payload)=>{if(!interrupted&&payload.sourceBuild?.candidateReviews?.[issue.candidateIds[0]]){interrupted=true;throw new Error("模拟确认记录写入中断");}return update(id,payload);};
+  try {
+    await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:issue.id,resolution:"use_candidate",reviewChecksum:issue.reviewChecksum}]});
+    const failed=await waitForTask(app,task.id);assert.equal(failed.status,"failed");assert.match(failed.error,/确认记录写入中断/);
+    assert.equal(app.store.getOntologyCandidate(issue.candidateIds[0]).status,"review_required");
+    assert.equal(failed.payload.sourceBuild.candidateReviews?.[issue.candidateIds[0]],undefined);
+    assert.equal(app.ontologyCandidates.listEvents(issue.candidateIds[0]).filter(e=>e.eventType==="confirmed").length,0);
+    assert.equal(app.store.getPublishedOntologySchema(1).id,original.id);
+  } finally {app.store.updateTaskPayload=update;await close();}
+});
+
+test("保留旧定义的评分等待期间候选发生变化，过期确认不会覆盖新内容",async()=>{
+  let pause=false,entered,release;
+  const scoring=new Promise(resolve=>{entered=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+  const {app,original,task,issue,close}=await changedObjectFixture({onScore:async()=>{if(pause){entered();await gate;}}});
+  try {
+    pause=true;
+    await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:issue.id,resolution:"keep_existing",reviewChecksum:issue.reviewChecksum}]});
+    await scoring;
+    const candidate=app.store.getOntologyCandidate(issue.candidateIds[0]);
+    app.store.transitionOntologyCandidate({id:candidate.id,expectedStatus:"review_required",status:"review_required",payload:{...candidate.payload,description:"审核期间更新的定义"},score:candidate.score,validation:candidate.validation,actor:"test",eventType:"model_repair"});
+    release();
+    const failed=await waitForTask(app,task.id);assert.equal(failed.status,"failed");assert.match(failed.error,/已变化/);
+    const after=app.store.getOntologyCandidate(candidate.id);assert.equal(after.status,"review_required");assert.equal(after.payload.description,"审核期间更新的定义");
+    assert.equal(app.store.getPublishedOntologySchema(1).id,original.id);
+  } finally {release();await close();}
 });
 
 test("失败域按原因聚合并有界重试；配置错误不自动重试",async()=>{
@@ -424,6 +550,92 @@ test("跨域关系进入最终生效草稿，补边运行不要求重复生成�
     assert.equal(published.schema.objectTypes.length,2);assert.equal(published.schema.linkTypes.length,1);
     assert.equal(task.payload.sourceBuild.relationCoverage.coveredRelationCount,1);
     assert.equal(app.store.listOntologyGenerationRuns(1).filter(run=>run.scope.scopeKind==="global_links").length,1);
+  }finally{await close();}
+});
+
+test("关系候选待审核时不重复生成缺少业务定义的问题，历史提示按同一规则显示",async()=>{
+  const {app,close}=await fixture({mode:"auto_draft",firstBuild:true,splitDomains:true,generateLinks:completeLinks,similarity:c=>c.candidateType==="link"?.4:.9});
+  try{
+    const started=await api(app,"/api/sources/1/ontology-build",{selections:[{tableName:"crm_customer",included:true},{tableName:"sales_order",included:true}]});
+    const task=await waitForTask(app,started.body.id),questions=task.payload.sourceBuild.questions;
+    assert.equal(questions.length,1,JSON.stringify(questions));assert.equal(questions[0].kind,"candidate_review");
+    const candidate=app.store.getOntologyCandidate(questions[0].candidateIds[0]);
+    const relationId=candidate.payload.relationMappings[0].relationId;
+    const before=app.store.getTask(task.id);
+    const old={...before.payload,sourceBuild:{...before.payload.sourceBuild,questions:[...questions,{id:buildIssueId(`link:${relationId}`),kind:"definition",title:"已确认关系尚未形成业务定义",candidateIds:[],tables:[],retryable:true}]}};
+    app.store.db.prepare("UPDATE ds_task SET payload_json=? WHERE id=?").run(JSON.stringify(old),task.id);
+    const status=(await api(app,"/api/sources/1/ontology-build",null,"GET")).body;
+    assert.deepEqual(status.update.questions.map(q=>q.kind),["candidate_review"]);
+    assert.deepEqual(app.store.getTask(task.id).payload,old);
+  }finally{await close();}
+});
+
+test("对象重试额度耗尽后关系漏生成仍自动补齐，已审核候选保持不变",async()=>{
+  let appRef,linkCalls=0;const empty={candidates:[],calls:[],normalizationIssues:[],tokenUsage:{},eligibleRelationCount:1};
+  const {app,close}=await fixture({mode:"auto_draft",firstBuild:true,splitDomains:true,generateLinks:async args=>{
+    if(args.run.scope.scopeKind!=="global_links")return empty;
+    linkCalls++;
+    if(linkCalls===1){
+      for(const run of appRef.store.listOntologyGenerationRuns(1).filter(r=>r.scope.scopeKind!=="global_links"))appRef.store.transitionOntologyGenerationRun({id:run.id,expectedStatus:"succeeded",status:"succeeded",summary:{...run.summary,repairAttempts:10}});
+      return empty;
+    }
+    return completeLinks(args);
+  }});appRef=app;
+  try{
+    const started=await api(app,"/api/sources/1/ontology-build",{selections:[{tableName:"crm_customer",included:true},{tableName:"sales_order",included:true}]});
+    const task=await waitForTask(app,started.body.id);
+    assert.equal(task.payload.sourceBuild.phase,"ready",JSON.stringify(task.payload.sourceBuild.questions));
+    assert.equal(linkCalls,2);assert.equal(app.store.getPublishedOntologySchema(1).schema.linkTypes.length,1);
+    assert.equal(app.store.listOntologyGenerationRuns(1).filter(r=>r.scope.scopeKind!=="global_links").reduce((n,r)=>n+r.summary.repairAttempts,0),20);
+  }finally{await close();}
+});
+
+test("生成失败汇总为可重试系统任务，显式重试有上限且不要求虚构业务说明",async()=>{
+  let calls=0;
+  const {app,close}=await fixture({mode:"auto_draft",firstBuild:true,splitDomains:true,generateLinks:async({run})=>{if(run.scope.scopeKind==="global_links")calls++;return {candidates:[],calls:[],normalizationIssues:[{code:"ONTOLOGY_LINK_RELATION_NOT_ALLOWED"}],tokenUsage:{},eligibleRelationCount:1};}});
+  try{
+    const started=await api(app,"/api/sources/1/ontology-build",{selections:[{tableName:"crm_customer",included:true},{tableName:"sales_order",included:true}]});
+    let task=await waitForTask(app,started.body.id);
+    assert.equal(task.payload.sourceBuild.phase,"needs_input");assert.equal(calls,3);
+    assert.deepEqual(task.payload.sourceBuild.questions.map(q=>q.kind),["generation"]);
+    assert.equal(task.payload.sourceBuild.questions[0].relationIds.length,1);
+    assert.match(task.payload.sourceBuild.questions[0].detail,/系统/);
+    assert.equal(app.store.getPublishedOntologySchema(1),null);
+    const knowledgeCount=app.store.listKnowledge(1).length;
+    const invalid=await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,answers:[{questionId:task.payload.sourceBuild.questions[0].id,text:"这些关系已经确认"}]});assert.equal(invalid.status,400);
+    for(let i=0;i<2;i++){
+      assert.equal((await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,retryLinkGeneration:true})).status,202);
+      task=await waitForTask(app,task.id);assert.equal(task.payload.sourceBuild.linkRetryPasses,i+1);
+    }
+    assert.equal(calls,7);assert.equal(task.payload.sourceBuild.questions[0].retryable,false);
+    assert.equal((await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,retryLinkGeneration:true})).status,409);
+    assert.equal(app.store.listKnowledge(1).length,knowledgeCount);
+  }finally{await close();}
+});
+
+test("已有关系审核不会阻止系统重试漏项，重试也不改写已经展示的候选",async()=>{
+  let complete=false,calls=0;
+  const {app,close}=await fixture({mode:"auto_draft",firstBuild:true,splitDomains:true,similarity:c=>c.candidateType==="link"?.4:.9,generateLinks:async args=>{
+    if(args.run.scope.scopeKind!=="global_links")return {candidates:[],calls:[],normalizationIssues:[],tokenUsage:{},eligibleRelationCount:0};
+    calls++;
+    const catalog={...args.catalog,relations:args.catalog.relations.filter(r=>complete||r.fromTable==="sales_order")};
+    return completeLinks({...args,catalog,onCandidate:input=>args.onCandidate({...input,payload:{...input.payload,description:complete?"模型尝试改写已有说明":"应保留的待审核说明"}})});
+  }});
+  try{
+    const selected=["crm_customer","sales_order","payment_transaction"].map(tableName=>({tableName,included:true}));
+    const started=await api(app,"/api/sources/1/ontology-build",{selections:selected});let task=await waitForTask(app,started.body.id);
+    const issue=task.payload.sourceBuild.questions.find(q=>q.kind==="candidate_review");assert.ok(issue);
+    const system=task.payload.sourceBuild.questions.find(q=>q.kind==="generation");assert.equal(system.relationIds.length,1);
+    const candidate=app.store.getOntologyCandidate(issue.candidateIds[0]),events=app.store.listOntologyCandidateEvents(candidate.id);
+    complete=true;
+    assert.equal((await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id,retryLinkGeneration:true})).status,202);
+    task=await waitForTask(app,task.id);
+    assert.ok(!task.payload.sourceBuild.questions.some(q=>q.kind==="generation"));
+    assert.equal(task.payload.sourceBuild.questions.filter(q=>q.kind==="candidate_review").length,2);
+    assert.deepEqual(app.store.getOntologyCandidate(candidate.id),candidate);assert.deepEqual(app.store.listOntologyCandidateEvents(candidate.id),events);
+    assert.equal(task.payload.sourceBuild.questions.find(q=>q.id===issue.id).reviewChecksum,issue.reviewChecksum);
+    const before=calls;await api(app,"/api/sources/1/ontology-build/resume",{taskId:task.id});await waitForTask(app,task.id);assert.equal(calls,before);
+    assert.equal(app.store.getPublishedOntologySchema(1),null);
   }finally{await close();}
 });
 

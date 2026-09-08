@@ -58,6 +58,9 @@
 .ontology-clarification fieldset{border:0;padding:0;margin:1rem 0;font-size:.875rem}
 .ontology-clarification fieldset label{display:flex;align-items:center;gap:.6rem;margin:.6rem 0}
 .ontology-clarification input[type=radio]{accent-color:#087c70}
+.ontology-review-evidence{padding-left:1.2rem;margin:.8rem 0;color:var(--muted);font-size:.875rem;line-height:1.7}
+.ontology-review-comparison{margin:1rem 0;padding:.8rem 1rem;background:#fff;border:1px solid #ebdfc1;border-radius:8px;font-size:.875rem;overflow-wrap:anywhere}
+.ontology-review-comparison p{margin:.3rem 0}
 .ontology-definition-editor{background:#edf7f4;padding:1rem 1.2rem;border-radius:10px;margin:.5rem 0 1rem}
 .ontology-definition-editor p{font-size:.8125rem;color:var(--muted);margin-bottom:1rem}
 .ontology-definition-editor>div{display:flex;gap:.7rem}

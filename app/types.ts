@@ -92,8 +92,16 @@ export type BackgroundTask = {
   result:DiscoverySummary|EvaluationSummary|EvaluationGateSummary|OntologyDomainModelingResult|null; createdAt:string; startedAt:string|null; finishedAt:string|null;
 };
 export type SchemaSnapshot = { id:number; sourceId:number; version:number; checksum:string; createdAt:string };
-export type OntologyBuildIssue={id:string;kind:string;title:string;detail:string;tables:string[];retryable:boolean;domains?:string[];definitions?:Array<{name:string;description:string;reasons?:string[]}>;options?:Array<{value:"keep_existing"|"use_candidate"|"confirm_relation"|"deny_relation";label:string}>};
-export type OntologyBuildAnswer={questionId:string;text?:string;resolution?:"keep_existing"|"use_candidate"|"confirm_relation"|"deny_relation"};
+export type OntologyBuildResolution="keep_existing"|"use_candidate"|"confirm_relation"|"deny_relation"|"supplement_definition";
+export type OntologyBuildIssue={
+  id:string;kind:string;title:string;detail:string;tables:string[];retryable:boolean;domains?:string[];
+  definitions?:Array<{name:string;description:string;reasons?:string[]}>;options?:Array<{value:OntologyBuildResolution;label:string}>;
+  candidateType?:"object"|"link";relationIds?:number[];pathIds?:string[];
+  reviewKind?:"change"|"business"|"review";reviewChecksum?:string;score?:number;threshold?:number;evidenceSummary?:string[];
+  changes?:SemanticSchemaDiff|null;clarificationPrompt?:string;
+  comparison?:{baseVersion:number;previousName:string;previousPrimaryKey:string|string[]|null;currentPrimaryKey:string|string[]|null;previousFieldCount:number|null;currentFieldCount:number|null}|null;
+};
+export type OntologyBuildAnswer={questionId:string;text?:string;resolution?:OntologyBuildResolution;reviewChecksum?:string};
 export type OntologyBuildRecord={
   id:string;phase:string;busy:boolean;legacy:boolean;createdAt:string;finishedAt:string|null;progress:number;currentStep:string|null;
   summary:string|null;error:string|null;questions:OntologyBuildIssue[];events:Array<{phase:string;label:string;at:string}>;tableNames:string[];versionId:number|null;

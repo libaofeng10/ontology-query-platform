@@ -29,6 +29,7 @@ import { applySensitiveCatalogMigration } from "./sensitive-catalog-migration.mj
 import { applyEnumCatalogMigration } from "./enum-catalog-migration.mjs";
 import { createRelationDocumentService } from "./relation-document-service.mjs";
 import { createOntologyCandidateCritic } from "./ontology-candidate-critic.mjs";
+import { createOntologyCandidateVerifier } from "./ontology-candidate-verifier.mjs";
 import { createOntologyDomainPlanner } from "./ontology-domain-plan.mjs";
 import { createOntologyDomainModelingService } from "./ontology-domain-modeling-service.mjs";
 import { createOntologyDomainDraftService } from "./ontology-domain-draft-service.mjs";
@@ -52,7 +53,8 @@ export function createApp(overrides={}) {
   const semanticSchemas=createSemanticSchemaService({store});
   const ontologyGenerator=overrides.ontologyCandidateGenerator||createOntologyCandidateGenerator({llm:settingsConfig.llm,fetchImpl:overrides.llmFetchImpl,timeoutMs:()=>settingsConfig.ontologyAi.timeoutMs,auditDir:runtime.ontologyAi?.auditDir});
   const ontologyCritic=overrides.ontologyCandidateCritic||createOntologyCandidateCritic({llm:settingsConfig.llm,fetchImpl:overrides.llmFetchImpl,timeoutMs:()=>settingsConfig.ontologyAi.timeoutMs,enabled:()=>settingsConfig.ontologyAi.criticEnabled});
-  const ontologyCandidates=createOntologyCandidateService({store,config:settingsConfig,scorer:overrides.ontologyCandidateScorer,generator:ontologyGenerator,critic:ontologyCritic,embeddingIndex,semanticSchemas,embeddingFetchImpl:overrides.embeddingFetchImpl});
+  const ontologyVerifier=overrides.ontologyCandidateVerifier===false?null:overrides.ontologyCandidateVerifier||createOntologyCandidateVerifier({llm:settingsConfig.llm,fetchImpl:overrides.llmFetchImpl,timeoutMs:()=>settingsConfig.ontologyAi.timeoutMs});
+  const ontologyCandidates=createOntologyCandidateService({store,config:settingsConfig,scorer:overrides.ontologyCandidateScorer,generator:ontologyGenerator,critic:ontologyCritic,verifier:ontologyVerifier,embeddingIndex,semanticSchemas,embeddingFetchImpl:overrides.embeddingFetchImpl});
   const ontologyCalibration=createOntologyCalibrationService({store,config:settingsConfig,settings});
   const ontologyDomainPlanner=overrides.ontologyDomainPlanner||createOntologyDomainPlanner({store,config:settingsConfig,fetchImpl:overrides.llmFetchImpl});
   const ontologyDomainModeling=createOntologyDomainModelingService({domainPlanner:ontologyDomainPlanner,candidates:ontologyCandidates});

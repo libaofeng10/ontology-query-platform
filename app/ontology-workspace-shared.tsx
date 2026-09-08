@@ -20,5 +20,5 @@ function definitionIndex(schema?:SemanticSchema){
   for(const link of schema?.linkTypes||[])entries.set(`linkTypes.${link.apiName}`,{label:link.displayName||link.apiName,displayName:link.displayName||link.apiName,description:link.description||""});
   return entries;
 }
-export function phaseLabel(phase:string){return ({legacy:"历史生成记录",queued:"等待整理",discovering:"读取数据结构",generating:"整理业务定义",repairing:"补充与修正",merging:"合并业务定义",checking:"检查更新",evaluating:"验证业务问法",activating:"启用更新",needs_input:"需要补充说明",awaiting_change:"等待确认业务变化",failed:"本次整理未完成",ready:"已用于问数",unchanged:"沿用当前业务定义"} as Record<string,string>)[phase]||"本体更新";}
+export function phaseLabel(phase:string){return ({legacy:"历史生成记录",queued:"等待整理",discovering:"读取数据结构",generating:"整理业务定义",repairing:"补充与修正",merging:"合并业务定义",checking:"检查更新",evaluating:"验证业务问法",activating:"启用更新",needs_input:"需要审核或补充信息",awaiting_change:"等待确认业务变化",failed:"本次整理未完成",ready:"已用于问数",unchanged:"沿用当前业务定义"} as Record<string,string>)[phase]||"本体更新";}
 export function formatDate(value:string|null){if(!value)return "—";const date=new Date(value.includes("T")?value:`${value.replace(" ","T")}Z`);return Number.isNaN(date.getTime())?value:new Intl.DateTimeFormat("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}).format(date);}

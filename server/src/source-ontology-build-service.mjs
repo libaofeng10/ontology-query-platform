@@ -3,6 +3,7 @@ import { findBridgeRelationPaths, missingBridgePaths } from "./ontology-bridge-p
 import { createHash } from "node:crypto";
 import { diffSemanticSchemas } from "./semantic-schema-diff.mjs";
 import { buildIssueId, classifyBuildError, groupBuildErrors } from "./ontology-build-issues.mjs";
+import { candidateReviewChecksum, candidateReviewIssue, previousCandidateDefinition } from "./ontology-candidate-review.mjs";
 
 const CATALOG_TASKS=["discovery","ontology_domain_modeling","ontology_generation","ontology_link_generation"];
 const ACTIVE=new Set(["queued","running"]);
@@ -19,7 +20,7 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
     const task=jobs.find((item)=>ACTIVE.has(item.status))||jobs[0]||null;
     const activeVersion=store.getPublishedOntologySchema(sourceId),checkpoint=task?.payload?.sourceBuild;
     const phase=checkpoint?.workflowVersion===2?checkpoint.phase||"queued":task?(ACTIVE.has(task.status)?"generating":"legacy"):"empty";
-    const questions=checkpoint?.questions||[];
+    const questions=task?currentQuestions(task):[];
     return {task,modelingEnabled:config.ontologyAi.mode!=="off",profilingEnabled:Boolean(config.profiling?.enabled),activeVersion,
       availability:{canQuery:Boolean(activeVersion),tableNames:mappedTables(activeVersion?.schema),objectCount:activeVersion?.schema?.objectTypes?.length||0},
       update:task?{id:task.id,phase,busy:ACTIVE.has(task.status),questions,changes:checkpoint?.changes||null,changeChecksum:checkpoint?.changeChecksum||null,
@@ -58,7 +59,7 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
     const runs=store.listOntologyGenerationRunsForBuild(sourceId,id);
     const selected=checkpoint.selections?.filter((item)=>item.included).map((item)=>item.tableName);
     return {id,phase,busy,legacy,createdAt:task.createdAt,finishedAt:task.finishedAt,progress:task.progress,currentStep:task.currentStep,
-      summary:checkpoint.summary||null,error:checkpoint.failure?.message||task.error||null,questions:checkpoint.questions||[],events:checkpoint.events||[],
+      summary:checkpoint.summary||null,error:checkpoint.failure?.message||task.error||null,questions:currentQuestions(task),events:checkpoint.events||[],
       tableNames:selected||[...new Set(runs.flatMap((run)=>run.scope.tableNames||[]))],
       versionId:checkpoint.publishedVersionId||checkpoint.draftVersionId||task.result?.draftSchemaVersionId||null,
       runs:runs.map((run)=>({id:run.id,name:run.scope.domainName||"业务定义整理",tableNames:run.scope.tableNames||[],status:run.status,progress:run.progress,
@@ -69,19 +70,28 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
     const task=requiredBuild(source.id,input?.taskId);
     if(ACTIVE.has(task.status)||FINISHED.has(task.payload.sourceBuild.phase))return task;
     assertCatalogIdle(source.id);
-    const checkpoint=task.payload.sourceBuild,questions=new Map((checkpoint.questions||[]).map((item)=>[item.id,item]));
+    const checkpoint=task.payload.sourceBuild,current=currentQuestions(task),questions=new Map(current.map((item)=>[item.id,item]));
+    assertBase(source.id,checkpoint.baseVersionId);
     if(input?.answers!=null&&(!Array.isArray(input.answers)||input.answers.length>50))throw httpError(400,"补充说明格式无效");
+    if(new Set((input?.answers||[]).map(answer=>String(answer.questionId))).size!==(input?.answers||[]).length)throw httpError(400,"同一问题不能重复提交答案");
     const answers=(input?.answers||[]).map((answer)=>{
       const question=questions.get(String(answer.questionId));
-      if(!question||!["definition","conflict","relation"].includes(question.kind))throw httpError(400,"待补充的问题已变化，请刷新结果");
+      if(!question||!["definition","conflict","relation","candidate_review"].includes(question.kind))throw httpError(400,"待处理的问题已变化，请刷新结果");
       const text=String(answer.text||"").trim(),resolution=answer.resolution;
-      if(["conflict","relation"].includes(question.kind)&&!question.options?.some((option)=>option.value===resolution))throw httpError(400,"请选择此次业务定义的处理方式");
-      if(question.kind==="definition"&&(!text||text.length>3000))throw httpError(400,"请补充 1 到 3000 字的业务说明");
+      if(["conflict","relation","candidate_review"].includes(question.kind)&&!question.options?.some((option)=>option.value===resolution))throw httpError(400,"请选择此次业务定义的处理方式");
+      if(question.kind==="candidate_review"&&answer.reviewChecksum!==question.reviewChecksum)throw httpError(409,"待审核定义或依据已变化，请刷新后重新确认");
+      if((question.kind==="definition"||resolution==="supplement_definition")&&(!text||text.length>3000))throw httpError(400,"请补充 1 到 3000 字的业务说明");
       return {questionId:question.id,text,resolution,question,actor};
     });
+    if(input?.retryLinkGeneration!=null&&typeof input.retryLinkGeneration!=="boolean")throw httpError(400,"关系补齐重试参数无效");
+    const retryLinks=input?.retryLinkGeneration===true;
+    if(retryLinks&&((input.answers||[]).length||!current.some(item=>item.kind==="generation"&&item.retryable)||Number(checkpoint.linkRetryPasses||0)>=2))throw httpError(409,"当前关系补齐不可重试，请刷新并查看执行记录");
+    if(input?.retryVerification!=null&&typeof input.retryVerification!=="boolean")throw httpError(400,"证据核验重试参数无效");
+    const retryVerification=input?.retryVerification===true;
+    if(retryVerification&&(retryLinks||(input.answers||[]).length||!current.some(item=>item.kind==="verification"&&item.retryable)||Number(checkpoint.verificationRetryPasses||0)>=2))throw httpError(409,"当前证据核验不可重试，请刷新并查看执行记录");
     const approveChangeChecksum=input?.approveChangeChecksum;
     if(approveChangeChecksum&&(approveChangeChecksum!==checkpoint.changeChecksum||checkpoint.phase!=="awaiting_change"))throw httpError(409,"变化摘要已更新，请查看最新内容");
-    return tasks.resume(task.id,{...task.payload,actor,sourceBuild:{...checkpoint,pendingAnswers:answers,...(approveChangeChecksum?{approvedChangeChecksum:approveChangeChecksum}:{}),failure:null}});
+    return tasks.resume(task.id,{...task.payload,actor,sourceBuild:{...checkpoint,questions:current,pendingAnswers:answers,...(retryLinks?{linkRetryPasses:Number(checkpoint.linkRetryPasses||0)+1}:{}),...(retryVerification?{verificationRetryPasses:Number(checkpoint.verificationRetryPasses||0)+1}:{}),...(approveChangeChecksum?{approvedChangeChecksum:approveChangeChecksum}:{}),failure:null}});
   }
 
   function correct(source,input,actor) {
@@ -119,7 +129,33 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
       if(checkpoint.draftVersionId&&store.getPublishedOntologySchema(source.id)?.id===checkpoint.draftVersionId){save({publishedVersionId:checkpoint.draftVersionId});return finish("ready",checkpoint.summary||"本次更新已用于问数");}
       assertBase(source.id,checkpoint.baseVersionId);
       for(const answer of checkpoint.pendingAnswers||[]) {
-        if(answer.question.kind==="relation") {
+        if(answer.question.kind==="candidate_review") {
+          const candidate=store.getOntologyCandidate(answer.question.candidateIds[0]);
+          const run=candidate&&store.getOntologyGenerationRun(candidate.runId),base=checkpoint.baseVersionId?store.getOntologySchemaVersion(checkpoint.baseVersionId):null;
+          if(!candidate||candidate.sourceId!==source.id||run?.scope.orchestrationId!==task.id||candidate.status!=="review_required"||
+            candidateReviewChecksum(candidate,run,base)!==answer.question.reviewChecksum)throw httpError(409,"待审核定义或依据已变化，请刷新后重新确认");
+          if(answer.resolution==="supplement_definition") {
+            await knowledge.save(source.id,{pageType:"term",slug:`ontology-${task.id}-${buildIssueId(answer.questionId)}`,title:answer.question.title,content:answer.text,tables:answer.question.tables,verified:true,owner:answer.actor});
+            save({answeredQuestions:[...new Set([...(checkpoint.answeredQuestions||[]),answer.questionId])],
+              clarifiedCandidateIds:[...new Set([...(checkpoint.clarifiedCandidateIds||[]),candidate.id])],
+              pendingAnswers:checkpoint.pendingAnswers.filter(item=>item.questionId!==answer.questionId)});
+          } else {
+            const previous=checkpoint;
+            const existing=previousCandidateDefinition(candidate,base);
+            if(answer.resolution==="keep_existing"&&!existing)throw httpError(409,"已有定义已变化，请刷新后重新审核");
+            try {
+              await candidates.decide(candidate.id,{decision:"confirm",reviewChecksum:answer.question.reviewChecksum,
+                ...(answer.resolution==="keep_existing"?{candidate:existing}:{}),note:answer.resolution==="keep_existing"?"本次构建审核：保留已有定义":"本次构建审核：采用当前候选定义"},answer.actor,{onDecision:()=>{
+                  if(store.getTask(task.id)?.status!=="running")throw httpError(409,"本次构建状态已变化，请刷新后重试");
+                  save({
+                  candidateReviews:{...checkpoint.candidateReviews,[candidate.id]:{reviewChecksum:answer.question.reviewChecksum,resolution:answer.resolution,baseVersionId:checkpoint.baseVersionId,reviewedBy:answer.actor,reviewedAt:new Date().toISOString()}},
+                  conflictResolutions:{...checkpoint.conflictResolutions,[candidate.id]:answer.resolution},
+                  pendingAnswers:checkpoint.pendingAnswers.filter(item=>item.questionId!==answer.questionId),
+                  });
+                }});
+            } catch(error){checkpoint=previous;throw error;}
+          }
+        } else if(answer.question.kind==="relation") {
           const relation=store.listRelations(source.id,false,true).find(item=>item.id===answer.question.relationId);
           if(!relation||!checkpoint.selections.some(item=>item.included&&item.tableName===relation.fromTable)||!checkpoint.selections.some(item=>item.included&&item.tableName===relation.toTable))throw httpError(409,"待确认关系已变化，请重新读取数据范围");
           store.db.transaction(()=>{
@@ -185,18 +221,22 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
           stage("repairing","AI 正在补充证据并修正不确定的定义",68);
           for(const runId of (checkpoint.generation.runIds||[]).filter(id=>store.getOntologyGenerationRun(id)?.scope.scopeKind!=="global_links")) {
             const spent=store.listOntologyGenerationRuns(source.id,500).filter((item)=>item.scope.orchestrationId===task.id).reduce((total,item)=>total+Number(item.summary.repairAttempts||0),0);
-            await candidates.refineRun(runId,{remainingRounds:Math.max(0,20-spent),extraRounds:(checkpoint.answeredQuestions||[]).length,onProgress:(step)=>onProgress({...step,total:100,progress:70})});
+            await candidates.refineRun(runId,{remainingRounds:Math.max(0,20-spent),extraRounds:(checkpoint.answeredQuestions||[]).length,clarifiedCandidateIds:checkpoint.clarifiedCandidateIds||[],onProgress:(step)=>onProgress({...step,total:100,progress:70})});
+            await candidates.verifyAndRepairRun?.(runId,{retryPasses:Number(checkpoint.verificationRetryPasses||0),onProgress:step=>onProgress({...step,total:100,progress:72})});
           }
-          const issues=definitionIssues(task.id);if(issues.length)return wait("needs_input",issues);
-          const completed=await candidates.completeBuildLinks({sourceId:source.id,orchestrationId:task.id,runIds:checkpoint.generation.runIds||[],tableNames:selectedTables,actor:payload.actor,extraRounds:(checkpoint.answeredQuestions||[]).length,onProgress:step=>onProgress({...step,total:100,progress:75})});
+          const issues=definitionIssues(task.id,{objectsOnly:true});if(issues.length)return wait("needs_input",issues);
+          const completed=await candidates.completeBuildLinks({sourceId:source.id,orchestrationId:task.id,runIds:checkpoint.generation.runIds||[],tableNames:selectedTables,actor:payload.actor,extraRounds:(checkpoint.answeredQuestions||[]).length,retryPasses:Number(checkpoint.linkRetryPasses||0),verificationRetryPasses:Number(checkpoint.verificationRetryPasses||0),clarifiedCandidateIds:checkpoint.clarifiedCandidateIds||[],onProgress:step=>onProgress({...step,total:100,progress:75})});
           save({relationCoverage:completed.coverage,generation:{...checkpoint.generation,runIds:[...new Set([...(checkpoint.generation.runIds||[]),...completed.runIds])]}});
-          const linkIssues=[...definitionIssues(task.id),...missingLinkIssues(source.id,completed.coverage.missingRelationIds),...missingBridgeIssues(completed.coverage.missingBridgePaths||[])];
+          if(checkpoint.clarifiedCandidateIds?.length)save({clarifiedCandidateIds:[]});
+          const linkIssues=[...definitionIssues(task.id),...linkGenerationIssues(task.id,completed.coverage)];
           if(linkIssues.length)return wait("needs_input",linkIssues);
           stage("merging","合并业务定义并保留已有说明",78);
           const workflow=drafts.summary(task.id);
           if(workflow.draftSchemaVersionId)save({draftVersionId:workflow.draftSchemaVersionId});
           else {
-            const input={conflictResolutions:checkpoint.conflictResolutions||{}},preview=drafts.previewBuild(task.id,input),conflicts=preview.conflicts.filter((item)=>item.resolution==="unresolved");
+            const resolutions={...checkpoint.conflictResolutions};
+            for(const runId of checkpoint.generation.runIds||[])for(const item of store.listOntologyCandidates({runId,limit:2000}))if(!resolutions[item.id]&&item.status==="auto_confirmed"&&candidates.currentVerification?.(item)?.decision==="supported")resolutions[item.id]="use_candidate";
+            const input={conflictResolutions:resolutions},preview=drafts.previewBuild(task.id,input),conflicts=preview.conflicts.filter((item)=>item.resolution==="unresolved");
             if(conflicts.length)return wait("needs_input",conflictIssues(conflicts));
             const missing=selectedTables.filter((table)=>!mappedTables(preview.schema).includes(table));
             if(missing.length)return wait("needs_input",[{id:"scope",kind:"scope",title:"部分所选数据还没有业务定义",detail:`尚未覆盖：${missing.join("、")}。请补充表说明后继续整理。`,tables:missing,retryable:true}]);
@@ -204,8 +244,7 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
             const expectedLinks=store.listRelations(source.id,true).filter(item=>selectedTables.includes(item.fromTable)&&selectedTables.includes(item.toTable)),missingLinks=expectedLinks.filter(item=>!coveredLinks.has(item.id));
             const missingPaths=missingBridgePaths(bridgePaths,preview.schema.linkTypes||[]);
             save({relationCoverage:{confirmedRelationCount:expectedLinks.length,coveredRelationCount:expectedLinks.length-missingLinks.length,missingRelationIds:missingLinks.map(item=>item.id),bridgePathCount:bridgePaths.length,bridgePathLimitReached:Boolean(bridgePaths.truncated),coveredBridgePathCount:bridgePaths.length-missingPaths.length,missingBridgePaths:missingPaths.map(({pathId,fromTable,toTable,bridgeTable,relationIds})=>({pathId,fromTable,toTable,bridgeTable,relationIds}))}});
-            if(missingLinks.length)return wait("needs_input",missingLinkIssues(source.id,missingLinks.map(item=>item.id)));
-            if(missingPaths.length)return wait("needs_input",missingBridgeIssues(missingPaths));
+            if(missingLinks.length||missingPaths.length)return wait("needs_input",[{id:"link-merge-coverage",kind:"validation",title:"关系定义合并后覆盖不完整",detail:`合并结果缺少 ${missingLinks.length} 条已确认关系和 ${missingPaths.length} 条中间表路径，请查看执行记录中的映射与冲突。系统需要修复合并结果，无需重复确认物理关系。`,tables:[...new Set(missingLinks.flatMap(item=>[item.fromTable,item.toTable]))],retryable:true}]);
             if(!preview.validation.ok)return wait("needs_input",validationIssues(preview.validation));
             if(checkpoint.baseVersionId&&!preview.diff.summary.total){save({publishedVersionId:checkpoint.baseVersionId});return finish("unchanged","业务定义没有变化，继续使用当前结果");}
             saveDraft(()=>drafts.applyBuild(task.id,input,payload.actor).draft);
@@ -246,36 +285,60 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
     }
   }
 
-  function definitionIssues(orchestrationId) {
+  function definitionIssues(orchestrationId,{objectsOnly=false}={}) {
     const owner=store.getTask(orchestrationId),currentIds=new Set(owner.payload?.sourceBuild?.generation?.runIds||[]);
     const runs=store.listOntologyGenerationRuns(owner.sourceId,500).filter((item)=>item.scope.orchestrationId===orchestrationId&&item.status==="succeeded"&&(!currentIds.size||currentIds.has(item.id))),issues=new Map();
     for(const run of runs) {
       const all=store.listOntologyCandidates({runId:run.id,limit:2000});
-      for(const candidate of all.filter((item)=>["review_required","blocked"].includes(item.status))) {
-        const tables=candidate.candidateType==="object"?mappedTables({objectTypes:[candidate.payload]}):run.scope.tableNames;
-        const key=candidate.candidateType==="object"?tables.join("|"):`link:${candidate.payload.relationMappings?.map((item)=>item.relationId).sort().join(",")}`;
-        const title=candidate.candidateType==="object"?`请补充「${candidate.payload.displayName||tables.join("、")}」的业务含义`:`请说明「${candidate.payload.displayName||"关联关系"}」的用途`;
-        if(!issues.has(key))issues.set(key,{id:buildIssueId(key),kind:"definition",title,detail:"AI 已根据现有结构和知识检查；以下定义仍缺少明确依据。补充用途、关键字段或具体口径后，系统会继续整理。",tables,candidateIds:[],definitions:[],retryable:true});
-        issues.get(key).candidateIds.push(candidate.id);issues.get(key).definitions.push({name:candidate.payload.displayName,description:candidate.payload.description,reasons:candidate.validation?.errors?.map((item)=>item.message)||[]});
+      for(const candidate of all.filter((item)=>(!objectsOnly||item.candidateType==="object")&&["review_required","blocked"].includes(item.status))) {
+        if(candidate.sourceId!==owner.sourceId)continue;
+        const base=owner.payload.sourceBuild.baseVersionId?store.getOntologySchemaVersion(owner.payload.sourceBuild.baseVersionId):null;
+        issues.set(candidate.id,candidates?.reviewIssue?candidates.reviewIssue(candidate,run,base):candidateReviewIssue(candidate,run,base));
       }
       const covered=new Set(all.filter((item)=>item.candidateType==="object").flatMap((item)=>mappedTables({objectTypes:[item.payload]})));
-      for(const table of (run.scope.scopeKind==="global_links"?[]:run.scope.tableNames).filter((name)=>!covered.has(name)))if(!issues.has(table))issues.set(table,{id:buildIssueId(table),kind:"definition",title:`「${table}」存放什么业务数据？`,detail:"模型尚未生成这张表的业务定义，请补充用途或关键字段含义。",tables:[table],candidateIds:[],definitions:[],retryable:true});
+      for(const table of (run.scope.scopeKind==="global_links"?[]:run.scope.tableNames).filter((name)=>!covered.has(name)))if(!issues.has(table))issues.set(table,{id:buildIssueId(table),kind:"validation",title:`「${table}」尚未生成业务对象`,detail:"自动生成和修正后仍缺少此表的对象定义。请查看执行记录中的生成错误并重试，当前不能据此判断缺少哪项业务知识。",tables:[table],candidateIds:[],definitions:[],retryable:true});
     }
-    return [...issues.values()];
+    const all=[...issues.values()],system=all.filter(item=>item.kind==="verification");
+    if(!system.length)return all;
+    return [...all.filter(item=>item.kind!=="verification"),{id:"evidence-verification",kind:"verification",title:`系统需要核验或修正 ${system.length} 项定义`,
+      detail:"系统会先用已确认关系、字段说明和业务知识核验，证据充分的自动通过。模型或结构问题由系统修复；只有仍有具体业务疑点的才需要你回答。",
+      tables:[...new Set(system.flatMap(item=>item.tables||[]))],candidateIds:system.flatMap(item=>item.candidateIds),
+      definitions:system.map(item=>({name:item.candidateIds[0],description:item.detail,reasons:[]})),retryable:Number(owner.payload.sourceBuild.verificationRetryPasses||0)<2}];
+  }
+  function currentQuestions(task) {
+    const checkpoint=task.payload?.sourceBuild,questions=checkpoint?.questions||[];
+    const candidateIssue=item=>["definition","candidate_review","validation","verification"].includes(item.kind)&&item.candidateIds?.length;
+    const coverage=checkpoint?.relationCoverage||{};
+    const legacyIds=new Set([...(coverage.missingRelationIds||[]).map(id=>buildIssueId(`link:${id}`)),...(coverage.missingBridgePaths||[]).map(path=>buildIssueId(path.pathId))]);
+    const coverageIssue=item=>item.kind==="generation"||legacyIds.has(item.id);
+    if(checkpoint?.phase!=="needs_input"||!questions.some(item=>candidateIssue(item)||coverageIssue(item)))return questions;
+    // Project historical prompts without changing saved decisions or calling a model.
+    return [...questions.filter(item=>!candidateIssue(item)&&!coverageIssue(item)),...definitionIssues(task.id).filter(item=>item.candidateIds?.length),
+      ...(questions.some(coverageIssue)?linkGenerationIssues(task.id,coverage):[])];
+  }
+  function linkGenerationIssues(orchestrationId,coverage) {
+    const owner=store.getTask(orchestrationId),checkpoint=owner.payload.sourceBuild,ids=new Set(checkpoint.generation?.runIds||[]);
+    const runs=store.listOntologyGenerationRunsForBuild(owner.sourceId,orchestrationId).filter(run=>run.status==="succeeded"&&(!ids.size||ids.has(run.id)));
+    const pending=runs.flatMap(run=>store.listOntologyCandidates({runId:run.id,candidateType:"link",limit:2000})).filter(item=>["review_required","blocked"].includes(item.status)).map(item=>item.payload);
+    const handled=new Set(pending.flatMap(link=>(link.relationMappings||[]).map(item=>Number(item.relationId))));
+    const missing=new Set((coverage?.missingRelationIds||[]).filter(id=>!handled.has(Number(id))));
+    const relations=store.listRelations(owner.sourceId,true).filter(item=>missing.has(item.id));
+    const paths=missingBridgePaths(coverage?.missingBridgePaths||[],pending);
+    if(!relations.length&&!paths.length)return [];
+    const codes=[...new Set(runs.filter(run=>run.scope.scopeKind==="global_links"&&((run.scope.relationIds||[]).some(id=>missing.has(id))||(run.scope.pathIds||[]).some(id=>paths.some(path=>path.pathId===id)))).flatMap(run=>run.summary.normalizationIssues||[]).map(item=>item.code))];
+    const retryable=Number(checkpoint.linkRetryPasses||0)<2;
+    return [{id:"link-generation",kind:"generation",title:`系统还需补齐 ${relations.length} 条关系定义${paths.length?`及 ${paths.length} 条中间表路径`:""}`,
+      detail:`这些关系已确认，生成阶段尚未产出相应定义。${codes.includes("ONTOLOGY_LINK_RELATION_NOT_ALLOWED")?"部分模型输出使用了不属于本批次的关系标识，已被校验拦截。":""}${retryable?"可重试系统补齐；已有定义和审核结果会保留，无需逐条填写业务说明。":"已达到本次自动补齐及额外重试上限，请查看执行记录中的生成问题。"}`,
+      tables:[...new Set([...relations.flatMap(item=>[item.fromTable,item.toTable]),...paths.flatMap(path=>[path.fromTable,path.bridgeTable,path.toTable])])],relationIds:relations.map(item=>item.id),pathIds:paths.map(path=>path.pathId),retryable}];
   }
   function physicalRelationIssues(sourceId,tableNames){
     const tables=new Set(tableNames);
     return store.listRelations(sourceId,false,true).filter(item=>item.status==="review"&&tables.has(item.fromTable)&&tables.has(item.toTable)).map(relation=>({id:`physical-relation:${relation.id}`,kind:"relation",relationId:relation.id,title:"请确认数据之间的业务关系",detail:`${formatRelation(relation)}；${relation.modelReason||relation.structuralReason||"尚缺少明确的业务依据"}`,tables:[...new Set([relation.fromTable,relation.toTable])],retryable:true,options:[{value:"confirm_relation",label:"确认该业务关系"},{value:"deny_relation",label:"这些字段不构成业务关系"}]}));
   }
-  function missingLinkIssues(sourceId,ids){
-    const wanted=new Set(ids);
-    return store.listRelations(sourceId,true).filter(item=>wanted.has(item.id)).map(relation=>({id:buildIssueId(`link:${relation.id}`),kind:"definition",title:"已确认关系尚未形成业务定义",detail:`${formatRelation(relation)}。请补充这条关系的业务名称、用途和两个方向的含义；系统将继续补充关系定义。`,tables:[...new Set([relation.fromTable,relation.toTable])],candidateIds:[],definitions:[],retryable:true}));
-  }
   function sourceBridgePaths(sourceId,tableNames){
     const selected=new Set(tableNames);
     return findBridgeRelationPaths({columnsByTable:Object.fromEntries(tableNames.map(table=>[table,store.listColumns(sourceId,table)])),relations:store.listRelations(sourceId,true).filter(relation=>selected.has(relation.fromTable)&&selected.has(relation.toTable))});
   }
-  function missingBridgeIssues(paths){return paths.map(path=>({id:buildIssueId(path.pathId),kind:"definition",title:"中间表关联尚未形成业务定义",detail:`${path.fromTable} 经 ${path.bridgeTable} 关联 ${path.toTable}，路径包含关系 ${path.relationIds.join("、")}。请说明这条路径的业务名称和用途，系统将继续补充定义。`,tables:[...new Set([path.fromTable,path.bridgeTable,path.toTable])],candidateIds:[],definitions:[],retryable:true}));}
   function conflictIssues(conflicts) {
     return conflicts.map((conflict)=>{
       const candidate=store.getOntologyCandidate(conflict.candidateId);
