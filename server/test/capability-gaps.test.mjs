@@ -5,7 +5,6 @@ import { join } from "node:path";
 import test from "node:test";
 import { createCapabilityGapService, _internal } from "../src/capability-gap-service.mjs";
 import { createKnowledgeService } from "../src/knowledge-service.mjs";
-import { describeIntentFacets } from "../src/query-intent.mjs";
 import { createStore } from "../src/store.mjs";
 
 async function createFixture() {
@@ -172,21 +171,4 @@ test("a degraded verified page reaches the board through the real service",async
     assert.equal(gap.remedy.prefill.slug,saved.slug);
     assert.match(gap.detail,/TIME_ROLE_UNDETERMINED/);
   } finally { store.close(); }
-});
-
-test("refusal copy renders business surfaces, never internal facet ids",()=>{
-  // The gap board and the refusal card are the two places a business user reads
-  // machine state; a leaked "filter:channel:0" there is a defect, not cosmetics.
-  const intent={requirements:[
-    {id:"filter:channel:0",kind:"filter",field:"source_data_channel",fieldSurface:"渠道",value:"抖音"},
-    {id:"subject:clue",kind:"subject",value:"clue"},
-    {id:"measure:rate",kind:"measure",sourceText:"成交率"},
-  ]};
-  const described=describeIntentFacets(intent,["filter:channel:0","subject:clue","measure:rate"]);
-  assert.deepEqual(described,["筛选「渠道」","业务对象「线索」","指标「成交率」"]);
-  for(const text of described) {
-    assert.doesNotMatch(text,/:/,"facet id 的冒号形态不得出现在用户可见文案里");
-    assert.doesNotMatch(text,/source_data_channel/,"物理列名不得出现在用户可见文案里");
-    assert.doesNotMatch(text,/抖音/,"筛选值可能是个人数据，不得进入拒答文案");
-  }
 });

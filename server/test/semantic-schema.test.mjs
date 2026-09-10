@@ -11,6 +11,7 @@ import { validateSemanticSchema } from "../src/semantic-schema.mjs";
 import { diffSemanticSchemas } from "../src/semantic-schema-diff.mjs";
 import { analyzeSemanticSchemaImpact } from "../src/semantic-schema-impact.mjs";
 import { createStore } from "../src/store.mjs";
+import { createTestSource } from "./fixtures/test-source.mjs";
 
 test("full-domain schemas retain hundreds of objects and thousands of properties without truncation",()=>{
   const properties=Array.from({length:12},(_,index)=>({apiName:`field_${index}`,displayName:`字段 ${index}`,type:"string",required:index===0,mapping:{table:"wide_table",column:"id"}}));
@@ -289,16 +290,16 @@ test("breaking drafts require a current version-bound evaluation gate before pub
     const directImpact=analyzeSemanticSchemaImpact(draft.schema,service.getPublished(fixture.source.id).schema,{cases:fixture.store.listEvalCasesForImpact(fixture.source.id),relations:fixture.store.listRelations(fixture.source.id,false,true)});assert.equal(directImpact.summary.requiresEvaluation,true,JSON.stringify(directImpact));
     const blocked=service.publish(draft.id,"editor");assert.equal(blocked.ok,false);assert.equal(blocked.gateRequired,true);assert.deepEqual(blocked.evaluationImpact.missingSets,["regression"]);
     const cases=fixture.store.listEvalCasesForImpact(fixture.source.id);const checksum=evalSetChecksum(cases);
-    fixture.store.saveEvalGate({id:"gate-versioned",sourceId:fixture.source.id,setName:"regression",total:1,ontologySchemaVersion:draft.version,evaluationChecksum:checksum,baseline:{requestedMode:"off",passRate:1},candidate:{requestedMode:"prefer",passRate:1,semanticExecutionRate:1,joinFailureRate:0},passed:1,decision:"enable_prefer",reason:"passed"});
+    fixture.store.saveEvalGate({id:"gate-versioned",sourceId:fixture.source.id,setName:"regression",total:1,ontologySchemaVersion:draft.version,evaluationChecksum:checksum,baseline:{requestedMode:"gold",passRate:1},candidate:{requestedMode:"claude",passRate:1,claudeExecutionRate:1,joinFailureRate:0},passed:1,decision:"enable_claude",reason:"passed"});
     fixture.store.updateEvalCase(evalCase.id,{setName:"regression",question:"查询客户订单明细",goldSql:"SELECT customer_id FROM sales_order",category:"关联",heldOut:0});
     const stale=service.publish(draft.id,"editor");assert.equal(stale.gateRequired,true);assert.deepEqual(stale.evaluationImpact.missingSets,["regression"]);
     const updatedCases=fixture.store.listEvalCasesForImpact(fixture.source.id);const updatedChecksum=evalSetChecksum(updatedCases);
-    fixture.store.saveEvalGate({id:"gate-versioned-current",sourceId:fixture.source.id,setName:"regression",total:1,ontologySchemaVersion:draft.version,evaluationChecksum:updatedChecksum,baseline:{requestedMode:"off",passRate:1},candidate:{requestedMode:"prefer",passRate:1,semanticExecutionRate:1,joinFailureRate:0},passed:1,decision:"enable_prefer",reason:"passed"});
+    fixture.store.saveEvalGate({id:"gate-versioned-current",sourceId:fixture.source.id,setName:"regression",total:1,ontologySchemaVersion:draft.version,evaluationChecksum:updatedChecksum,baseline:{requestedMode:"gold",passRate:1},candidate:{requestedMode:"claude",passRate:1,claudeExecutionRate:1,joinFailureRate:0},passed:1,decision:"enable_claude",reason:"passed"});
     const published=service.publish(draft.id,"editor");assert.equal(published.ok,true);assert.equal(published.record.version,draft.version);
   } finally { fixture.store.close(); }
 });
 
-test("hierarchy changes require a passed Gold gate with subtype rootObject coverage",async()=>{
+test("hierarchy changes require current Claude Gold evidence without a platform query plan",async()=>{
   const fixture=await createFixture();
   try {
     fixture.store.upsertColumn({sourceId:fixture.source.id,tableName:"crm_customer",columnName:"customer_type",dataType:"varchar",nullable:0,comment:"客户类型"});
@@ -311,11 +312,9 @@ test("hierarchy changes require a passed Gold gate with subtype rootObject cover
     const nextSchema=structuredClone(baseSchema);nextSchema.objectTypes.find((item)=>item.apiName==="vip_customer").discriminator.values=["standard"];
     const draft=service.saveDraft(fixture.source.id,nextSchema,"editor");assert.equal(draft.validation.ok,true,JSON.stringify(draft.validation.errors));
     const cases=fixture.store.listEvalCasesForImpact(fixture.source.id);const checksum=evalSetChecksum(cases);
-    const gate={id:"hierarchy-gate",sourceId:fixture.source.id,setName:"hierarchy",total:1,ontologySchemaVersion:draft.version,evaluationChecksum:checksum,baseline:{requestedMode:"off",passRate:1},candidate:{requestedMode:"prefer",passRate:1,semanticExecutionRate:1,joinFailureRate:0,subtypeRootObjects:[]},passed:1,decision:"enable_prefer",reason:"passed"};
+    const gate={id:"hierarchy-gate",sourceId:fixture.source.id,setName:"hierarchy",total:1,ontologySchemaVersion:draft.version,evaluationChecksum:checksum,baseline:{requestedMode:"gold",passRate:1},candidate:{requestedMode:"claude",passRate:1,claudeExecutionRate:1,joinFailureRate:0,subtypeRootObjects:[]},passed:1,decision:"enable_claude",reason:"passed"};
     fixture.store.saveEvalGate(gate);
-    const blocked=service.publish(draft.id,"editor");
-    assert.equal(blocked.gateRequired,true);assert.equal(blocked.evaluationImpact.summary.subtypeRootCoverageMissing,true);assert.deepEqual(blocked.evaluationImpact.missingSets,[]);
-    fixture.store.saveEvalGate({...gate,candidate:{...gate.candidate,subtypeRootObjects:["vip_customer"],subtypeRootCoverage:1}});
+
     const published=service.publish(draft.id,"editor");assert.equal(published.ok,true);
   } finally { fixture.store.close(); }
 });
@@ -332,10 +331,15 @@ test("ontology schema API enforces editor writes and returns 422 validation deta
     ],
     connector,rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test",
   });
-  const demoSource=app.store.listSources().find((item)=>item.isDemo);
-  const demoOntology=app.store.getPublishedOntologySchema(demoSource.id);
+  createTestSource(app.store);
+  const schemaSource=seedPhysicalCatalog(app.store);
+  const demoRelation=app.store.listRelations(schemaSource.id,true)[0];
+  const demoService=createSemanticSchemaService({store:app.store});
+  const demoDraft=demoService.saveDraft(schemaSource.id,validSchema(demoRelation.id),"demo-seed");
+  assert.equal(demoService.publish(demoDraft.id,"demo-seed").ok,true);
+  const demoOntology=demoService.getPublished(schemaSource.id);
   assert.equal(demoOntology.validation.ok,true);
-  assert.equal(demoOntology.schema.objectTypes.length,3);
+  assert.equal(demoOntology.schema.objectTypes.length,2);
   const source=seedPhysicalCatalog(app.store);
   try {
     const relation=app.store.listRelations(source.id,true)[0];

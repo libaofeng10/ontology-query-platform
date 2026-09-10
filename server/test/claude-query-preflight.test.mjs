@@ -122,33 +122,9 @@ test("--local-only validates readiness without spawning a potentially billable C
   });
 
   assert.equal(result.ok, true);
-  assert.equal(result.mode, "prefer");
+  assert.equal(result.mode, "claude");
   assert.equal(spawned, 0);
   assert.equal(result.readiness.authConfigured, true);
-});
-
-test("--check-enabled validates deployment prerequisites while runtime mode stays off", async () => {
-  let observedMode;
-  let spawned = 0;
-  const result = await runClaudeQueryPreflight({
-    config: { claudeQuery: { mode: "off" } },
-    env: { ANTHROPIC_API_KEY: "secret-key" },
-    checkEnabled: true,
-    localOnly: true,
-    readinessChecker: ({ config }) => {
-      observedMode = config.claudeQuery.mode;
-      return readiness();
-    },
-    spawnImpl: () => {
-      spawned += 1;
-      throw new Error("--check-enabled must not spawn without explicit API probe");
-    },
-  });
-  assert.equal(result.ok, true);
-  assert.equal(result.mode, "off");
-  assert.equal(result.checkedAsEnabled, true);
-  assert.equal(observedMode, "prefer");
-  assert.equal(spawned, 0);
 });
 
 test("preflight creates private config/tmp directories and removes the run directory in finally", async () => {

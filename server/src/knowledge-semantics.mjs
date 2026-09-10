@@ -1,4 +1,4 @@
-import { knowledgeIntentConcepts } from "./query-intent.mjs";
+import { knowledgeIntentConcepts } from "./knowledge-concepts.mjs";
 
 // One validator for every path that writes knowledge pages — human save, machine
 // proposal, Markdown sync. The assertions are the consumption-time derivations

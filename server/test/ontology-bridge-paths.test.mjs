@@ -3,8 +3,6 @@ import test from "node:test";
 import { buildLinkGenerationScope, normalizeLinkCandidateOutput } from "../src/ontology-candidate-generator.mjs";
 import { createOntologyCandidateStableKey } from "../src/ontology-candidate-score.mjs";
 import { assembleOntologyDraft } from "../src/ontology-draft-assembler.mjs";
-import { compileSemanticQueryPlan } from "../src/semantic-query-plan.mjs";
-import { guardSql } from "../src/sql-guard.mjs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,14 +16,12 @@ const endpoints=[endpoint("student","students"),endpoint("course","courses")];
 const unique={name:"uq_enrollment",unique:true,members:[{column:"student_id",ordinal:1},{column:"course_id",ordinal:2}]};
 const catalog={tables:["students","courses","enrollments"].map(tableName=>({tableName,active:1})),columnsByTable:{students:[{columnName:"id",isPrimary:1,dataType:"bigint",nullable:0}],courses:[{columnName:"id",isPrimary:1,dataType:"bigint",nullable:0}],enrollments:["student_id","course_id"].map(columnName=>({columnName,dataType:"bigint",nullable:0,keyConstraints:[unique]}))},relations:[{id:1,fromTable:"enrollments",fromCol:"student_id",toTable:"students",toCol:"id",cardinality:"N:1",status:"confirmed"},{id:2,fromTable:"enrollments",fromCol:"course_id",toTable:"courses",toCol:"id",cardinality:"N:1",status:"confirmed"}]};
 
-test("bridge scope proposes a complete business path even without a bridge Object",()=>{
+test("bridge scope proposes a complete business path without a bridge Object",()=>{
   const scope=buildLinkGenerationScope({catalog,endpoints,namespace:"test"});
   const path=scope.relations.find(item=>item.relationIds?.length===2);assert.ok(path);
   const output=normalizeLinkCandidateOutput({candidates:[{pathId:path.pathId,sourceStableKey:endpoints[0].stableKey,targetStableKey:endpoints[1].stableKey,apiName:"enrolled_in",inverseApiName:"has_students",description:"学生选修课程"}]},{run:{scope:{namespace:"test"}},scope});
-  const candidate=output.candidates[0];assert.deepEqual(candidate.payload.relationMappings,[{relationId:1},{relationId:2}]);assert.equal(candidate.payload.cardinality,"many_to_many");
-  const schema={name:"learning",objectTypes:endpoints.map(item=>item.payload),linkTypes:[candidate.payload]};
-  const compiled=compileSemanticQueryPlan({rootObject:"student",dimensions:[{property:"student.id",alias:"student_id"},{property:"course.id",alias:"course_id"}]},{schema,catalog});
-  assert.match(compiled.sql,/JOIN `enrollments`/);assert.match(compiled.sql,/JOIN `courses`/);assert.equal(guardSql(compiled.sql,compiled.policy).ok,true);
+  assert.deepEqual(output.candidates[0].payload.relationMappings,[{relationId:1},{relationId:2}]);
+  assert.equal(output.candidates[0].payload.cardinality,"many_to_many");
 });
 
 test("global completion persists and resumes a bridge path across separate object runs",async()=>{

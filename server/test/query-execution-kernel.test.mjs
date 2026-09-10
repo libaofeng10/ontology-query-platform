@@ -18,7 +18,7 @@ function fixture({ rows = [{ id: 1, label: "ok" }], explainRows = [{ rows: 2 }],
     relations: [],
     enums: {},
   };
-  const kernel = createQueryExecutionKernel({ source: { id: 1 }, connector, catalog, config: { queryMaxRows: 10, explainMaxRows: 100, queryAgentMaxSqlCalls: 3, queryAgentMaxScannedRows: 100, ...config }, question: "", disclosedTables });
+  const kernel = createQueryExecutionKernel({ source: { id: 1 }, connector, catalog, config: { queryMaxRows: 10, explainMaxRows: 100, queryMaxSqlCalls: 3, queryMaxScannedRows: 100, ...config }, question: "", disclosedTables });
   return { kernel, calls };
 }
 
@@ -27,7 +27,7 @@ test("database schema mode accepts unlisted columns and joins without disclosure
   const kernel = createQueryExecutionKernel({ source: { id: 1 }, schemaMode: "database",
     connector: { explain: async () => { calls.push("explain"); return [{ rows: 1 }]; }, query: async () => { calls.push("query"); return [[{ phone: "13800138000" }], [{ name: "phone" }]]; } },
     catalog: { policy: { allowedTables: ["legacy"], allowedColumns: { legacy: ["id"] }, allowedRelations: [] } },
-    config: { queryMaxRows: 2, queryAgentMaxSqlCalls: 1, explainMaxRows: 10 },
+    config: { queryMaxRows: 2, queryMaxSqlCalls: 1, explainMaxRows: 10 },
   });
   const receipt = await kernel.execute({ sql: "SELECT a.phone FROM accounts a JOIN customers c ON a.user_id = c.account_id" });
   assert.equal(receipt.ok, true, receipt.error);
@@ -66,7 +66,7 @@ test("database schema mode still refuses excessive scans before reading business
   let queries = 0;
   const kernel = createQueryExecutionKernel({ source: { id: 1 }, schemaMode: "database",
     connector: { explain: async () => [{ rows: 101 }], query: async () => { queries++; return [[], []]; } },
-    config: { explainMaxRows: 100, queryAgentMaxSqlCalls: 5 },
+    config: { explainMaxRows: 100, queryMaxSqlCalls: 5 },
   });
   assert.equal((await kernel.execute({ sql: "SELECT * FROM accounts" })).ok, false);
   assert.equal(queries, 0);
@@ -86,19 +86,13 @@ test("execution kernel performs the guarded explain/query sequence and registers
   assert.deepEqual(kernel.resolveExecutionIds([result.executionId]), { ok: true, runs: [run] });
 });
 
-test("guard and disclosure failures stop before EXPLAIN or database query", async () => {
+test("guard failures stop before EXPLAIN or database query", async () => {
   const first = fixture();
   const denied = await first.kernel.execute({ sql: "DELETE FROM demo_table" });
   assert.equal(denied.ok, false);
   assert.equal(first.calls.length, 0);
 
-  const undisclosed = fixture({ disclosedTables: [] });
-  const result = await undisclosed.kernel.execute({ sql: "SELECT id FROM demo_table", requireDisclosure: false });
-  assert.equal(result.ok, false);
-  assert.equal(result.code, "DISCLOSURE_REQUIRED");
-  assert.equal(result.stage, "guard");
-  assert.equal(result.retryable, true);
-  assert.equal(undisclosed.calls.length, 0);
+
 });
 
 test("execution IDs are scoped to the kernel and duplicate or unknown IDs fail closed", async () => {
@@ -113,7 +107,7 @@ test("execution IDs are scoped to the kernel and duplicate or unknown IDs fail c
 });
 
 test("EXPLAIN scan limits apply per query and cumulatively", async () => {
-  const { kernel, calls } = fixture({ explainRows: [{ rows: 60 }], config: { explainMaxRows: 100, queryAgentMaxScannedRows: 100 } });
+  const { kernel, calls } = fixture({ explainRows: [{ rows: 60 }], config: { explainMaxRows: 100, queryMaxScannedRows: 100 } });
   const first = await kernel.execute({ sql: "SELECT id FROM demo_table" });
   assert.equal(first.ok, true);
   const second = await kernel.execute({ sql: "SELECT id FROM demo_table" });
@@ -157,7 +151,7 @@ test("kernel caps connector over-return and marks the receipt incomplete", async
   assert.deepEqual(kernel.getRun(result.executionId).rows, [{ id: 1 }, { id: 2 }]);
 });
 
-test("sensitive columns can be used as typed filters and are selectable unless a policy explicitly forbids output", async () => {
+test("sensitive columns can be used as typed filters and are selectable without ontology restrictions", async () => {
   const calls = [];
   const connector = { explain: async () => [{ rows: 1 }], query: async (_source, sql) => { calls.push(sql); return [[{ id: 1 }], [{ name: "id" }]]; } };
   const catalog = {
@@ -177,16 +171,7 @@ test("sensitive columns can be used as typed filters and are selectable unless a
   assert.equal(noLongerForbidden.ok, true, noLongerForbidden.error);
   assert.equal(calls.length, 2);
 
-  // sql-guard 的 SENSITIVE_OUTPUT_FORBIDDEN 机制本身仍在：调用方显式传入
-  // policy.forbiddenOutputColumns 时依然生效。
-  const kernelWithExplicitPolicy = createQueryExecutionKernel({
-    source: { id: 1 }, connector, disclosedTables: ["demo_table"],
-    catalog: { ...catalog, policy: guardPolicy },
-    config: { queryMaxRows: 10 },
-  });
-  const forbidden = await kernelWithExplicitPolicy.execute({ sql: "SELECT mobile FROM demo_table" });
-  assert.equal(forbidden.ok, false);
-  assert.equal(forbidden.code, "SENSITIVE_OUTPUT_FORBIDDEN");
+
 });
 
 test("snapshot-style sensitive flag no longer drives kernel output denial without an explicit policy", async () => {
@@ -203,67 +188,4 @@ test("snapshot-style sensitive flag no longer drives kernel output denial withou
   // forbiddenOutputColumns，因此没有显式 policy 时该列可以正常被查询。
   const result = await kernel.execute({ sql: "SELECT phone FROM demo_table" });
   assert.equal(result.ok, true, result.error);
-});
-
-test("policy overrides can only narrow catalog tables, columns, relations, and output denies", async () => {
-  const relation = { id: 7, fromTable: "demo_table", fromCol: "id", toTable: "other_table", toCol: "demo_id" };
-  const calls = [];
-  const connector = {
-    async explain(_source, sql) { calls.push({ kind: "explain", sql }); return [{ rows: 1 }]; },
-    async query() { calls.push({ kind: "query" }); return [[{ id: 1 }], [{ name: "id" }]]; },
-  };
-  const kernel = createQueryExecutionKernel({
-    source: { id: 1 }, connector, disclosedTables: ["demo_table", "other_table"], forbidSensitiveOutput: true,
-    catalog: {
-      columnsByTable: {
-        demo_table: [{ columnName: "id" }, { columnName: "secret", isSensitive: 1 }],
-        other_table: [{ columnName: "demo_id" }],
-      },
-      policy: {
-        allowedTables: ["demo_table", "other_table"],
-        allowedColumns: { demo_table: ["id", "secret"], other_table: ["demo_id"] },
-        allowedRelations: [relation],
-        forbiddenOutputColumns: ["demo_table.secret"],
-        maxRows: 10,
-      },
-      relations: [relation],
-    },
-    config: { queryMaxRows: 10 },
-  });
-
-  const widenedTable = await kernel.execute({
-    sql: "SELECT id FROM unknown_table",
-    policy: { allowedTables: ["unknown_table"], allowedColumns: { unknown_table: ["id"] } },
-  });
-  assert.equal(widenedTable.ok, false);
-  assert.equal(widenedTable.code, "UNKNOWN_TABLE");
-
-  const clearedSensitiveDeny = await kernel.execute({
-    sql: "SELECT secret FROM demo_table",
-    policy: { allowedTables: ["demo_table"], allowedColumns: { demo_table: ["secret"] }, forbiddenOutputColumns: [] },
-  });
-  assert.equal(clearedSensitiveDeny.ok, false);
-  assert.equal(clearedSensitiveDeny.code, "SENSITIVE_OUTPUT_FORBIDDEN");
-
-  const omittedColumnTable = await kernel.execute({
-    sql: "SELECT demo_id FROM other_table",
-    policy: { allowedColumns: { demo_table: ["id"] } },
-  });
-  assert.equal(omittedColumnTable.ok, false);
-  assert.equal(omittedColumnTable.code, "UNKNOWN_COLUMN");
-
-  const widenedRelation = await kernel.execute({
-    sql: "SELECT d.id FROM demo_table d JOIN other_table o ON d.id = o.demo_id",
-    policy: { allowedTables: ["demo_table", "other_table"], allowedColumns: { demo_table: ["id"], other_table: ["demo_id"] }, allowedRelations: [{ id: 999, fromTable: "demo_table", fromCol: "secret", toTable: "other_table", toCol: "demo_id" }] },
-  });
-  assert.equal(widenedRelation.ok, false);
-  assert.equal(widenedRelation.code, "UNCONFIRMED_RELATION");
-  assert.equal(calls.filter((item) => item.kind === "query").length, 0);
-
-  const narrowed = await kernel.execute({
-    sql: "SELECT id FROM demo_table",
-    policy: { allowedTables: ["demo_table"], allowedColumns: { demo_table: ["id"] }, allowedRelations: [] },
-  });
-  assert.equal(narrowed.ok, true, narrowed.reason);
-  assert.equal(kernel.registry.resolve([narrowed.executionId]).ok, true);
 });

@@ -1,6 +1,6 @@
-import { encryptCredential } from "./crypto.mjs";
-import { createSemanticSchemaService } from "./semantic-schema-service.mjs";
-import { gradeTable } from "./table-grading.mjs";
+import { createTestSource } from "./test-source.mjs";
+import { createSemanticSchemaService } from "../../src/semantic-schema-service.mjs";
+import { gradeTable } from "../../src/table-grading.mjs";
 
 const tables = [
   { tableName:"crm_customer", rowEstimate:3_482_600, inboundRelations:4, daysSinceWrite:0, comment:"CRM 客户主档，一客户一行" },
@@ -20,9 +20,9 @@ const columns = {
   sales_refund: [["refund_id","bigint",1,"退款编号"],["refund_no","varchar",0,"业务退款号"],["order_no","varchar",0,"订单号"],["amount","bigint",0,"退款金额，分"],["refund_status","tinyint",0,"退款状态"],["refunded_at","datetime",0,"退款时间"]],
 };
 
-export function seedDemo(store, appSecret) {
-  let source = store.listSources().find((item)=>item.isDemo);
-  if(!source) source = store.createSource({ name:"演示数据源", kind:"demo", host:"localhost", port:3306, dbName:"billing_demo", userName:"readonly_demo", credential:encryptCredential("demo",appSecret), isDemo:true });
+// Explicit synthetic commerce catalog for tests only. No runtime startup hook.
+export function createCommerceCatalog(store) {
+  const source=createTestSource(store,{name:"commerce-fixture"});
   for (const table of tables) {
     const result = gradeTable(table);
     store.upsertTable({ sourceId:source.id, ...table, grade:result.grade, active:result.grade === "C" ? 0 : 1 });
@@ -45,17 +45,18 @@ export function seedDemo(store, appSecret) {
     {pageType:"metric",slug:"复购率",title:"复购率",aliases:["客户复购率"],tables:["crm_customer","sales_order"],content:"周期内下单不少于两次的有效客户，占当期有下单有效客户的比例。",sqlContent:"SELECT COUNT(DISTINCT CASE WHEN order_cnt >= 2 THEN customer_id END) / COUNT(DISTINCT customer_id) AS repurchase_rate FROM (...) t",antiExamples:"按 pay_time 而不是 create_time 过滤。"},
     {pageType:"metric",slug:"支付成功率",title:"支付成功率",aliases:["支付通过率"],tables:["payment_transaction"],content:"成功支付笔数占全部有效支付尝试的比例。",sqlContent:"SUM(pay_status = 20) / COUNT(*)",antiExamples:"主动关闭的支付单不进入分母。"},
     {pageType:"term",slug:"退款金额",title:"退款金额",aliases:["退费金额"],tables:["sales_refund"],content:"退款成功记录的退款金额，底层单位为分，展示时换算为元。",sqlContent:"sales_refund.amount / 100.0",antiExamples:"退款申请中状态不计入已退款金额。"},
-  ]) store.upsertKnowledge({sourceId:source.id,...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),verified:1,owner:"演示数据维护者",verifiedAt:"2026-08-12T00:00:00.000Z"});
+  ]) store.upsertKnowledge({sourceId:source.id,...page,aliases:JSON.stringify(page.aliases),tablesJson:JSON.stringify(page.tables),verified:1,owner:"fixture",verifiedAt:"2026-08-12T00:00:00.000Z"});
   if(!store.listOntologySchemaVersions(source.id).length) {
     const semanticSchemas=createSemanticSchemaService({store});
-    const draft=semanticSchemas.saveDraft(source.id,demoSemanticSchema(customerOrder.id,orderPayment.id),"demo-seed");
-    if(draft.validation.ok) semanticSchemas.publish(draft.id,"demo-seed");
+    const draft=semanticSchemas.saveDraft(source.id,commerceSchema(customerOrder.id,orderPayment.id),"commerce-fixture");
+    if(draft.validation.ok) semanticSchemas.publish(draft.id,"commerce-fixture");
   }
+  return store.getSource(source.id);
 }
 
-function demoSemanticSchema(customerOrderRelationId,orderPaymentRelationId) {
+function commerceSchema(customerOrderRelationId,orderPaymentRelationId) {
   return {
-    name:"billing",displayName:"客户交易本体",description:"演示客户、订单和支付的业务对象与物理数据映射",
+    name:"billing",displayName:"客户交易本体",description:"测试客户、订单和支付的业务对象与物理数据映射",
     objectTypes:[
       {apiName:"customer",displayName:"客户",description:"CRM 客户主档中的业务客户",primaryKey:"customer_id",properties:[
         {apiName:"customer_id",displayName:"客户编号",type:"integer",required:true,mapping:{table:"crm_customer",column:"customer_id"}},

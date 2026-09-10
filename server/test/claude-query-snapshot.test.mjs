@@ -191,7 +191,7 @@ test("a matched business definition includes its mapped objects and allowed tabl
   assert.deepEqual(snapshot.read({ operation: "get_knowledge", query: "不存在的定义" }).tables, []);
 });
 
-test("snapshot overview retains required execution evidence without copying arbitrary retrieval data", () => {
+test("snapshot ignores retired platform planning and retrieval contracts", () => {
   const snapshot = fixture({
     queryIntent: { requirements: [{ id: "subject:customer", kind: "subject", value: "customer", required: true }] },
     retrievalEvidence: [{ diagnostics: {
@@ -203,9 +203,7 @@ test("snapshot overview retains required execution evidence without copying arbi
     } }],
   });
   const contract = snapshot.read("overview").executionContract;
-  assert.ok(contract);
-  assert.deepEqual(contract.slots[0].tables, ["crm_customer"]);
-  assert.deepEqual(contract.slots[0].executionValidityPredicates, [{ column: "crm_customer.is_deleted", operator: "eq", value: 0 }]);
+  assert.equal(contract,null);
   assert.equal(snapshot.disclosedTables.size, 0);
   assert.doesNotMatch(JSON.stringify(snapshot), /private-provider-key|injected-instruction/);
 });
@@ -307,7 +305,7 @@ test("snapshot leaves typed literals in model-visible catalog and knowledge text
   assert.doesNotMatch(serialized, /\[REDACTED\]/);
 });
 
-test("snapshot leaves typed literals represented as numeric intent values unmodified", () => {
+test("snapshot does not carry platform intent state", () => {
   const built = fixture({
     queryIntent: {
       version: "2.0",
@@ -317,7 +315,5 @@ test("snapshot leaves typed literals represented as numeric intent values unmodi
       entities: [{ type: "phone", value: 13800138000 }],
     },
   });
-  const serialized = JSON.stringify(built.queryIntent);
-  assert.match(serialized, /13800138000/);
-  assert.doesNotMatch(serialized, /\[REDACTED\]/);
+  assert.equal(built.queryIntent,null);
 });

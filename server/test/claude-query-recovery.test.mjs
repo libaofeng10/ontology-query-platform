@@ -10,7 +10,7 @@ function setup({maxSqlCalls=5,explain=async()=>[{rows:1}],query=async()=>[[],[]]
   const columnsByTable={office:[{columnName:'id',dataType:'varchar',comment:'系统所属机构ID'},{columnName:'name',dataType:'varchar',comment:'机构名称'}],users:[{columnName:'id'},{columnName:'office_id',comment:'所属机构ID'},{columnName:'office_name',comment:'所属机构名称'},{columnName:'name'},{columnName:'phone'},{columnName:'activated_at'},{columnName:'expires_at'}]};
   const catalog={tables:Object.keys(columnsByTable).map(tableName=>({tableName})),columnsByTable};
   const snapshot=createClaudeQuerySnapshot({sourceId:1,published:{sourceId:1,version:14,status:'published',schema:{name:'accounts',objectTypes:[],linkTypes:[]}},catalog});
-  const kernel=createQueryExecutionKernel({source:{id:1},schemaMode,catalog,disclosedTables:['office','users'],connector:{explain,query},config:{queryMaxRows:100,maxSqlCalls,queryAgentMaxSqlCalls:maxSqlCalls,explainMaxRows:100}});
+  const kernel=createQueryExecutionKernel({source:{id:1},schemaMode,catalog,disclosedTables:['office','users'],connector:{explain,query},config:{queryMaxRows:100,maxSqlCalls,queryMaxSqlCalls:maxSqlCalls,explainMaxRows:100}});
   return {snapshot,kernel};
 }
 

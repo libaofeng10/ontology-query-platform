@@ -163,7 +163,7 @@ export type EvalInput = { sourceId:number; setName:string; question:string; gold
 export type EvaluationRepairHint = { targetType:"object"|"property"|"link"; target:string; label:string; action:string };
 export type EvalRun = { id:number; evalId:number; batchId:string; setName:string; question:string; generatedSql:string|null; passed:number; failReason:string|null; durationMs:number|null; failureClass:string|null; suggestion:string|null; repairHints:EvaluationRepairHint[]; requestedMode:"off"|"prefer"|"single"|"agent_prefer"|"agent_required"|"claude_prefer"|"claude_required"|null; planningMode:Exclude<QueryPlanningMode,"demo">|null; comparisonRole:"baseline"|"candidate"|null; ontologySchemaVersion:number|null; semanticPath:SemanticQueryPath|null; tableCount:number|null; planningAttempts:number|null; agentMetrics:{agentExecution:number;iterations:number;toolCalls:number;toolSuccesses:number;clarificationCount:number;budgetFallback:number;repeatedActions:number;intentFailures:number;incompleteFailures:number;totalTokens:number|null}|null; runAt:string };
 export type EvaluationSummary = { batchId:string; setName:string; queryAgentMode?:ClaudeQueryMode; claudeQueryMode?:ClaudeQueryMode; total:number; passed:number; failed:number; failures:Array<{evalId:number;question:string;failureClass:string;reason:string;suggestion:string;repairHints:EvaluationRepairHint[]}> };
-export type EvaluationGateMetrics = { gateKind?:"agent"|"claude"; requestedMode:"off"|"prefer"|"single"|"agent_required"|"claude_prefer"|"claude_required"; total:number; passed:number; failed:number; refused:number; passRate:number; averageDurationMs:number; joinFailures?:number; semanticExecutions?:number; joinFailureRate?:number; refusalRate:number; semanticExecutionRate?:number; subtypeRootObjects?:string[]; subtypeRootCoverage?:number; averageContextTables?:number; averagePlanningAttempts?:number; agentExecutions?:number; agentExecutionRate?:number; averageIterations?:number; toolCalls?:number; toolSuccesses?:number; toolSuccessRate?:number; clarifications?:number; clarificationRate?:number; budgetFallbacks?:number; budgetFallbackRate?:number; repeatedActions?:number; repeatedActionRate?:number; intentFailures?:number; intentFailureRate?:number; incompleteFailures?:number; incompleteFailureRate?:number; p95DurationMs?:number; tokenCoverage?:number; averageTokens?:number; p95Tokens?:number };
+export type EvaluationGateMetrics = { gateKind?:"agent"|"claude"; requestedMode:"off"|"prefer"|"single"|"agent_required"|"claude_prefer"|"claude_required"; total:number; passed:number; failed:number; refused:number; passRate:number; averageDurationMs:number; joinFailures?:number; semanticExecutions?:number; joinFailureRate?:number; refusalRate:number; claudeExecutionRate?:number; subtypeRootObjects?:string[]; subtypeRootCoverage?:number; averageContextTables?:number; averagePlanningAttempts?:number; agentExecutions?:number; agentExecutionRate?:number; averageIterations?:number; toolCalls?:number; toolSuccesses?:number; toolSuccessRate?:number; clarifications?:number; clarificationRate?:number; budgetFallbacks?:number; budgetFallbackRate?:number; repeatedActions?:number; repeatedActionRate?:number; intentFailures?:number; intentFailureRate?:number; incompleteFailures?:number; incompleteFailureRate?:number; p95DurationMs?:number; tokenCoverage?:number; averageTokens?:number; p95Tokens?:number };
 export type EvaluationGate = { id:string; sourceId:number; setName:string; total:number; ontologySchemaVersion:number|null; ontologySchemaPublishedAt?:string|null; evaluationChecksum?:string|null; baseline:EvaluationGateMetrics; candidate:EvaluationGateMetrics; passed:number|boolean; decision:"enable_prefer"|"enable_agent_prefer"|"enable_claude_prefer"|"keep_off"; reason:string; createdAt:string };
 export type EvaluationGateSummary = { batchId:string; gateKind?:"agent"|"claude"; setName:string; total:number; ontologySchemaVersion:number|null; ontologySchemaPublishedAt?:string|null; baseline:EvaluationGateMetrics; candidate:EvaluationGateMetrics; passed:boolean; decision:"enable_prefer"|"enable_agent_prefer"|"enable_claude_prefer"|"keep_off"; reason:string; failures:EvaluationSummary["failures"] };
 
@@ -276,7 +276,7 @@ export type OntologyCalibrationReport={
   counts:{runs:number;staleRuns:number;excludedStaleRuns:number;candidates:number;objects:number;links:number;labels:number;invalidLabels:number;autoEligible:number;labeledAuto:number;correctAuto:number;unlabeledAuto:number;manualObjectCount:number;finalObjectCount:number};
   quality:{precision:number|null;physicalMappingErrors:number;sensitiveAutoConfirmed:number;unconfirmedJoinAutoConfirmed:number;autoWithdrawnCount:number;autoWithdrawnRate:number;duplicateCount:number;duplicateRate:number;modifiedCount:number;humanModificationRate:number;majorModificationCount:number;majorModificationRate:number;manualObjectRate:number};
   runtime:{callCount:number;failures:number;failureRate:number;totalTokens:number;averageTokens:number;averageLatencyMs:number;p95LatencyMs:number};
-  downstream:{goldEquivalenceRate:number|null;semanticExecutionRate:number|null;joinFailureRate:number|null;draftsCreated:number;draftsPublished:number;draftPublicationRate:number|null;schemaValidationPassRate:number|null};
+  downstream:{goldEquivalenceRate:number|null;claudeExecutionRate:number|null;joinFailureRate:number|null;draftsCreated:number;draftsPublished:number;draftPublicationRate:number|null;schemaValidationPassRate:number|null};
   scoreBuckets:Array<{range:string;total:number;labeled:number;accepted:number;acceptanceRate:number|null}>;
   issueTypeSummary:Array<{issueType:string;count:number;ratio:number}>;ruleSuggestions:Array<{issueType:string;sampleCount:number;count:number;ratio:number;action:string;forcedReviewReason:string;scorePenalty:number}>;
   thresholdSuggestion:{targetPrecision:number;suggestedScore:number|null;labeledCount:number;correctCount:number;precision:number|null};settingDraft:{sourceId:number;autoConfirmScore:number;runIds:string[]}|null;
@@ -289,11 +289,8 @@ export type OntologyCalibrationReport={
 export type OntologyCalibrationGate={id:string;sourceId:number;runIds:string[];draftSchemaVersionId:number|null;evalGateId:string|null;manualObjectCount:number;finalObjectCount:number;metrics:OntologyCalibrationReport;passed:boolean;decision:"enable_auto_draft"|"keep_review";reason:string;createdBy:string;createdAt:string;activatedBy:string|null;activatedAt:string|null};
 
 export type MaskedSecret = { set:boolean; masked?:string };
-export type QueryPromptKey = "agentSystem"|"agentQuestion"|"legacySqlPlanner"|"semanticPlanner"|"resultSummary";
-export type QueryPromptMap = Record<QueryPromptKey,string>;
-export type QueryPromptMeta = Record<QueryPromptKey,{label:string;description:string;variables:string[]}>;
 export type ClaudeQuerySettings = {
-  mode:ClaudeQueryMode; trafficPercent:number; binary:string; model:string; promptVersion:string;
+  binary:string; model:string; promptVersion:string;
   timeoutMs:number; maxTurns:number; maxBudgetUsd:number; maxConcurrency:number; queueTimeoutMs:number; maxStdioBytes:number;
 };
 export type SettingsData = {
@@ -302,12 +299,9 @@ export type SettingsData = {
   retrieval:{ vectorEnabled:boolean; vectorWeight:number; minSimilarity:number; semanticThreshold:number };
   discovery:{enumMaxDistinctRatio:number};
   profiling:{enabled:boolean;sampleLimit:number;maxTablesPerRefresh:number;timeoutMs:number};
-  query:{ semanticQueryPlanMode:"off"|"prefer"|"required"; queryAgentMode:"off"|"prefer"|"required"; queryAgentTrafficPercent:number; queryAgentMaxIterations:number; queryAgentMaxSqlCalls:number; queryAgentMaxScannedRows:number; queryAgentPendingTtlMs:number; queryMaxRows:number; explainMaxRows:number; queryTimeoutMs:number; queryLlmTimeoutMs:number };
+  query:{ queryMaxSqlCalls:number; queryMaxScannedRows:number; queryPendingTtlMs:number; queryMaxRows:number; explainMaxRows:number; queryTimeoutMs:number };
   claudeQuery:ClaudeQuerySettings;
   ontologyAi:{mode:"off"|"review"|"auto_draft";autoConfirmScore:number;maxTables:number;maxFields:number;timeoutMs:number;criticEnabled:boolean;calibrationMinSamples:number;calibrationMinPrecision:number;maxManualObjectRate:number;maxFailureRate:number;maxP95LatencyMs:number;maxAverageTokens:number};
-  prompts:QueryPromptMap;
-  promptMeta:QueryPromptMeta;
-  promptDefaults:QueryPromptMap;
   sources:Record<string,"db"|"env"|"default"|"override">;
   locked:string[];
 };
@@ -317,10 +311,9 @@ export type SettingsInput = {
   retrieval?:Partial<{ vectorEnabled:boolean; vectorWeight:number; minSimilarity:number; semanticThreshold:number }>;
   discovery?:Partial<{enumMaxDistinctRatio:number}>;
   profiling?:Partial<{enabled:boolean;sampleLimit:number;maxTablesPerRefresh:number;timeoutMs:number}>;
-  query?:Partial<{ semanticQueryPlanMode:"off"|"prefer"|"required"; queryAgentMode:"off"|"prefer"|"required"; queryAgentTrafficPercent:number; queryAgentMaxIterations:number; queryAgentMaxSqlCalls:number; queryAgentMaxScannedRows:number; queryAgentPendingTtlMs:number; queryMaxRows:number; explainMaxRows:number; queryTimeoutMs:number; queryLlmTimeoutMs:number }>;
+  query?:Partial<{ queryMaxSqlCalls:number; queryMaxScannedRows:number; queryPendingTtlMs:number; queryMaxRows:number; explainMaxRows:number; queryTimeoutMs:number }>;
   claudeQuery?:Partial<Omit<ClaudeQuerySettings,"binary"|"model"|"promptVersion">>;
   ontologyAi?:Partial<{mode:"off"|"review"|"auto_draft";autoConfirmScore:number;maxTables:number;maxFields:number;timeoutMs:number;criticEnabled:boolean;calibrationMinSamples:number;calibrationMinPrecision:number;maxManualObjectRate:number;maxFailureRate:number;maxP95LatencyMs:number;maxAverageTokens:number}>;
-  prompts?:Partial<Record<QueryPromptKey,string|null>>;
 };
 export type RelationDocumentAssertion={fromTable:string;fromColumn:string;toTable:string;toColumn:string;cardinality:string|null;evidenceQuote:string|null;accepted:boolean;reason:string|null;relationId:number|null;overlapRatio:number|null};
 export type RelationDocument={id:string;sourceId:number;fileName:string;checksum:string;status:"processed"|"failed";assertions:RelationDocumentAssertion[];assertionCount:number;acceptedCount:number;rejectedCount:number;error:string|null;createdBy:string|null;createdAt:string;idempotent?:boolean};

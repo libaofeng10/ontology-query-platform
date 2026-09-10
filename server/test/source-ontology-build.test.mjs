@@ -12,6 +12,7 @@ import { scoreOntologyCandidate } from "../src/ontology-candidate-score.mjs";
 import { createTaskService } from "../src/task-service.mjs";
 import { createSemanticSchemaService } from "../src/semantic-schema-service.mjs";
 import { evalSetChecksum } from "../src/evaluation-evidence.mjs";
+import { createCommerceCatalog } from "./fixtures/commerce-catalog.mjs";
 import { buildIssueId } from "../src/ontology-build-issues.mjs";
 
 async function fixture({mode="review",pausePlan=Promise.resolve(),firstBuild=false,candidateTransform=(candidate)=>candidate,onGenerate=()=>{},onScore=()=>{},similarity=()=>.9,splitDomains=false,generateLinks=null,verifier=false}={}) {
@@ -20,10 +21,16 @@ async function fixture({mode="review",pausePlan=Promise.resolve(),firstBuild=fal
     dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"source-build-test-secret",nodeEnv:"test",claudeBridge:null,
     llm:{baseUrl:"",apiKey:"",model:""},embedding:{enabled:false},profiling:{enabled:false},
     ontologyAi:{mode,criticEnabled:false,maxTables:20,maxFields:600,auditDir:join(root,"audit")},
+    relationModelService:{judge:async(candidates)=>({status:"completed",decisions:candidates.map(item=>({candidateId:item.id,decision:"reject",confidence:1,reason:"fixture"}))})},
     ontologyCandidateVerifier:verifier,
     ontologyCandidateScorer:{score:async(candidate,options)=>{await onScore(candidate,options);return scoreOntologyCandidate(candidate,{...options,semanticSimilarity:similarity(candidate)});}},
     apiIdentities:[{name:"viewer",role:"viewer",token:"viewer",sourceIds:[1]},{name:"editor",role:"editor",token:"editor",sourceIds:"*"}],
-    connector:{close:async()=>{},query:async()=>[[],[]],explain:async()=>[]},
+    connector:{close:async()=>{},query:async(source,sql)=>{
+      if(sql.includes("information_schema.TABLES"))return [app.store.listTables(source.id).map(table=>({...table,updateTime:new Date().toISOString()})),[]];
+      if(sql.includes("information_schema.COLUMNS"))return [app.store.listTables(source.id).flatMap(table=>app.store.listColumns(source.id,table.tableName).map(column=>({...column,keyConstraints:undefined,nullable:column.nullable?"YES":"NO"}))),[]];
+      if(sql.includes("information_schema.KEY_COLUMN_USAGE"))return [app.store.listRelations(source.id,true),[]];
+      return [[],[]];
+    },explain:async()=>[]},
     rateLimits:{queryPerMinute:100,readPerMinute:1000,writePerMinute:1000},
     ontologyDomainPlanner:{plan:async()=>{
       await pausePlan;
@@ -41,6 +48,7 @@ async function fixture({mode="review",pausePlan=Promise.resolve(),firstBuild=fal
       return {candidates:items,calls:[],tokenUsage:{promptTokens:0,completionTokens:0,totalTokens:0},normalizationIssues:[]};
     }},
   });
+  createCommerceCatalog(app.store);
   if(firstBuild){app.store.db.prepare("DELETE FROM ds_ontology_publication WHERE source_id=1").run();app.store.db.prepare("DELETE FROM ds_ontology_schema_version WHERE source_id=1").run();}
   const selections=app.store.listTables(1).map((table)=>({tableName:table.tableName,included:table.tableName==="crm_customer"}));
   return {app,selections,close:async()=>{await app.close();await rm(root,{recursive:true,force:true});}};
@@ -64,7 +72,7 @@ test("自动构建先核验低分定义，有证据则继续构建且没有人�
   }}});
   try{
     const start=await api(app,"/api/sources/1/ontology-build",{selections}),task=await waitForTask(app,start.body.id);
-    assert.equal(task.status,"succeeded",task.error);assert.equal(task.payload.sourceBuild.phase,"ready");assert.deepEqual(task.payload.sourceBuild.questions,[]);assert.equal(calls,1);
+    assert.equal(task.status,"succeeded",task.error);assert.equal(task.payload.sourceBuild.phase,"ready",JSON.stringify(task.payload.sourceBuild.questions));assert.deepEqual(task.payload.sourceBuild.questions,[]);assert.equal(calls,1);
     const candidate=app.store.listOntologyCandidates({runId:task.payload.sourceBuild.generation.runIds[0]})[0];assert.ok(candidate.score<85);assert.ok(candidate.evidence.some(item=>item.kind==="automatic_verification"&&item.verified));
   }finally{await close();}
 });
@@ -236,7 +244,7 @@ test("首次选表一次完成自动合并与启用，同一结构更新不创�
 });
 
 test("业务说明直接保存自动启用；接入新增表继承人工修改和版本历史",async()=>{
-  const {app,selections,close}=await fixture({mode:"auto_draft",firstBuild:true});
+  const {app,selections,close}=await fixture({mode:"auto_draft",firstBuild:true,generateLinks:completeLinks});
   try {
     const additionalTable=app.store.listTables(1).find((table)=>table.tableName==="sales_order");
     const additionalColumns=app.store.listColumns(1,"sales_order");
@@ -251,7 +259,7 @@ test("业务说明直接保存自动启用；接入新增表继承人工修改�
     assert.equal(v2.version,2);assert.equal(v2.schema.objectTypes[0].description,"人工明确：已签约且尚在服务期的客户");
     assert.equal((await api(app,"/api/sources/1/ontology-build/correct",{versionId:v1.id,objectName:object.apiName,displayName:"过期",description:"不应覆盖"})).status,409);
     const changed=selections.map((item)=>({...item,included:["crm_customer","sales_order"].includes(item.tableName)}));
-    // The demo catalog is also its physical database; introduce a table there.
+    // The test connector reads its physical catalog from the fixture store.
     app.store.upsertTable({...additionalTable,sourceId:1});
     for(const column of additionalColumns)app.store.upsertColumn({...column,sourceId:1,tableName:"sales_order"});
     const next=await api(app,"/api/sources/1/ontology-build",{selections:changed});
@@ -500,7 +508,7 @@ test("后台按候选版本执行所需评测，浏览器不参与；缺少依�
     const evaluation={runGate:async({task:gateTask,payload})=>{
       calls++;assert.equal(payload.ontologySchemaVersionId,draft.id);assert.equal(payload.setName,"business_checks");
       const setCases=cases.filter((item)=>item.setName===payload.setName);
-      app.store.saveEvalGate({id:gateTask.id,sourceId:1,setName:payload.setName,total:setCases.length,ontologySchemaVersion:draft.version,ontologySchemaPublishedAt:null,evaluationChecksum:evalSetChecksum(setCases),baseline:{requestedMode:"off",passRate:1},candidate:{requestedMode:"prefer",passRate:1,semanticExecutionRate:1},passed:1,decision:"enable_prefer",reason:"approved business cases"});
+      app.store.saveEvalGate({id:gateTask.id,sourceId:1,setName:payload.setName,total:setCases.length,ontologySchemaVersion:draft.version,ontologySchemaPublishedAt:null,evaluationChecksum:evalSetChecksum(setCases),baseline:{requestedMode:"gold",passRate:1},candidate:{requestedMode:"claude",passRate:1,claudeExecutionRate:1},passed:1,decision:"enable_claude",reason:"approved business cases"});
       return {passed:true};
     }};
     const build=createSourceOntologyBuildService({store:app.store,semanticSchemas:schemas,evaluation,config:{ontologyAi:{mode:"auto_draft"}}});

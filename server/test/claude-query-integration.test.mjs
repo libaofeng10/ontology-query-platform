@@ -59,7 +59,7 @@ test("Claude queries unmapped tables and columns with an unregistered JOIN befor
         query: async (_source, sql) => { calls.push(["query", sql]); return [[{ phone: "13800138000" }], [{ name: "phone" }]]; },
       },
       claudeMcpFactory: async options => createClaudeQueryMcpSession({ ...options, listen: false }),
-      config: { llm: {}, queryMaxRows: 100, explainMaxRows: 1000, queryAgentMaxSqlCalls: 5, claudeQuery: { mode: "required", model: "fake", maxBudgetUsd: 1, requireApiKey: false } },
+      config: { llm: {}, queryMaxRows: 100, explainMaxRows: 1000, queryMaxSqlCalls: 5, claudeQuery: { mode: "required", model: "fake", maxBudgetUsd: 1, requireApiKey: false } },
     });
     const answer = await service.ask({ sourceId: source.id, question: "查询客户对应产品账号", userName: "tester", onEvent: event => events.push(event) });
     assert.equal(answer.refused, undefined, answer.reason);
@@ -91,7 +91,7 @@ test("Claude cannot report no usage from an auxiliary result after an unexecuted
       connector: { explain: async () => [{ rows: 1 }], query: async () => { executed++; return [[], [{ name: "customer_id" }]]; } },
       claudeBridge: bridge,
       claudeMcpFactory: async (options) => createClaudeQueryMcpSession({ ...options, listen: false }),
-      config: { llm: {}, queryMaxRows: 100, explainMaxRows: 1_000, queryAgentMaxSqlCalls: 1, claudeQuery: { mode: "required", model: "fake", maxBudgetUsd: 1, requireApiKey: false } },
+      config: { llm: {}, queryMaxRows: 100, explainMaxRows: 1_000, queryMaxSqlCalls: 1, claudeQuery: { mode: "required", model: "fake", maxBudgetUsd: 1, requireApiKey: false } },
     });
     const answer = await service.ask({ sourceId: source.id, question: "查询客户 GPT 使用情况", userName: "tester" });
     assert.equal(answer.refused, true);
@@ -224,8 +224,8 @@ test("query service routes a required Claude attempt through snapshot, MCP, kern
         llm: {},
         queryMaxRows: 100,
         explainMaxRows: 1_000,
-        queryAgentMaxSqlCalls: 5,
-        queryAgentMaxScannedRows: 1_000,
+        queryMaxSqlCalls: 5,
+        queryMaxScannedRows: 1_000,
         claudeQuery: { mode: "required", trafficPercent: 100, model: "fake", maxBudgetUsd: 1 },
       },
     });
@@ -332,7 +332,7 @@ test("Claude reads business definitions without a platform intent contract in it
     assert.doesNotMatch(receivedPrompt, /本轮执行合同：|已解析意图|当前检索证据/);
     assert.match(receivedPrompt, /用户问题：查询手机号 13800138000 对应客户/);
     assert.equal(receivedOverview.data.executionContract, null);
-    assert.equal(answer.evidence.queryIntent, null);
+    assert.equal("queryIntent" in answer.evidence, false);
     assert.deepEqual(answer.evidence.pages, ["客户"]);
   } finally {
     await bridge.close();
@@ -349,6 +349,7 @@ test("Claude questions containing typed literals proceed into the bridge instead
   try {
     const service = createQueryService({
       store,
+      claudeMcpFactory: options=>createClaudeQueryMcpSession({...options,listen:false}),
       connector: { explain: async () => [{ rows: 1 }], query: async () => [[], []] },
       claudeBridge: { run: async () => { bridgeCalls += 1; return { status: "answered" }; } },
       config: {
@@ -378,76 +379,6 @@ test("Claude questions containing typed literals proceed into the bridge instead
   }
 });
 
-test("prefer Claude infrastructure failure falls back to the configured legacy planner", async () => {
-  const { store, source } = await fixture();
-  const connector = { explain: async () => [{ rows: 1 }], query: async () => [[{ customer_id: 7 }], [{ name: "customer_id" }]] };
-  const bridge = { run: async () => ({ status: "failed", reason: "CLI 不可用", failureClass: "cli_unavailable", iterations: 0, toolTrace: [] }) };
-  const originalFetch = globalThis.fetch;
-  let calls = 0;
-  globalThis.fetch = async () => {
-    calls += 1;
-    const content = calls === 1 ? JSON.stringify({ sql: "SELECT customer_id FROM crm_customer" }) : JSON.stringify({ conclusion: "查询到客户编号 7。" });
-    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200, headers: { "content-type": "application/json" } });
-  };
-  try {
-    const service = createQueryService({
-      store,
-      connector,
-      claudeBridge: bridge,
-      config: {
-        llm: { baseUrl: "http://llm.test/v1", apiKey: "test", model: "test" },
-        queryMaxRows: 100,
-        explainMaxRows: 1_000,
-        semanticQueryPlanMode: "off",
-        queryAgentMode: "off",
-        claudeQuery: { mode: "prefer", trafficPercent: 100, model: "fake", maxBudgetUsd: 1 },
-      },
-    });
-    const answer = await service.ask({ sourceId: source.id, question: "查询客户", userName: "tester" });
-    assert.equal(answer.evidence.planningMode, "legacy");
-    assert.equal(calls, 2);
-    const audits = store.listAudits(source.id, 5);
-    assert.equal(audits.some((item) => item.planningMode === "claude" && item.verdict === "failed"), true);
-  } finally {
-    globalThis.fetch = originalFetch;
-    store.close();
-  }
-});
-
-test("bridge shutdown failure does not start a legacy fallback query", async () => {
-  const { store, source } = await fixture();
-  let llmCalls = 0;
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
-    llmCalls += 1;
-    throw new Error("legacy planner must not start during shutdown");
-  };
-  try {
-    const mcpFactory = async (options) => createClaudeQueryMcpSession({ ...options, listen: false });
-    const service = createQueryService({
-      store,
-      connector: { explain: async () => [{ rows: 1 }], query: async () => [[{ customer_id: 7 }], [{ name: "customer_id" }]] },
-      claudeBridge: { run: async () => { const error = new Error("Claude bridge 已关闭"); error.code = "BRIDGE_CLOSED"; throw error; } },
-      claudeMcpFactory: mcpFactory,
-      config: {
-        llm: { baseUrl: "http://llm.test/v1", apiKey: "test", model: "test" },
-        queryMaxRows: 100,
-        explainMaxRows: 1_000,
-        semanticQueryPlanMode: "off",
-        queryAgentMode: "off",
-        claudeQuery: { mode: "prefer", trafficPercent: 100, model: "fake", maxBudgetUsd: 1 },
-      },
-    });
-    const answer = await service.ask({ sourceId: source.id, question: "查询客户", userName: "tester" });
-    assert.equal(answer.refused, true);
-    assert.equal(answer.planningMode, "claude");
-    assert.equal(answer.errorCode, "BRIDGE_CLOSED");
-    assert.equal(llmCalls, 0);
-  } finally {
-    globalThis.fetch = originalFetch;
-    store.close();
-  }
-});
 
 test("query service refuses a zero Claude budget without invoking bridge or MCP", async () => {
   const { store, source } = await fixture();
@@ -632,6 +563,81 @@ test("query service normalizes registry runs regardless of snake-case sensitive 
     assert.deepEqual(answer.rows, [{ customer_id: 7, mobile: "13800138000" }]);
     assert.equal(answer.columns.some((column) => column.name === "mobile" || column.key === "mobile"), true);
   } finally {
+    store.close();
+  }
+});
+
+test("Claude infrastructure failure preserves its reason and never calls another planner", async () => {
+  const { store, source } = await fixture();
+  const connector = { explain: async () => [{ rows: 1 }], query: async () => [[{ customer_id: 7 }], [{ name: "customer_id" }]] };
+  const bridge = { run: async () => ({ status: "failed", reason: "CLI 不可用", failureClass: "cli_unavailable", iterations: 0, toolTrace: [] }) };
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    const content = calls === 1 ? JSON.stringify({ sql: "SELECT customer_id FROM crm_customer" }) : JSON.stringify({ conclusion: "查询到客户编号 7。" });
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const service = createQueryService({
+      store,
+      connector,
+      claudeBridge: bridge,
+      claudeMcpFactory: options=>createClaudeQueryMcpSession({...options,listen:false}),
+      config: {
+        llm: { baseUrl: "http://llm.test/v1", apiKey: "test", model: "test" },
+        queryMaxRows: 100,
+        explainMaxRows: 1_000,
+        semanticQueryPlanMode: "off",
+        queryAgentMode: "off",
+        claudeQuery: { mode: "prefer", trafficPercent: 100, model: "fake", maxBudgetUsd: 1 },
+      },
+    });
+    const answer = await service.ask({ sourceId: source.id, question: "查询客户", userName: "tester" });
+    assert.equal(answer.refused,true);
+    assert.equal(answer.planningMode,"claude");
+    assert.equal(answer.failureClass,"cli_unavailable");
+    assert.equal(answer.reason,"CLI 不可用");
+    assert.equal(calls, 0);
+    const audits = store.listAudits(source.id, 5);
+    assert.equal(audits.some((item) => item.planningMode === "claude" && item.verdict === "failed"), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    store.close();
+  }
+});
+
+test("bridge shutdown failure does not start a legacy fallback query", async () => {
+  const { store, source } = await fixture();
+  let llmCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    llmCalls += 1;
+    throw new Error("legacy planner must not start during shutdown");
+  };
+  try {
+    const mcpFactory = async (options) => createClaudeQueryMcpSession({ ...options, listen: false });
+    const service = createQueryService({
+      store,
+      connector: { explain: async () => [{ rows: 1 }], query: async () => [[{ customer_id: 7 }], [{ name: "customer_id" }]] },
+      claudeBridge: { run: async () => { const error = new Error("Claude bridge 已关闭"); error.code = "BRIDGE_CLOSED"; throw error; } },
+      claudeMcpFactory: mcpFactory,
+      config: {
+        llm: { baseUrl: "http://llm.test/v1", apiKey: "test", model: "test" },
+        queryMaxRows: 100,
+        explainMaxRows: 1_000,
+        semanticQueryPlanMode: "off",
+        queryAgentMode: "off",
+        claudeQuery: { mode: "prefer", trafficPercent: 100, model: "fake", maxBudgetUsd: 1 },
+      },
+    });
+    const answer = await service.ask({ sourceId: source.id, question: "查询客户", userName: "tester" });
+    assert.equal(answer.refused, true);
+    assert.equal(answer.planningMode, "claude");
+    assert.equal(answer.errorCode, "BRIDGE_CLOSED");
+    assert.equal(llmCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
     store.close();
   }
 });

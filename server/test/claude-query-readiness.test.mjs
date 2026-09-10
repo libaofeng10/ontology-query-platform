@@ -8,9 +8,10 @@ const base = {
   },
 };
 
-test("Claude readiness is green without probing a paid API when disabled", () => {
-  const result = inspectClaudeQueryReadiness({ config: { claudeQuery: { mode: "off" } }, env: {} });
-  assert.deepEqual(result, { ok: true, enabled: false, mode: "off", binary: null, temp: null, modelConfigured: false, authConfigured: false, errors: [] });
+test("readiness checks prerequisites when no legacy mode is configured",()=>{
+  const result=inspectClaudeQueryReadiness({config:{claudeQuery:{}},env:{}});
+  assert.equal(result.ok,false);assert.equal(result.enabled,true);assert.equal(result.modelConfigured,false);
+  assert.ok(result.errors.some(item=>item.includes("CLI")));
 });
 
 test("Claude readiness validates local executable, version, temp, model and key", () => {

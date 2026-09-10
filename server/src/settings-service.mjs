@@ -1,9 +1,4 @@
 import { encryptCredential, decryptCredential } from "./crypto.mjs";
-import { QUERY_PROMPT_DEFAULTS, QUERY_PROMPT_SPECS, validateQueryPrompt } from "./query-prompts.mjs";
-
-function promptSpec(promptKey) {
-  return { validate: (value, settingKey) => validateQueryPrompt(promptKey, value, settingKey) };
-}
 
 const GROUPS = {
   llm: {
@@ -34,26 +29,18 @@ const GROUPS = {
     timeoutMs: { envVar: "COLUMN_PROFILING_TIMEOUT_MS", validate: intRange(100, 120_000) },
   },
   query: {
-    semanticQueryPlanMode: { envVar: "SEMANTIC_QUERY_PLAN_MODE", validate: oneOf(["off", "prefer", "required"]) },
-    queryAgentMode: { envVar: "QUERY_AGENT_MODE", validate: oneOf(["off", "prefer", "required"]) },
-    queryAgentTrafficPercent: { envVar: "QUERY_AGENT_TRAFFIC_PERCENT", validate: intRange(0, 100) },
-    queryAgentMaxIterations: { envVar: "QUERY_AGENT_MAX_ITERATIONS", validate: intRange(2, 20) },
-    queryAgentMaxSqlCalls: { envVar: "QUERY_AGENT_MAX_SQL_CALLS", validate: intRange(1, 10) },
-    queryAgentMaxScannedRows: { envVar: "QUERY_AGENT_MAX_SCANNED_ROWS", validate: intRange(1, 1_000_000_000) },
-    queryAgentPendingTtlMs: { envVar: "QUERY_AGENT_PENDING_TTL_MS", validate: intRange(1_000, 3_600_000) },
-    metricProposalEnabled: { envVar: "METRIC_PROPOSAL_ENABLED", validate: bool },
+    queryMaxSqlCalls: { envVar: "QUERY_MAX_SQL_CALLS", validate: intRange(1, 10) },
+    queryMaxScannedRows: { envVar: "QUERY_MAX_SCANNED_ROWS", validate: intRange(1, 1_000_000_000) },
+    queryPendingTtlMs: { envVar: "QUERY_PENDING_TTL_MS", validate: intRange(1_000, 3_600_000) },
     queryMaxRows: { envVar: "QUERY_MAX_ROWS", validate: intRange(1, 100_000) },
     explainMaxRows: { envVar: "EXPLAIN_MAX_ROWS", validate: intRange(1, 1_000_000_000) },
     queryTimeoutMs: { envVar: "QUERY_TIMEOUT_MS", validate: intRange(1_000, 600_000) },
-    queryLlmTimeoutMs: { envVar: "QUERY_LLM_TIMEOUT_MS", validate: intRange(1_000, 600_000) },
   },
   // Claude Code itself is deployment-owned.  The executable path, exact model
   // ID and prompt contract version are visible for diagnostics but cannot be
   // changed through the API; changing any of them requires a reviewed
   // deployment so the readiness and cost/quality audit identity stay true.
   claudeQuery: {
-    mode: { envVar: "CLAUDE_QUERY_MODE", validate: oneOf(["off", "prefer", "required"]) },
-    trafficPercent: { envVar: "CLAUDE_QUERY_TRAFFIC_PERCENT", validate: intRange(0, 100) },
     binary: { envVar: "CLAUDE_QUERY_BINARY", validate: text, readonly: true },
     model: { envVar: "CLAUDE_QUERY_MODEL", validate: text, readonly: true },
     promptVersion: { envVar: "CLAUDE_QUERY_PROMPT_VERSION", validate: text, readonly: true },
@@ -78,17 +65,24 @@ const GROUPS = {
     maxP95LatencyMs: { envVar: "ONTOLOGY_AI_MAX_P95_LATENCY_MS", validate: intRange(1_000, 600_000) },
     maxAverageTokens: { envVar: "ONTOLOGY_AI_MAX_AVERAGE_TOKENS", validate: intRange(1, 10_000_000) },
   },
-  prompts: Object.fromEntries(Object.keys(QUERY_PROMPT_SPECS).map((key) => [key, promptSpec(key)])),
 };
 
 export function createSettingsService({ store, baseConfig, appSecret, lockedKeys = [] }) {
+  // Preserve saved execution limits when retiring the planner-specific names.
+  store.db.transaction(()=>{
+    for(const [oldName,newName] of [["queryAgentMaxSqlCalls","queryMaxSqlCalls"],["queryAgentMaxScannedRows","queryMaxScannedRows"],["queryAgentPendingTtlMs","queryPendingTtlMs"]]) {
+      const oldKey=`query.${oldName}`,newKey=`query.${newName}`,row=store.getSetting(oldKey);
+      if(!row)continue;
+      if(!store.getSetting(newKey))store.upsertSetting({...row,key:newKey});
+      store.deleteSetting(oldKey);
+    }
+  })();
   const locked = new Set(lockedKeys);
-  const state = { llm: {}, embedding: {}, retrieval: {}, discovery: {}, profiling: {}, query: {}, claudeQuery: {}, ontologyAi: {}, prompts: {} };
+  const state = { llm: {}, embedding: {}, retrieval: {}, discovery: {}, profiling: {}, query: {}, claudeQuery: {}, ontologyAi: {} };
   const sources = {};
 
   function defaultsFor(group, key) {
     if (group === "query") return baseConfig[key];
-    if (group === "prompts") return QUERY_PROMPT_DEFAULTS[key];
     if (group === "claudeQuery") return baseConfig[group]?.[key] ?? CLAUDE_QUERY_FALLBACKS[key] ?? "";
     return baseConfig[group]?.[key] ?? (key === "dimensions" ? null : "");
   }
@@ -167,15 +161,8 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
         view[group][key] = keys[key].secret ? maskSecret(value) : value;
       }
     }
-    const promptMeta = Object.fromEntries(Object.entries(QUERY_PROMPT_SPECS).map(([key, spec]) => [key, {
-      label: spec.label,
-      description: spec.description,
-      variables: [...spec.variables],
-    }]));
     return {
       ...view,
-      promptMeta,
-      promptDefaults: { ...QUERY_PROMPT_DEFAULTS },
       sources: { ...sources },
       locked: [...locked],
     };
@@ -188,7 +175,6 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
   const profilingView = viewOf(state.profiling, ["enabled", "sampleLimit", "maxTablesPerRefresh", "timeoutMs"]);
   const claudeQueryView = viewOf(state.claudeQuery, Object.keys(GROUPS.claudeQuery));
   const ontologyAiView = viewOf(state.ontologyAi, ["mode", "autoConfirmScore", "maxTables", "maxFields", "timeoutMs", "criticEnabled", "calibrationMinSamples", "calibrationMinPrecision", "maxManualObjectRate", "maxFailureRate", "maxP95LatencyMs", "maxAverageTokens"]);
-  const promptsView = viewOf(state.prompts, Object.keys(QUERY_PROMPT_SPECS));
   const config = {
     ...baseConfig,
     llm: llmView,
@@ -198,19 +184,12 @@ export function createSettingsService({ store, baseConfig, appSecret, lockedKeys
     profiling: profilingView,
     claudeQuery: claudeQueryView,
     ontologyAi: ontologyAiView,
-    prompts: promptsView,
-    get semanticQueryPlanMode() { return state.query.semanticQueryPlanMode; },
-    get queryAgentMode() { return state.query.queryAgentMode; },
-    get queryAgentTrafficPercent() { return state.query.queryAgentTrafficPercent; },
-    get queryAgentMaxIterations() { return state.query.queryAgentMaxIterations; },
-    get queryAgentMaxSqlCalls() { return state.query.queryAgentMaxSqlCalls; },
-    get queryAgentMaxScannedRows() { return state.query.queryAgentMaxScannedRows; },
-    get queryAgentPendingTtlMs() { return state.query.queryAgentPendingTtlMs; },
-    get metricProposalEnabled() { return state.query.metricProposalEnabled; },
+    get queryMaxSqlCalls() { return state.query.queryMaxSqlCalls; },
+    get queryMaxScannedRows() { return state.query.queryMaxScannedRows; },
+    get queryPendingTtlMs() { return state.query.queryPendingTtlMs; },
     get queryMaxRows() { return state.query.queryMaxRows; },
     get explainMaxRows() { return state.query.explainMaxRows; },
     get queryTimeoutMs() { return state.query.queryTimeoutMs; },
-    get queryLlmTimeoutMs() { return state.query.queryLlmTimeoutMs; },
   };
 
   return { config, update, publicView, snapshot: () => structuredClone(state), reload: rebuild };
@@ -229,8 +208,6 @@ function maskSecret(value) {
 }
 
 const CLAUDE_QUERY_FALLBACKS = {
-  mode: "off",
-  trafficPercent: 0,
   binary: "/app/node_modules/.bin/claude",
   model: "",
   promptVersion: "claude-query-v1",

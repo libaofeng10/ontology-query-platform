@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { createApp } from "../src/server.mjs";
+import { createCommerceCatalog } from "./fixtures/commerce-catalog.mjs";
 import { scoreOntologyCandidate } from "../src/ontology-candidate-score.mjs";
 
 async function createFixture(extra={}) {
@@ -30,31 +31,20 @@ test("settings API requires admin for reads and writes and hot-applies updates",
     const view=await api(app,"/api/settings","token-admin",null,"GET");
     assert.equal(view.status,200);
     assert.equal(Object.hasOwn(view.body.retrieval,"topK"),false);
-    assert.ok("llm" in view.body&&"embedding" in view.body&&"retrieval" in view.body&&"query" in view.body&&"claudeQuery" in view.body&&"ontologyAi" in view.body&&"prompts" in view.body);
-    assert.equal(view.body.promptMeta.agentQuestion.label,"Agent 初始任务");
-    assert.deepEqual(view.body.promptMeta.agentQuestion.variables,["context"]);
-    assert.equal(view.body.prompts.agentQuestion,view.body.promptDefaults.agentQuestion);
-    const customPrompt="API 自定义提示词：{{context}}";
-    const updated=await api(app,"/api/settings","token-admin",{llm:{model:"hot-model",apiKey:"sk-new-key-tail"},retrieval:{minSimilarity:0.5},claudeQuery:{mode:"prefer",trafficPercent:10,maxBudgetUsd:2},ontologyAi:{mode:"review",autoConfirmScore:80},prompts:{agentQuestion:customPrompt}},"PUT");
+    assert.ok("llm" in view.body&&"embedding" in view.body&&"retrieval" in view.body&&"query" in view.body&&"claudeQuery" in view.body&&"ontologyAi" in view.body);
+    const updated=await api(app,"/api/settings","token-admin",{llm:{model:"hot-model",apiKey:"sk-new-key-tail"},retrieval:{minSimilarity:0.5},claudeQuery:{maxBudgetUsd:2},ontologyAi:{mode:"review",autoConfirmScore:80}},"PUT");
     assert.equal(updated.status,200);
     assert.equal(updated.body.llm.model,"hot-model");
     assert.deepEqual(updated.body.llm.apiKey,{set:true,masked:"****tail"});
     assert.equal(updated.body.retrieval.minSimilarity,0.5);
-    assert.equal(updated.body.claudeQuery.mode,"prefer");
-    assert.equal(updated.body.claudeQuery.trafficPercent,10);
     assert.equal(updated.body.claudeQuery.maxBudgetUsd,2);
     assert.equal(updated.body.ontologyAi.mode,"review");
-    assert.equal(updated.body.prompts.agentQuestion,customPrompt);
-    assert.equal(updated.body.sources["prompts.agentQuestion"],"db");
-    const reset=await api(app,"/api/settings","token-admin",{prompts:{agentQuestion:null}},"PUT");
-    assert.equal(reset.body.prompts.agentQuestion,reset.body.promptDefaults.agentQuestion);
-    assert.equal(reset.body.sources["prompts.agentQuestion"],"default");
     const invalid=await api(app,"/api/settings","token-admin",{retrieval:{vectorWeight:5}},"PUT");
     assert.equal(invalid.status,400);
     assert.match(invalid.body.error,/vectorWeight/);
     const invalidPrompt=await api(app,"/api/settings","token-admin",{prompts:{agentQuestion:"no variable"}},"PUT");
     assert.equal(invalidPrompt.status,400);
-    assert.match(invalidPrompt.body.error,/缺少必需变量/);
+    assert.match(invalidPrompt.body.error,/未知设置/);
     const retired=await api(app,"/api/settings","token-admin",{retrieval:{topK:8}},"PUT");
     assert.equal(retired.status,400);
     assert.match(retired.body.error,/未知设置项 retrieval.topK/);
@@ -157,7 +147,7 @@ test("embedding reindex is admin-only and returns an async task",async()=>{
     embeddingFetchImpl:async(_url,init)=>new Response(JSON.stringify({data:JSON.parse(init.body).input.map((_,index)=>({index,embedding:[1,0]}))}),{status:200}),
   });
   try {
-    const source=app.store.listSources().find((item)=>item.isDemo);
+    const source=createCommerceCatalog(app.store);
     assert.equal((await api(app,"/api/settings/reindex-embeddings","token-editor",{sourceId:source.id})).status,403);
     await api(app,"/api/settings","token-admin",{embedding:{baseUrl:"https://embed.test/v1",apiKey:"sk-embed",model:"embed-v1"}},"PUT");
     const task=await api(app,"/api/settings/reindex-embeddings","token-admin",{sourceId:source.id});

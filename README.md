@@ -11,18 +11,18 @@
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-Apache--2.0-D22128)
 
-OntoQuery 是一个面向企业数据分析场景的本体驱动智能问数平台。它从只读 MySQL 自动探查结构和受限值域，构建可人工审核的业务对象、属性与关系模型，再通过语义查询计划、SQL 安全护栏和结果等价评测生成可追溯的问数结果。
+OntoQuery 是一个面向企业数据分析场景的本体驱动智能问数平台。它从只读 MySQL 自动探查结构和受限值域，构建可人工审核的业务对象、属性与关系模型，问数时调用 Claude Code 完成理解、SQL 规划与回答；平台保留只读执行、会话、前端展示和结果等价评测。
 
-项目内置“客户 → 订单 → 支付 → 退款”演示域，无需连接真实数据库即可体验完整工作流。真实数据源不会使用静态答案或伪造指标作为回退。
+首次启动为空工作区，请先接入只读 MySQL 并构建本体。测试目录使用显式夹具，生产服务不加载演示数据或静态答案。
 
 ## 为什么使用 OntoQuery
 
-- **业务语义先行**：以 Object Type、Property、Link Type 描述业务对象，而非把数据库字段直接暴露给规划模型。
-- **关系必须确认**：结构候选、模型审阅和值域验证只生成建议，只有人工确认的 JOIN 才能进入执行白名单。
-- **SQL 全链路受控**：执行前经过单条 `SELECT` AST、表/字段、JOIN、枚举、`EXPLAIN` 成本、超时和行数上限检查。
+- **业务语义先行**：以 Object Type、Property、Link Type 描述业务对象，向 Claude 提供业务知识与物理映射。
+- **关系必须确认**：结构候选、模型审阅和值域验证只生成建议，确认结果作为 Claude 的关系参考，不作为数据库查询权限。
+- **SQL 全链路受控**：执行前经过单条 `SELECT` AST、`EXPLAIN` 成本、超时和行数上限检查。
 - **证据完整可追溯**：回答同时提供结论、表格、图表和依据，并保留 SQL、规则、知识页及执行审计。
-- **可量化灰度启用**：通过 Gold SQL 结果等价、失败率、延迟、token 与工具成功率门禁，评估语义规划和 Agent Loop。
-- **默认最小权限**：MySQL 只读验证、AES-256-GCM 凭据加密、角色与数据源范围控制、限流及敏感字段前置拦截。
+- **结果驱动改进**：对照 Gold SQL 验证 Claude 回答，失败时修正本体和知识，再运行门禁。
+- **默认最小权限**：MySQL 只读验证、AES-256-GCM 凭据加密、角色与数据源范围控制、限流与只读执行护栏。
 
 ## 功能概览
 
@@ -32,13 +32,14 @@ OntoQuery 是一个面向企业数据分析场景的本体驱动智能问数平�
 | 关系发现 | 结构候选、LLM 元数据审阅、本地值域重叠验证、人工确认/否决闭环 |
 | 本体知识 | `tables / terms / metrics / joins / rules` Markdown 页面、SQLite CRUD、术语检索与 Wikilink 扩展 |
 | 业务对象建模 | Object / Property / Link 可视化编辑、物理映射、版本、Diff、重新校验、发布与回滚 |
-| 智能问数 | 语义 Query Plan、受控 SQL 编译、交互式澄清、表格/图表/CSV 与证据展示 |
-| Agent Loop | 有预算的工具循环、会话稳定分桶、失败安全回退与全程审计 |
-| 评测治理 | Gold SQL 隔离、真实结果集等价判定、失败修复建议、语义与 Agent 对照门禁 |
+| 智能问数 | Claude Code 规划与回答，交互式澄清、表格/图表/CSV 与证据展示 |
+| 评测治理 | Gold SQL 隔离、真实结果集等价判定、失败修复建议、Claude 与 Gold SQL 门禁 |
 | 访问控制 | `viewer / analyst / editor / admin`、Bearer token、数据源范围、请求限流 |
 | 部署运维 | Docker Compose、安全容器基线、健康检查、备份恢复指引 |
 
 ## 架构
+
+当前职责、升级参数和验证方式见 [问数架构](docs/QUERY_ARCHITECTURE.md)。
 
 ```mermaid
 flowchart LR
@@ -52,10 +53,11 @@ flowchart LR
   MySQL --> Discovery[结构探查与受限探针]
   Discovery --> Meta
   Meta --> Schema[业务对象 Schema]
-  Wiki --> Planner[语义规划 / Agent Loop]
+  Wiki --> Planner[Claude Code]
   Schema --> Planner
-  Planner --> Guard[AST / 白名单 / JOIN / 枚举 / EXPLAIN]
-  LLM --> Planner
+  Planner --> Guard[只读 AST / EXPLAIN / 预算]
+  Planner --> MCP[请求级 MCP: ontology_read / db_query]
+  MCP --> Guard
   Guard --> MySQL
   MySQL --> Answer[结论 / 表格 / 图表 / 证据]
   Answer --> Web
@@ -88,7 +90,7 @@ npm run dev
 - API 健康检查：<http://localhost:8787/api/health>
 - API 就绪检查：<http://localhost:8787/api/ready>
 
-`npm run dev` 会同时启动 Web 和本地 API。首次启动时，API 会在 `.data/` 创建 SQLite 数据库并自动装载演示工作区。
+`npm run dev` 会同时启动 Web 和本地 API。首次启动时，API 会在 `.data/` 创建 SQLite 数据库，初始工作区不含数据源。
 
 开发环境可使用 `.env.local` 中的本地管理员 token。生产环境不要设置 `NEXT_PUBLIC_API_WRITE_TOKEN`；登录页输入的 token 只保存在当前标签页的 `sessionStorage`。
 
@@ -97,9 +99,9 @@ npm run dev
 1. 使用只读账号在“数据源”页添加 MySQL，或调用 `POST /api/sources`。
 2. 点击“连接测试”。系统会验证 `SELECT`、`@@read_only`，并尝试创建临时表以确认账号不可写。
 3. 点击“开始探查”。后台任务读取结构、运行受限探针、生成关系候选并进行模型批量审阅。
-4. 在“消歧队列”确认或否决候选关系。模型建议默认处于 `review`，不会自动获得 JOIN 权限。
+4. 在“消歧队列”确认或否决候选关系。模型建议需要核验后进入本体知识。
 5. 在业务对象建模工作台维护 Object、Property、Link 及物理映射，校验后发布 Schema。
-6. 建立评测集并运行门禁，再按需灰度启用语义规划或 Agent Loop。
+6. 建立评测集并运行门禁，验证 Claude 回答后启用本体版本。
 
 关系审阅只向模型发送表名、字段名、类型、索引和注释；数据库密码和原始采样值不会进入提示词。列值画像默认关闭，启用后也只覆盖 A/B 级表并进行脱敏。
 
@@ -113,25 +115,13 @@ LLM_API_KEY=replace-with-your-model-api-key
 LLM_MODEL=your-model-name
 ```
 
-未配置模型时，演示工作区使用确定性规划器；真实数据源会明确拒答，不会伪造结果。
+上述模型配置用于本体构建。问数另行配置 `CLAUDE_QUERY_BINARY`、`CLAUDE_QUERY_MODEL`、`ANTHROPIC_API_KEY`，然后运行 `npm run claude:preflight`。Claude 是唯一问数引擎；缺少配置或执行失败会明确返回失败原因。
 
-### 语义 Query Plan
+浏览器仍使用 `/api/query`，保留 SSE、工具进度、澄清续答、会话、图表与导出。平台通过请求级 MCP 提供本体读取和只读 SQL 执行；Claude 必须引用本次实际执行生成的 execution ID，不能提交自造结果。
 
-通过 `SEMANTIC_QUERY_PLAN_MODE` 控制：
+使用 `QUERY_MAX_SQL_CALLS`、`QUERY_MAX_SCANNED_ROWS`、`QUERY_PENDING_TTL_MS` 配置执行预算和澄清期限。旧 `QUERY_AGENT_*`、`SEMANTIC_QUERY_PLAN_MODE`、`CLAUDE_QUERY_MODE` 与灰度参数已退役；升级时需将原预算迁移到新名称。`CLAUDE_QUERY_MAX_BUDGET_USD=0` 可暂停问数。
 
-- `off`：使用兼容查询链路，默认值。
-- `prefer`：优先使用已发布且兼容的 Ontology Schema，失败时在安全条件下回退。
-- `required`：必须使用语义计划，不允许回退。
-
-### Agent Loop
-
-通过 `QUERY_AGENT_MODE` 控制：
-
-- `off`：保持单发链路，默认值。
-- `prefer`：需要探索或首次护栏/执行失败时升级为工具循环。
-- `required`：仅允许 Agent Loop。
-
-Agent 只能调用受限工具，不能直接访问数据库。迭代数、SQL 次数、累计扫描行数、澄清有效期和灰度比例均可配置。建议在评测中心门禁通过后，再将 `prefer` 流量按 `10% → 30% → 100%` 放量。
+评测每个用例调用一次 Claude，对照经过同一执行护栏的 Gold SQL。候选版本、评测集校验和、完整结果和实际 Claude 执行证据用于发布检查；旧引擎门禁需要重新运行。
 
 完整环境变量及安全默认值见 [`.env.example`](./.env.example)。
 

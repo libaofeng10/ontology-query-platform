@@ -8,6 +8,7 @@ import { createApp } from "../src/server.mjs";
 import { evalSetChecksum } from "../src/evaluation-evidence.mjs";
 import { ontologyCatalogChecksum } from "../src/ontology-candidate-service.mjs";
 import { scoreOntologyCandidate } from "../src/ontology-candidate-score.mjs";
+import { createCommerceCatalog } from "./fixtures/commerce-catalog.mjs";
 
 test("generation scope API uses server budgets and keeps historically sensitive endpoints",async()=>{
   const root=await mkdtemp(join(tmpdir(),"ontoquery-generation-scope-api-"));
@@ -18,7 +19,7 @@ test("generation scope API uses server budgets and keeps historically sensitive 
     connector:{close:async()=>{},test:async()=>({ok:true}),query:async()=>[[],[]],explain:async()=>[]},rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test",
   });
   try {
-    const source=app.store.listSources().find((item)=>item.isDemo);
+    const source=createCommerceCatalog(app.store);
     const empty={sourceId:source.id,tableNames:[]};
     assert.equal((await api(app,"/api/ontology/generation-scope","viewer-token",empty)).status,403);
     const limits=await api(app,"/api/ontology/generation-scope","editor-token",empty);
@@ -49,7 +50,7 @@ test("generation API enforces editor writes and completes an Object background t
     ],connector:{close:async()=>{},test:async()=>({ok:true}),query:async()=>[[],[]],explain:async()=>[]},rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test",
   });
   try {
-    const source=app.store.listSources().find((item)=>item.isDemo);
+    const source=createCommerceCatalog(app.store);
     const body={sourceId:source.id,mode:"selected_tables",tableNames:["crm_customer"],domainName:"客户域",domainDescription:"客户主档"};
     assert.equal((await api(app,"/api/ontology/generation-runs","viewer-token",body)).status,403);
     const created=await api(app,"/api/ontology/generation-runs","editor-token",body);
@@ -81,7 +82,7 @@ test("generation API isolates candidates by source and audits failed model outpu
     connector:{close:async()=>{},test:async()=>({ok:true}),query:async()=>[[],[]],explain:async()=>[]},rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test",
   });
   try {
-    const demo=app.store.listSources().find((item)=>item.isDemo);
+    const demo=createCommerceCatalog(app.store);
     const created=await api(app,"/api/ontology/generation-runs","editor-token",{sourceId:demo.id,tableNames:["crm_customer"]});
     const task=await waitForTask(app,created.body.taskId);assert.equal(task.status,"failed");assert.match(task.error,/合法 JSON/);
     const run=app.store.getOntologyGenerationRun(created.body.id);assert.equal(run.status,"failed");assert.equal(run.tokenUsage.totalTokens,3);assert.equal(run.summary.modelCalls[0].traceStored,true);
@@ -107,7 +108,7 @@ test("generation task sends all selected catalog columns to the configured JSON 
     apiIdentities:[{name:"viewer-a",role:"viewer",token:"viewer-token",sourceIds:"*"},{name:"editor-a",role:"editor",token:"editor-token",sourceIds:"*"}],connector:{close:async()=>{},test:async()=>({ok:true}),query:async()=>[[],[]],explain:async()=>[]},rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test",
   });
   try {
-    const source=app.store.listSources().find((item)=>item.isDemo);
+    const source=createCommerceCatalog(app.store);
     const created=await api(app,"/api/ontology/generation-runs","editor-token",{sourceId:source.id,tableNames:["crm_customer"],domainName:"客户"});
     const task=await waitForTask(app,created.body.taskId);assert.equal(task.status,"succeeded",task.error);
     assert.equal(requestBody.model,"object-model");assert.deepEqual(requestBody.response_format,{type:"json_object"});
@@ -169,7 +170,7 @@ test("candidate merge API is editor-only and keeps both sides auditable",async()
   const root=await mkdtemp(join(tmpdir(),"ontoquery-candidate-merge-api-"));
   const app=createApp({dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"merge-api-secret",ontologyAi:{mode:"review",autoConfirmScore:80,maxTables:20,maxFields:600},apiIdentities:[{name:"viewer-a",role:"viewer",token:"viewer-token",sourceIds:"*"},{name:"editor-a",role:"editor",token:"editor-token",sourceIds:"*"}],connector:{close:async()=>{},test:async()=>({ok:true}),query:async()=>[[],[]],explain:async()=>[]},rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test"});
   try {
-    const source=app.store.listSources().find((item)=>item.isDemo);app.store.createOntologyGenerationRun({id:"merge-run",sourceId:source.id,mode:"selected_tables",scope:{tableNames:["crm_customer"],namespace:"merge"},catalogChecksum:"snapshot",promptVersion:"v1",scoringVersion:"v1",status:"succeeded",createdBy:"editor-a"});
+    const source=createCommerceCatalog(app.store);app.store.createOntologyGenerationRun({id:"merge-run",sourceId:source.id,mode:"selected_tables",scope:{tableNames:["crm_customer"],namespace:"merge"},catalogChecksum:"snapshot",promptVersion:"v1",scoringVersion:"v1",status:"succeeded",createdBy:"editor-a"});
     app.store.createOntologyCandidate({id:"merge-retained",runId:"merge-run",sourceId:source.id,candidateType:"object",stableKey:"object:merge:crm_customer",payload:{apiName:"customer"},evidence:[{kind:"physical_table",refId:"table:crm_customer",verified:true}],status:"confirmed"});
     app.store.createOntologyCandidate({id:"merge-duplicate",runId:"merge-run",sourceId:source.id,candidateType:"object",stableKey:"object:merge:crm_customer_copy",payload:{apiName:"customer_copy"},evidence:[{kind:"knowledge_page",refId:"term:customer",verified:true}],status:"review_required"});
     assert.equal((await api(app,"/api/ontology/candidates/merge-duplicate/merge","viewer-token",{intoCandidateId:"merge-retained"})).status,403);
@@ -195,7 +196,7 @@ test("optional calibration API verifies evidence independently of admin score po
     const draft=app.store.createOntologySchemaVersion({sourceId:source.id,schemaName:"pilot",schema:{name:"pilot",displayName:"试点",objectTypes:[],linkTypes:[]},checksum:"draft",validation:{ok:true,errors:[],warnings:[],summary:{objectTypes:40,properties:40,linkTypes:0,errorCount:0,warningCount:0}},createdBy:"editor-a"});
     app.store.publishOntologySchemaVersion(draft.id,"editor-a");
     const evalCases=[];for(let index=0;index<10;index++)evalCases.push(app.store.addEvalCase({sourceId:source.id,setName:"pilot-gold",question:`试点 Gold 问题 ${index+1}`,goldSql:"SELECT id FROM pilot_customer",category:"客户",heldOut:1}));
-    const publishedDraft=app.store.getOntologySchemaVersion(draft.id);const evalGate=app.store.saveEvalGate({id:"pilot-gold",sourceId:source.id,setName:"pilot-gold",total:10,ontologySchemaVersion:draft.version,ontologySchemaPublishedAt:publishedDraft.publishedAt,evaluationChecksum:evalSetChecksum(evalCases),baseline:{requestedMode:"off",passRate:1},candidate:{requestedMode:"prefer",passRate:1,semanticExecutionRate:1,joinFailureRate:0},passed:1,decision:"enable_prefer",reason:"equivalent"});
+    const publishedDraft=app.store.getOntologySchemaVersion(draft.id);const evalGate=app.store.saveEvalGate({id:"pilot-gold",sourceId:source.id,setName:"pilot-gold",total:10,ontologySchemaVersion:draft.version,ontologySchemaPublishedAt:publishedDraft.publishedAt,evaluationChecksum:evalSetChecksum(evalCases),baseline:{requestedMode:"gold",passRate:1},candidate:{requestedMode:"claude",passRate:1,claudeExecutionRate:1,joinFailureRate:0},passed:1,decision:"enable_claude",reason:"equivalent"});
     assert.equal((await api(app,"/api/settings","admin-token",{ontologyAi:{mode:"auto_draft",autoConfirmScore:85}},"PUT")).status,200);
     const report=await api(app,`/api/ontology/calibration?sourceId=${source.id}`,"viewer-token",null,"GET");assert.equal(report.status,200);assert.equal(report.body.counts.labeledAuto,40);assert.deepEqual(report.body.evalSets,[{setName:"pilot-gold",total:10,goldCount:10,heldOutCount:10,ready:true}]);
     const created=await api(app,"/api/ontology/calibration/gates","editor-token",{sourceId:source.id,draftSchemaVersionId:draft.id,evalGateId:evalGate.id,manualObjectCount:0});assert.equal(created.status,201);assert.equal(created.body.passed,true);
@@ -213,7 +214,7 @@ test("domain-plan API clusters eligible tables for viewers with prefix fallback 
     connector:{close:async()=>{},test:async()=>({ok:true}),query:async()=>[[],[]],explain:async()=>[]},rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test",
   });
   try {
-    const source=app.store.listSources().find((item)=>item.isDemo);
+    const source=createCommerceCatalog(app.store);
     const empty=await api(app,`/api/ontology/domain-plan?sourceId=${source.id}`,"viewer-token",null,"GET");
     assert.equal(empty.status,200);
     assert.equal(empty.body.stored,false);

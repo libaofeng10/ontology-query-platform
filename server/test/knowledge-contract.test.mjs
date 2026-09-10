@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createKnowledgeService } from "../src/knowledge-service.mjs";
-import { knowledgeIntentConcepts } from "../src/query-intent.mjs";
+import { knowledgeIntentConcepts } from "../src/knowledge-concepts.mjs";
 import { createStore } from "../src/store.mjs";
 
 const RATIO_SQL="COUNT(DISTINCT CASE WHEN rel.is_deleted = 0 THEN rel.clue_id END) / COUNT(DISTINCT clue.id)";

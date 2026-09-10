@@ -5,11 +5,16 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { createApp } from "../src/server.mjs";
+import { createCommerceCatalog } from "./fixtures/commerce-catalog.mjs";
+import { createClaudeQueryMcpSession } from "../src/claude-query-mcp.mjs";
 
 test("query session API persists turns and isolates them by authenticated user",async()=>{
   const root=await mkdtemp(join(tmpdir(),"ontoquery-session-api-"));
   const connector={close:async()=>{},test:async()=>({ok:true}),query:async()=>[[],[]],explain:async()=>[]};
   const app=createApp({
+    claudeQuery:{model:"test-model",maxBudgetUsd:1},
+    claudeMcpFactory:options=>createClaudeQueryMcpSession({...options,listen:false}),
+    claudeBridge:{run:async({mcpSession})=>{const receipt=await mcpSession.callTool("db_query",{sql:"SELECT customer_id FROM crm_customer"});return {status:"answered",executionIds:[receipt.executionId],conclusion:"查询完成",toolTrace:mcpSession.trace};}},
     dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"session-api-secret",
     apiIdentities:[
       {name:"analyst-a",role:"analyst",token:"token-a",sourceIds:"*"},
@@ -17,7 +22,7 @@ test("query session API persists turns and isolates them by authenticated user",
     ],
     connector,rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test",
   });
-  const source=app.store.listSources().find((item)=>item.isDemo);
+  const source=createCommerceCatalog(app.store);
   try {
     const created=await api(app,"/api/sessions","token-a",{sourceId:source.id});
     assert.equal(created.status,201);assert.equal(created.body.title,"新问数会话");

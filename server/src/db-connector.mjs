@@ -20,7 +20,6 @@ export function createConnector({ appSecret, timeoutMs, mysqlClient=mysql }) {
   }
 
   async function test(source) {
-    if (source.isDemo) return { ok:true, readOnly:true, server:"demo", latencyMs:1 };
     const started = Date.now();
     const pool = poolFor(source);
     const connection = await pool.getConnection();
@@ -39,7 +38,6 @@ export function createConnector({ appSecret, timeoutMs, mysqlClient=mysql }) {
   }
 
   async function query(source, sql, params = [], signal) {
-    if (source.isDemo) throw new Error("演示数据源不接受任意 SQL 执行");
     const pool = poolFor(source);
     for(let attempt=0;attempt<2;attempt++) {
       try { return await executeOnce(pool,sql,params,signal,resolveTimeout()); }

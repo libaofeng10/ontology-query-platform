@@ -42,25 +42,21 @@ test("联合主键及联合唯一的成员不能充当标量对象标识，单�
   assert.deepEqual(catalog.columns.map(c=>[c.isPrimary,c.isUnique]),[[0,0],[0,0],[0,1]]);
 });
 
-test("联合关系编译、快照与 Schema 校验保留第二个等式，非首成员变更使目录失效",async()=>{
-  const {compileSemanticQueryPlan}=await import("../src/semantic-query-plan.mjs");
+test("联合关系快照、Schema 校验与护栏保留第二个等式，非首成员变更使目录失效",async()=>{
   const {validateSemanticSchema}=await import("../src/semantic-schema.mjs");
   const {ontologyCatalogChecksum}=await import("../src/ontology-candidate-service.mjs");
   const {createClaudeQuerySnapshot}=await import("../src/claude-query-snapshot.mjs");
   const columnsByTable={orders:["id","tenant_id","customer_code"],customers:["id","tenant_id","code"]};
   const catalog={sourceId:1,tables:Object.keys(columnsByTable).map(tableName=>({tableName,grade:"A",active:1})),columnsByTable:Object.fromEntries(Object.entries(columnsByTable).map(([table,columns])=>[table,columns.map(columnName=>({columnName,dataType:"bigint",nullable:0,isPrimary:Number(columnName==="id"),isUnique:Number(columnName==="id")}))])),relations:[relation]};
   const schema={name:"sales",objectTypes:Object.keys(columnsByTable).map(table=>({apiName:table,primaryKey:"id",properties:[{apiName:"id",type:"integer",required:true,mapping:{table,column:"id"}}]})),linkTypes:[{apiName:"order_customer",source:"orders",target:"customers",cardinality:"many_to_one",relationMappings:[{relationId:1}]}]};
-  const plan={rootObject:"customers",dimensions:[{property:"orders.id",alias:"order_id"}],metrics:[],filters:[],orderBy:[]};
-  const compiled=compileSemanticQueryPlan(plan,{schema,catalog});
-  assert.match(compiled.sql,/t1\.`tenant_id` = t0\.`tenant_id` AND t1\.`customer_code` = t0\.`code`/);
-  assert.deepEqual(compiled.semanticPath.relations[0].columnPairs,relation.columnPairs);assert.equal(guardSql(compiled.sql,compiled.policy).ok,true);
+  // The composite constraint must survive both snapshot serving and schema validation,
+  // and a change to any member (not just the first) must invalidate the schema catalog.
   const snapshot=createClaudeQuerySnapshot({sourceId:1,published:{sourceId:1,id:1,status:"published",schema},catalog});
   assert.deepEqual(snapshot.relations[0].columnPairs,relation.columnPairs);
   assert.equal(validateSemanticSchema(schema,catalog).ok,true);
   const changed=structuredClone(catalog);changed.columnsByTable.orders=changed.columnsByTable.orders.filter(c=>c.columnName!=="customer_code");
   assert.notEqual(ontologyCatalogChecksum(catalog),ontologyCatalogChecksum(changed));
   assert.equal(validateSemanticSchema(schema,changed).ok,false);
-  assert.throws(()=>compileSemanticQueryPlan(plan,{schema,catalog:changed}),/完整关联字段/);
 });
 
 test("联合自关联不能用单列、不同 JOIN 或子查询拼接条件绕过",()=>{

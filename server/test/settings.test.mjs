@@ -5,7 +5,6 @@ import { join } from "node:path";
 import test from "node:test";
 import { createStore } from "../src/store.mjs";
 import { createSettingsService } from "../src/settings-service.mjs";
-import { QUERY_PROMPT_DEFAULTS } from "../src/query-prompts.mjs";
 
 const BASE_CONFIG={
   llm:{baseUrl:"https://env-llm.example/v1",apiKey:"env-llm-key",model:"env-model"},
@@ -14,7 +13,7 @@ const BASE_CONFIG={
   discovery:{enumMaxDistinctRatio:0.05,labelDictionaryMaxRows:20},
   claudeQuery:{mode:"off",trafficPercent:0,binary:"/app/node_modules/.bin/claude",model:"",promptVersion:"claude-query-v1",timeoutMs:120_000,maxTurns:12,maxBudgetUsd:1,maxConcurrency:2,queueTimeoutMs:5_000,maxStdioBytes:2*1024*1024},
   ontologyAi:{mode:"off",autoConfirmScore:80,maxTables:20,maxFields:600,timeoutMs:90_000},
-  semanticQueryPlanMode:"off",queryAgentMode:"off",queryAgentTrafficPercent:100,queryAgentMaxIterations:8,queryAgentMaxSqlCalls:5,queryAgentMaxScannedRows:5_000_000,queryAgentPendingTtlMs:600_000,queryMaxRows:500,explainMaxRows:1_000_000,queryTimeoutMs:30_000,queryLlmTimeoutMs:90_000,
+  queryMaxSqlCalls:5,queryMaxScannedRows:5_000_000,queryPendingTtlMs:600_000,queryMaxRows:500,explainMaxRows:1_000_000,queryTimeoutMs:30_000,queryLlmTimeoutMs:90_000,
 };
 
 async function createFixture(lockedKeys=[]) {
@@ -29,21 +28,12 @@ test("settings fall back to env defaults and update hot-reloads getters",async()
   try {
     assert.equal(settings.config.llm.model,"env-model");
     assert.equal(settings.config.queryMaxRows,500);
-    assert.equal(settings.config.claudeQuery.mode,"off");
     assert.equal(settings.config.claudeQuery.maxTurns,12);
     assert.equal(settings.publicView().sources["llm.model"],"default");
-    assert.equal(settings.config.prompts.agentSystem,QUERY_PROMPT_DEFAULTS.agentSystem);
-    assert.equal(settings.publicView().sources["prompts.agentSystem"],"default");
-    assert.deepEqual(settings.publicView().promptMeta.agentQuestion.variables,["context"]);
-    const view=settings.update({llm:{model:"qwen-plus"},retrieval:{vectorWeight:0.6},query:{queryMaxRows:200,semanticQueryPlanMode:"prefer",queryAgentMode:"prefer",queryAgentTrafficPercent:10},claudeQuery:{mode:"prefer",trafficPercent:10,maxTurns:20,maxBudgetUsd:2}},"admin-user");
+    const view=settings.update({llm:{model:"qwen-plus"},retrieval:{vectorWeight:0.6},query:{queryMaxRows:200},claudeQuery:{maxTurns:20,maxBudgetUsd:2}},"admin-user");
     assert.equal(settings.config.llm.model,"qwen-plus");
     assert.equal(settings.config.retrieval.vectorWeight,0.6);
     assert.equal(settings.config.queryMaxRows,200);
-    assert.equal(settings.config.semanticQueryPlanMode,"prefer");
-    assert.equal(settings.config.queryAgentMode,"prefer");
-    assert.equal(settings.config.queryAgentTrafficPercent,10);
-    assert.equal(settings.config.claudeQuery.mode,"prefer");
-    assert.equal(settings.config.claudeQuery.trafficPercent,10);
     assert.equal(settings.config.claudeQuery.maxTurns,20);
     assert.equal(settings.config.claudeQuery.maxBudgetUsd,2);
     settings.update({ontologyAi:{mode:"review",autoConfirmScore:81}});
@@ -51,24 +41,6 @@ test("settings fall back to env defaults and update hot-reloads getters",async()
     assert.equal(settings.config.ontologyAi.autoConfirmScore,81);
     assert.equal(view.sources["llm.model"],"db");
     assert.equal(view.sources["llm.baseUrl"],"default");
-  } finally { store.close(); }
-});
-
-test("query prompts persist, hot-reload, validate variables, and reset to defaults",async()=>{
-  const {store,settings}=await createFixture();
-  try {
-    const custom=`自定义 Agent 任务\n{{context}}`;
-    const view=settings.update({prompts:{agentQuestion:custom}},"admin-user");
-    assert.equal(settings.config.prompts.agentQuestion,custom);
-    assert.equal(view.prompts.agentQuestion,custom);
-    assert.equal(view.sources["prompts.agentQuestion"],"db");
-    assert.equal(JSON.parse(store.getSetting("prompts.agentQuestion").valueJson),custom);
-    assert.throws(()=>settings.update({prompts:{agentQuestion:"缺少上下文变量"}}),/缺少必需变量.*\{\{context\}\}/);
-    assert.throws(()=>settings.update({prompts:{agentQuestion:"{{context}} {{unknown}}"}}),/包含未知变量.*unknown/);
-    settings.update({prompts:{agentQuestion:null}});
-    assert.equal(settings.config.prompts.agentQuestion,QUERY_PROMPT_DEFAULTS.agentQuestion);
-    assert.equal(settings.publicView().sources["prompts.agentQuestion"],"default");
-    assert.equal(store.getSetting("prompts.agentQuestion"),undefined);
   } finally { store.close(); }
 });
 
@@ -104,18 +76,15 @@ test("invalid values are rejected with a chinese error and nothing is written",a
   try {
     assert.throws(()=>settings.update({retrieval:{vectorWeight:1.5}}),/vectorWeight 必须在 0 和 1 之间/);
     assert.throws(()=>settings.update({retrieval:{topK:0}}),/未知设置项 retrieval.topK/);
-    assert.throws(()=>settings.update({query:{semanticQueryPlanMode:"maybe"}}),/必须是 off、prefer、required 之一/);
-    assert.throws(()=>settings.update({query:{queryAgentMaxIterations:1}}),/必须是 2 到 20 的整数/);
-    assert.throws(()=>settings.update({query:{queryAgentTrafficPercent:101}}),/必须是 0 到 100 的整数/);
-    assert.throws(()=>settings.update({query:{queryAgentPendingTtlMs:999}}),/必须是 1000 到 3600000 的整数/);
+    assert.throws(()=>settings.update({query:{queryMaxSqlCalls:0}}),/必须是 1 到 10 的整数/);
+    assert.throws(()=>settings.update({query:{queryPendingTtlMs:999}}),/必须是 1000 到 3600000 的整数/);
     assert.throws(()=>settings.update({llm:{baseUrl:"ftp://bad"}}),/必须是 http\(s\) 地址/);
     assert.throws(()=>settings.update({ontologyAi:{mode:"publish"}}),/必须是 off、review、auto_draft 之一/);
-    assert.throws(()=>settings.update({claudeQuery:{mode:"maybe"}}),/必须是 off、prefer、required 之一/);
+    assert.throws(()=>settings.update({claudeQuery:{mode:"maybe"}}),/未知设置项 claudeQuery.mode/);
     assert.throws(()=>settings.update({claudeQuery:{maxBudgetUsd:101}}),/必须在 0 和 100 之间/);
     assert.throws(()=>settings.update({claudeQuery:{binary:"/tmp/other"}}),/由部署配置固定/);
     assert.throws(()=>settings.update({ontologyAi:{autoConfirmScore:101}}),/必须是 0 到 100 的整数/);
     assert.throws(()=>settings.update({llm:{unknown:"x"}}),/未知设置项/);
-    assert.throws(()=>settings.update({prompts:{unknown:"x"}}),/未知设置项/);
     assert.equal(store.listSettings().length,0);
   } finally { store.close(); }
 });
@@ -139,10 +108,8 @@ test("deployment-owned Claude path and prompt version ignore stale settings rows
     store.upsertSetting({key:"claudeQuery.promptVersion",valueJson:JSON.stringify("forged"),encrypted:0,updatedBy:"test"});
     settings.reload();
     assert.equal(settings.config.claudeQuery.binary,"/app/node_modules/.bin/claude");
-    assert.equal(settings.config.claudeQuery.model,"");
     assert.equal(settings.config.claudeQuery.promptVersion,"claude-query-v1");
     assert.notEqual(settings.publicView().sources["claudeQuery.binary"],"db");
-    assert.notEqual(settings.publicView().sources["claudeQuery.model"],"db");
     for (const key of ["claudeQuery.binary","claudeQuery.model","claudeQuery.promptVersion"]) {
       assert.equal(store.getSetting(key),undefined);
     }
@@ -154,7 +121,7 @@ test("deployment-owned Claude path and prompt version ignore stale settings rows
 test("startup removes retired settings without changing active budgets, secrets or migration markers",async()=>{
   const {store,settings}=await createFixture();
   try {
-    settings.update({llm:{apiKey:"sk-preserve-me"},query:{queryAgentMaxSqlCalls:5},claudeQuery:{mode:"required"}});
+    settings.update({llm:{apiKey:"sk-preserve-me"},query:{queryMaxSqlCalls:5},claudeQuery:{maxTurns:15}});
     const secret=store.getSetting("llm.apiKey").valueJson;
     store.upsertSetting({key:"retrieval.topK",valueJson:"12"});
     store.upsertSetting({key:"system.enumDictionaryRuleVersion",valueJson:"3"});
@@ -163,8 +130,7 @@ test("startup removes retired settings without changing active budgets, secrets 
     assert.equal(Object.hasOwn(restarted.config.retrieval,"topK"),false);
     assert.equal(Object.hasOwn(restarted.publicView().retrieval,"topK"),false);
     assert.equal(restarted.publicView().sources["retrieval.topK"],undefined);
-    assert.equal(restarted.config.claudeQuery.mode,"required");
-    assert.equal(restarted.config.queryAgentMaxSqlCalls,5);
+    assert.equal(restarted.config.queryMaxSqlCalls,5);
     assert.equal(restarted.config.llm.apiKey,"sk-preserve-me");
     assert.equal(store.getSetting("llm.apiKey").valueJson,secret);
     assert.equal(store.getSetting("system.enumDictionaryRuleVersion").valueJson,"3");
@@ -187,4 +153,22 @@ test("label dictionary row cap is an online-editable discovery setting",async()=
     settings.update({discovery:{labelDictionaryMaxRows:null}},"admin-user");
     assert.equal(settings.config.discovery.labelDictionaryMaxRows,20);
   } finally { store.close(); }
+});
+
+test("retiring Agent setting names preserves saved budgets without overwriting newer values",async()=>{
+  const {store}=await createFixture();
+  try {
+    store.upsertSetting({key:"query.queryAgentMaxSqlCalls",valueJson:"2",updatedBy:"editor"});
+    store.upsertSetting({key:"query.queryAgentMaxScannedRows",valueJson:"300",updatedBy:"editor"});
+    store.upsertSetting({key:"query.queryMaxScannedRows",valueJson:"200",updatedBy:"admin"});
+    store.upsertSetting({key:"query.queryAgentPendingTtlMs",valueJson:"5000",updatedBy:"editor"});
+    for(let attempt=0;attempt<2;attempt++) {
+      const migrated=createSettingsService({store,baseConfig:BASE_CONFIG,appSecret:"settings-test-secret"});
+      assert.equal(migrated.config.queryMaxSqlCalls,2);
+      assert.equal(migrated.config.queryMaxScannedRows,200);
+      assert.equal(migrated.config.queryPendingTtlMs,5000);
+      assert.equal(store.getSetting("query.queryMaxSqlCalls").updatedBy,"editor");
+      assert.equal(store.getSetting("query.queryAgentMaxSqlCalls"),undefined);
+    }
+  } finally {store.close();}
 });

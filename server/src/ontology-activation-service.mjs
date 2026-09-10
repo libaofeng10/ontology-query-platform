@@ -23,7 +23,7 @@ export function createOntologyActivationService({store,semanticSchemas,tasks}) {
     if(record.status!=='draft'){state=record.status==='published'?'published':'historical';detail=record.status==='published'?'此版本已用于问数。':'历史版本请使用恢复操作。';}
     else if(newer){state='superseded';detail=`已有更新的草稿 v${newer.version}，请查看该版本的启用条件。`;}
     else if(active){state='busy';detail='当前数据源正在处理任务，完成后会更新启用条件。';}
-    else if(!source.isDemo&&source.lastTestOk!==1){state='blocked';detail='请先在连接设置中通过只读连接测试。';}
+    else if(source.lastTestOk!==1){state='blocked';detail='请先在连接设置中通过只读连接测试。';}
     else if(blockedScope.length){state='blocked';detail=`此版本包含未选中的数据表：${blockedScope.join('、')}，请重新核对数据范围。`;}
     else if(owner&&owner.payload.sourceBuild.baseVersionId!==(base?.id??null)){state='blocked';detail='当前使用版本已变化，请基于新版本重新整理此次更新。';}
     else if(owner&&(owner.payload.sourceBuild.questions||[]).some(issue=>issue.kind!=='evaluation')){state='blocked';detail='本次构建仍有待处理问题，请先查看本体结果中的处理入口。';}

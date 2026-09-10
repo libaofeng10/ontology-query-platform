@@ -105,7 +105,7 @@ export function createOntologyCalibrationService({store,config,settings}={}) {
     const manualObjectRate=finalObjectCount?manualObjectCount/finalObjectCount:(manualObjectCount?1:0);
     const evalGate=resolveEvalGate(source.id,input.evalGateId,draft);const evalEvidence=evalGateEvidence(source.id,evalGate,draft);
     const evalSets=summarizeEvalSets(store.listEvalCases(source.id));
-    const downstream={goldEquivalenceRate:numberOrNull(evalGate?.candidate?.passRate),semanticExecutionRate:numberOrNull(evalGate?.candidate?.semanticExecutionRate),joinFailureRate:numberOrNull(evalGate?.candidate?.joinFailureRate),draftsCreated:appliedDrafts.length,draftsPublished:publishedDrafts.length,draftPublicationRate,schemaValidationPassRate};
+    const downstream={goldEquivalenceRate:numberOrNull(evalGate?.candidate?.passRate),claudeExecutionRate:numberOrNull(evalGate?.candidate?.claudeExecutionRate),joinFailureRate:numberOrNull(evalGate?.candidate?.joinFailureRate),draftsCreated:appliedDrafts.length,draftsPublished:publishedDrafts.length,draftPublicationRate,schemaValidationPassRate};
     const runtime=runtimeMetrics(runs);
     const thresholds=calibrationThresholds(config?.ontologyAi||{});
     const scoreBuckets=buildScoreBuckets(candidates,originalCandidates,labelByCandidate);

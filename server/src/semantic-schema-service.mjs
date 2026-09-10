@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { evalSetChecksum, inspectSemanticEvalGate } from "./evaluation-evidence.mjs";
 import { validateSemanticSchema } from "./semantic-schema.mjs";
 import { analyzeSemanticSchemaImpact } from "./semantic-schema-impact.mjs";
-import { hasSemanticHierarchyChanges, semanticSubtypeNames } from "./semantic-schema-diff.mjs";
 
 export function createSemanticSchemaService({store}) {
   function selectedTableNames(sourceId) {
@@ -61,11 +60,7 @@ export function createSemanticSchemaService({store}) {
           if(valid)validGates.push(gate);
           return !valid;
         });
-        const hierarchyChanged=hasSemanticHierarchyChanges(record.schema,current.schema);
-        const subtypeNames=new Set(semanticSubtypeNames(record.schema));
-        const subtypeRootCoverage=validGates.flatMap((gate)=>gate.candidate?.subtypeRootObjects||[]).filter((name,index,items)=>subtypeNames.has(name)&&items.indexOf(name)===index);
-        const subtypeRootCoverageMissing=hierarchyChanged&&!subtypeRootCoverage.length;
-        if(impact.uncoveredChanges.length||missingSets.length||subtypeRootCoverageMissing) return {...compact,ok:false,gateRequired:true,record:checkedRecord,evaluationImpact:{summary:{...impact.summary,hierarchyChanged,subtypeRootCoverageMissing},affectedCases:impact.affectedCases,affectedSets:impact.affectedSets,uncoveredChanges:impact.uncoveredChanges,missingSets,subtypeRootCoverage}};
+        if(impact.uncoveredChanges.length||missingSets.length) return {...compact,ok:false,gateRequired:true,record:checkedRecord,evaluationImpact:{summary:impact.summary,affectedCases:impact.affectedCases,affectedSets:impact.affectedSets,uncoveredChanges:impact.uncoveredChanges,missingSets}};
       }
     }
     return {ok:true,record:checkedRecord,...compact};

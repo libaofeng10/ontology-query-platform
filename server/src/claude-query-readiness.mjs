@@ -9,23 +9,13 @@ export const CLAUDE_QUERY_MIN_VERSION = "2.1.248";
  * Perform a local, non-billing readiness check for the Claude query bridge.
  *
  * This intentionally does not call Anthropic.  It checks only deployment-owned
- * prerequisites (mode, executable, CLI version, model/key presence and a
+ * prerequisites (executable, CLI version, model/key presence and a
  * writable temporary directory).  The API key is represented by a boolean and
  * is never returned.
  */
 export function inspectClaudeQueryReadiness({ config = {}, env = process.env, versionProbe = probeVersion } = {}) {
   const settings = config.claudeQuery || {};
-  const mode = normalizeMode(settings.mode);
-  if (mode === "off") return {
-    ok: true,
-    enabled: false,
-    mode,
-    binary: null,
-    temp: null,
-    modelConfigured: false,
-    authConfigured: false,
-    errors: [],
-  };
+  const mode = "claude";
 
   const binaryPath = String(settings.binary || env.CLAUDE_QUERY_BINARY || "").trim();
   const tempPath = String(env.CLAUDE_CODE_TMPDIR || "/tmp").trim() || "/tmp";
@@ -58,11 +48,6 @@ export function inspectClaudeQueryReadiness({ config = {}, env = process.env, ve
 
 function probeVersion(binaryPath) {
   return execFileSync(binaryPath, ["--version"], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "pipe"] });
-}
-
-function normalizeMode(value) {
-  const mode = String(value || "off").trim().toLowerCase();
-  return ["off", "prefer", "required"].includes(mode) ? mode : "off";
 }
 
 function isVersionAtLeast(actual, minimum) {

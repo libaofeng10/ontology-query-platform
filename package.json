@@ -16,7 +16,7 @@
     "serve": "node scripts/serve.mjs",
     "test": "node --test server/test/*.test.mjs",
     "test:rendered": "node --test tests/rendered-html.test.mjs",
-    "eval:loop-v2:readiness": "node scripts/eval-readiness.mjs --manifest examples/evaluation/loop-v2-rock-readonly.candidate.json",
+    "eval:readiness": "node scripts/eval-readiness.mjs --manifest examples/evaluation/loop-v2-rock-readonly.candidate.json",
     "claude:preflight": "node scripts/claude-query-preflight.mjs",
     "eval:claude:local": "node scripts/claude-query-eval-local.mjs",
     "typecheck": "tsc --noEmit --incremental false",

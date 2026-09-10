@@ -5,8 +5,6 @@ import { join } from "node:path";
 import test from "node:test";
 import { decryptCredential, encryptCredential } from "../src/crypto.mjs";
 import { writeTablePage } from "../src/ontology-writer.mjs";
-import { inferRelation } from "../src/relation-inference.mjs";
-import { detectSensitiveField } from "../src/sensitive-fields.mjs";
 import { guardSql } from "../src/sql-guard.mjs";
 import { buildQueryColumnSemantics, detectQuestionValueKinds, redactTypedLiterals } from "../src/query-column-semantics.mjs";
 import { gradeTable } from "../src/table-grading.mjs";
@@ -16,16 +14,6 @@ test("credentials round-trip with authenticated encryption", () => {
   assert.doesNotMatch(encrypted, /not-plain-text/);
   assert.equal(decryptCredential(encrypted, "test secret"), "not-plain-text");
   assert.throws(() => decryptCredential(encrypted, "wrong secret"));
-});
-
-test("sensitive fields are blocked before value probing", () => {
-  assert.equal(detectSensitiveField("customer_mobile").sensitive, true);
-  assert.equal(detectSensitiveField("email").sensitive, true);
-  assert.equal(detectSensitiveField("seller_name").sensitive, true);
-  assert.equal(detectSensitiveField("name",[],"客户姓名").sensitive, true);
-  assert.equal(detectSensitiveField("unknown", ["13800138000"]).sensitive, true);
-  assert.equal(detectSensitiveField("unknown", ["owner@example.com"]).sensitive, true);
-  assert.equal(detectSensitiveField("customer_level", ["gold"]).sensitive, false);
 });
 
 test("query column semantics exposes every column and adds non-blocking value kinds",()=>{
@@ -61,12 +49,6 @@ test("table grading excludes inactive backup noise and promotes active hubs", ()
   assert.equal(gradeTable({ tableName:"crm_customer", rowEstimate:3000000, inboundRelations:4, daysSinceWrite:1 }).grade, "A");
   assert.equal(gradeTable({ tableName:"anything", gradeOverride:"B" }).grade, "B");
   assert.equal(gradeTable({ tableName:"customer_v2", gradeOverride:"B" }).grade, "B");
-});
-
-test("relation inference combines overlap, names, types and cardinality", () => {
-  const result = inferRelation({columnName:"customer_id",type:"bigint",unique:false,overlapRatio:.997,cardinality:10000},{columnName:"customer_id",type:"bigint",unique:true,overlapRatio:.997,cardinality:10000});
-  assert.equal(result.status, "accepted");
-  assert.equal(result.cardinality, "N:1");
 });
 
 test("SQL guard permits confirmed aliased joins and adds a limit", () => {

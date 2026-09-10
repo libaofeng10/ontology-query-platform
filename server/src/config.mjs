@@ -18,22 +18,15 @@ export const config = {
   wikiDir: resolve(process.env.ONTOLOGY_WIKI_DIR || ".ontology-wiki/wiki"),
   appSecret: process.env.APP_SECRET || "ontology-query-local-development-secret",
   queryTimeoutMs: numberFromEnv("QUERY_TIMEOUT_MS", 30_000),
-  queryLlmTimeoutMs: numberFromEnv("QUERY_LLM_TIMEOUT_MS", 90_000),
   queryMaxRows: numberFromEnv("QUERY_MAX_ROWS", 500),
   explainMaxRows: numberFromEnv("EXPLAIN_MAX_ROWS", 1_000_000),
-  semanticQueryPlanMode: enumFromEnv("SEMANTIC_QUERY_PLAN_MODE", ["off","prefer","required"], "off"),
-  queryAgentMode: enumFromEnv("QUERY_AGENT_MODE", ["off","prefer","required"], "off"),
-  queryAgentTrafficPercent: integerRangeFromEnv("QUERY_AGENT_TRAFFIC_PERCENT",0,100,100),
-  queryAgentMaxIterations: numberFromEnv("QUERY_AGENT_MAX_ITERATIONS", 8),
-  queryAgentMaxSqlCalls: numberFromEnv("QUERY_AGENT_MAX_SQL_CALLS", 5),
-  queryAgentMaxScannedRows: numberFromEnv("QUERY_AGENT_MAX_SCANNED_ROWS", 5_000_000),
-  queryAgentPendingTtlMs: numberFromEnv("QUERY_AGENT_PENDING_TTL_MS", 600_000),
+  queryMaxSqlCalls: numberFromEnv("QUERY_MAX_SQL_CALLS", 5),
+  queryMaxScannedRows: numberFromEnv("QUERY_MAX_SCANNED_ROWS", 5_000_000),
+  queryPendingTtlMs: numberFromEnv("QUERY_PENDING_TTL_MS", 600_000),
   // Claude Code query bridge is disabled by default.  The API key is deliberately
   // not copied into this runtime config object: the bridge reads ANTHROPIC_API_KEY
   // from its explicitly constructed child-process environment.
   claudeQuery: {
-    mode: enumFromEnv("CLAUDE_QUERY_MODE", ["off", "prefer", "required"], "off"),
-    trafficPercent: integerRangeFromEnv("CLAUDE_QUERY_TRAFFIC_PERCENT", 0, 100, 0),
     binary: textFromEnv("CLAUDE_QUERY_BINARY", "/app/node_modules/.bin/claude"),
     model: textFromEnv("CLAUDE_QUERY_MODEL", ""),
     promptVersion: textFromEnv("CLAUDE_QUERY_PROMPT_VERSION", "claude-query-v1"),
@@ -44,7 +37,6 @@ export const config = {
     queueTimeoutMs: integerRangeFromEnv("CLAUDE_QUERY_QUEUE_TIMEOUT_MS", 0, 120_000, 5_000),
     maxStdioBytes: integerRangeFromEnv("CLAUDE_QUERY_MAX_STDIO_BYTES", 64 * 1024, 16 * 1024 * 1024, 2 * 1024 * 1024),
   },
-  metricProposalEnabled: String(process.env.METRIC_PROPOSAL_ENABLED??"false").toLowerCase()==="true",
   rateLimits: {
     queryPerMinute:numberFromEnv("RATE_LIMIT_QUERY_PER_MINUTE",30),
     writePerMinute:numberFromEnv("RATE_LIMIT_WRITE_PER_MINUTE",120),

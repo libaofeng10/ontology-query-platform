@@ -5,12 +5,13 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { createApp } from "../src/server.mjs";
+import { createTestSource } from "./fixtures/test-source.mjs";
 
 async function createFixture() {
   const root=await mkdtemp(join(tmpdir(),"ontoquery-question-api-"));
   const connector={close:async()=>{},test:async()=>({ok:true}),query:async()=>[[],[]],explain:async()=>[]};
   const app=createApp({dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"question-api-secret",apiIdentities:[{name:"data-editor",role:"editor",token:"token-editor",sourceIds:"*"}],connector,rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test"});
-  return {app,source:app.store.listSources().find((item)=>item.isDemo)};
+  return {app,source:createTestSource(app.store)};
 }
 
 test("enum answer API only accepts listed options and stale answers cannot overwrite meaning",async()=>{

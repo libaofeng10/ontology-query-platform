@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { extractKnowledgeColumnRefs, findKnowledgeOntologyConflicts, findKnowledgeOntologyMappingConflicts, schemaMappedColumns } from "../src/knowledge-column-refs.mjs";
-import { probeTargets, probeZeroResult, siblingColumns } from "../src/query-result-probe.mjs";
 
 const columnsByTable={
   alpha_account_user:[
@@ -86,49 +85,6 @@ test("metric/rule 多列表达式的辅助谓词列不能借用页面标题升�
   const bound={...metric,propertyBindings:{"fact_order.gross_amount":"order.amount"}};
   const conflicts=findKnowledgeOntologyMappingConflicts([bound],formulaColumns,schema);
   assert.deepEqual(conflicts.map((item)=>[item.column,item.mappedProperty,item.mappedColumn,item.evidence]),[["gross_amount","order.amount","net_amount","structured_property_ref"]]);
-});
-
-test("兄弟字段：按词干重叠找同表字符串字段，排除敏感与非字符串", () => {
-  const siblings=siblingColumns("alpha_account_user","office_name",{columnsByTable});
-  assert.ok(siblings.includes("user_office_name"));
-  assert.ok(siblings.includes("standard_office_name"));
-  assert.ok(!siblings.includes("phone"));
-  assert.ok(!siblings.includes("expire_time"));
-});
-
-const schema={objectTypes:[{apiName:"alpha_product_account",primaryKey:"id",properties:[
-  {apiName:"office_name",type:"string",mapping:{table:"alpha_account_user",column:"office_name"}},
-]}]};
-
-test("探针目标：仅字符串 eq/contains 过滤产生目标", () => {
-  const plan={filters:[{property:"alpha_product_account.office_name",operator:"contains",value:"北京大成"}]};
-  const targets=probeTargets(plan,schema,{columnsByTable});
-  assert.ok(targets.length>=1);
-  assert.ok(targets.every((target)=>target.table==="alpha_account_user"&&target.filterColumn==="office_name"));
-  assert.equal(probeTargets({filters:[{property:"alpha_product_account.office_name",operator:"gt",value:"1"}]},schema,{columnsByTable}).length,0);
-  assert.equal(probeTargets({filters:[{property:"alpha_product_account.office_name",operator:"eq",value:123}]},schema,{columnsByTable}).length,0);
-});
-
-test("零行探针：兄弟字段有命中时产出 findings，探针 SQL 过护栏", async () => {
-  const executed=[];
-  const connector={
-    explain:async()=>[{rows:100}],
-    query:async(_source,sql)=>{executed.push(sql);return sql.includes("user_office_name")?[[{match_count:37}]]:[[{match_count:0}]];},
-  };
-  const plan={filters:[{property:"alpha_product_account.office_name",operator:"contains",value:"北京大成"}]};
-  const findings=await probeZeroResult({plan,schema,catalog:{columnsByTable},connector,source:{},signal:undefined});
-  assert.equal(findings.length,1);
-  assert.equal(findings[0].siblingColumn,"user_office_name");
-  assert.equal(findings[0].matchCount,37);
-  assert.ok(executed.every((sql)=>sql.startsWith("SELECT COUNT(*)")));
-});
-
-test("零行探针：EXPLAIN 超阈值或查询失败时静默跳过", async () => {
-  const plan={filters:[{property:"alpha_product_account.office_name",operator:"eq",value:"北京大成"}]};
-  const tooBig={explain:async()=>[{rows:2_000_000}],query:async()=>{throw new Error("should not run");}};
-  assert.deepEqual(await probeZeroResult({plan,schema,catalog:{columnsByTable},connector:tooBig,source:{}}),[]);
-  const failing={explain:async()=>[{rows:1}],query:async()=>{throw new Error("boom");}};
-  assert.deepEqual(await probeZeroResult({plan,schema,catalog:{columnsByTable},connector:failing,source:{}}),[]);
 });
 
 test("发布校验：已验证知识页引用未映射字段产生 warning，不阻塞发布", async () => {

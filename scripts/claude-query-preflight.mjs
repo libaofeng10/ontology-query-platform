@@ -7,7 +7,6 @@
  * Usage:
  *   CLAUDE_QUERY_MODEL=... ANTHROPIC_API_KEY=... node scripts/claude-query-preflight.mjs
  *   ... --local-only       # validate enabled prerequisites without an API call
- *   ... --check-enabled    # validate those prerequisites even when mode=off
  */
 import { spawn as nodeSpawn } from "node:child_process";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -36,19 +35,15 @@ export async function runClaudeQueryPreflight({
   config = defaultConfig,
   env = process.env,
   localOnly = false,
-  checkEnabled = false,
   spawnImpl = nodeSpawn,
   readinessChecker = inspectClaudeQueryReadiness,
   tempRoot = DEFAULT_PREFLIGHT_TEMP_ROOT,
 } = {}) {
   const sourceEnv = env && typeof env === "object" ? env : process.env;
-  const configuredMode = normalizeMode(config?.claudeQuery?.mode);
-  const readinessConfig = checkEnabled && configuredMode === "off"
-    ? { ...config, claudeQuery: { ...(config?.claudeQuery || {}), mode: "prefer" } }
-    : config;
+  const configuredMode = "claude";
   let readiness;
   try {
-    readiness = await readinessChecker({ config: readinessConfig, env: sourceEnv });
+    readiness = await readinessChecker({ config, env: sourceEnv });
   } catch (error) {
     return {
       ok: false,
@@ -62,19 +57,15 @@ export async function runClaudeQueryPreflight({
     return {
       ok: false,
       mode: configuredMode,
-      ...(checkEnabled && configuredMode === "off" ? { checkedAsEnabled: true } : {}),
       readiness: redactReadiness(readiness, sourceEnv.ANTHROPIC_API_KEY),
     };
   }
 
-  // A disabled bridge is a successful no-op. In particular, never spawn the
-  // CLI in this state, even when --local-only was omitted.
-  if (localOnly || configuredMode === "off" || readiness.enabled === false || readiness.mode === "off") {
+  // Local validation never launches a model request.
+  if (localOnly) {
     return {
       ok: true,
       mode: configuredMode,
-      ...(checkEnabled && configuredMode === "off" ? { checkedAsEnabled: true } : {}),
-      ...(!localOnly && configuredMode === "off" ? { skipped: true } : {}),
       readiness: redactReadiness(readiness, sourceEnv.ANTHROPIC_API_KEY),
     };
   }
@@ -289,7 +280,7 @@ function redactReadiness(value, secret = "") {
   return {
     ok: Boolean(value.ok),
     enabled: Boolean(value.enabled),
-    mode: String(value.mode || "off"),
+    mode: "claude",
     binary: value.binary ? {
       path: String(value.binary.path || ""),
       exists: Boolean(value.binary.exists),
@@ -327,14 +318,9 @@ function safeError(error, secret = "") {
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  const result = await runClaudeQueryPreflight({ localOnly: process.argv.includes("--local-only"), checkEnabled: process.argv.includes("--check-enabled") });
+  const result = await runClaudeQueryPreflight({ localOnly: process.argv.includes("--local-only") });
   const serialized = JSON.stringify(result, null, 2);
   if (!result.ok && result.readiness) console.error(serialized);
   else console.log(serialized);
   if (!result.ok) process.exitCode = 1;
-}
-
-function normalizeMode(value) {
-  const mode = String(value || "off").trim().toLowerCase();
-  return ["off", "prefer", "required"].includes(mode) ? mode : "off";
 }

@@ -1,9 +1,6 @@
-import { relationPairs, relationKey, reverseRelation } from "./physical-relation.mjs";
 import { randomUUID, createHash } from "node:crypto";
-import { guardSql, guardReadOnlySql } from "./sql-guard.mjs";
-import { buildQueryColumnSemantics, detectQuestionValueKinds } from "./query-column-semantics.mjs";
+import { guardReadOnlySql } from "./sql-guard.mjs";
 import { normalizeQueryRow } from "./query-result-normalization.mjs";
-import { queryIntentFilterError, queryResultContractValidation } from "./query-scope-coverage.mjs";
 import { toolFailure } from "./query-errors.mjs";
 
 // The shared query-errors helper historically exposed the human-readable
@@ -15,50 +12,27 @@ function kernelFailure(input = {}) {
   return { ...failure, reason: failure.error, retryable: Boolean(failure.retryable) };
 }
 
-/**
- * The one execution authority shared by every query planner.
- *
- * A planner is allowed to propose SQL, but it must never own the sequence
- * read-only guard -> optional ontology checks -> EXPLAIN -> query.
- * Keeping that sequence in this module gives the Claude adapter and the legacy
- * tool loop the same execution and resource boundary. The coordinator selects
- * database mode for Claude; other planners retain ontology validation.
- *
- * The module deliberately has a small interface.  Callers provide immutable
- * request dependencies and (where a clarification can replace the intent or
- * retrieval evidence) getter functions.  Full rows stay in this process; the
- * execution response contains only a bounded preview while `executionId`
- * identifies the in-memory run for a trusted caller.
- */
+/** Execute SQL from Claude or reviewed Gold cases: read-only AST, EXPLAIN,
+ * resource budgets, cancellation and request-local execution receipts. */
 export function createQueryExecutionKernel({
   connector,
   source,
   config = {},
-  question = "",
   catalog = {},
-  schemaMode = "ontology",
-  queryIntent,
-  retrievalEvidence,
-  disclosedTables,
-  getQueryIntent,
-  getRetrievalEvidence,
-  getDisclosedTables,
   signal,
   maxSqlCalls,
   maxScannedRows,
-  forbidSensitiveOutput = false,
   preview = {},
 } = {}) {
   if (!connector || typeof connector.query !== "function") throw new TypeError("query execution kernel 需要 connector.query");
   if (!source || source.id == null) throw new TypeError("query execution kernel 需要 source");
-  if (!["ontology", "database"].includes(schemaMode)) throw new TypeError("无效的 schemaMode");
 
   const effectiveConfig = config || {};
   const maxRows = boundedPositiveInt(effectiveConfig.queryMaxRows ?? catalog.policy?.maxRows, 500, 1, 100_000);
   const explainMaxRows = boundedPositiveInt(effectiveConfig.explainMaxRows, 1_000_000, 1, Number.MAX_SAFE_INTEGER);
-  const sqlCallLimit = boundedPositiveInt(maxSqlCalls ?? effectiveConfig.queryAgentMaxSqlCalls, 5, 1, 10_000);
+  const sqlCallLimit = boundedPositiveInt(maxSqlCalls ?? effectiveConfig.queryMaxSqlCalls, 5, 1, 10_000);
   const scanLimit = boundedPositiveInt(
-    maxScannedRows ?? effectiveConfig.queryAgentMaxScannedRows,
+    maxScannedRows ?? effectiveConfig.queryMaxScannedRows,
     Math.max(explainMaxRows * sqlCallLimit, explainMaxRows),
     1,
     Number.MAX_SAFE_INTEGER,
@@ -69,27 +43,18 @@ export function createQueryExecutionKernel({
     maxCellChars: boundedPositiveInt(preview.maxCellChars ?? effectiveConfig.queryExecutionPreviewCellChars, 200, 16, 10_000),
   };
 
-  // A catalog produced by query-agent-loop already contains these fields.  A
-  // standalone Claude bridge may only provide columnsByTable; derive the
-  // minimal policy in that case rather than silently allowing arbitrary SQL.
-  const catalogPolicy = buildCatalogPolicy(catalog, maxRows, question, forbidSensitiveOutput);
   const runs = new Map();
   let sqlCalls = 0;
   let scannedRowsTotal = 0;
   // Database-confirmed schema mistakes may be corrected without consuming the
   // last data-query slot. This is a small request-local allowance, not a way
   // to retry scans, empty results, policy failures or timeouts indefinitely.
-  const maxSchemaRepairs = schemaMode === "database" ? 2 : 0;
+  const maxSchemaRepairs = 2;
   let schemaRepairs = 0;
 
   async function execute({
     name = "查询",
     sql,
-    semanticPlan = null,
-    policy = null,
-    // Kept in the call shape for compatibility.  Disclosure is a security
-    // invariant and cannot be disabled by a planner/adapter-provided option.
-    requireDisclosure = true,
     signal: executeSignal,
   } = {}) {
     let requestedSql;
@@ -106,20 +71,14 @@ export function createQueryExecutionKernel({
       return kernelFailure({
         stage: "budget",
         code: "SQL_CALL_BUDGET_EXCEEDED",
-        error: `run_sql 已达到 ${sqlCallLimit} 次上限`,
+        error: `db_query 已达到 ${sqlCallLimit} 次上限`,
       });
     }
     sqlCalls++;
 
-    const activePolicy = mergePolicy(catalogPolicy, policy || semanticPlan?.policy, {
-      valueKinds: catalogPolicy.valueKinds,
-      forbidSensitiveOutput,
-    });
     let verdict;
     try {
-      verdict = schemaMode === "database"
-        ? guardReadOnlySql(requestedSql, { maxRows })
-        : guardSql(requestedSql, activePolicy);
+      verdict = guardReadOnlySql(requestedSql, { maxRows });
     } catch (error) {
       return kernelFailure({ stage: "guard", code: "GUARD_ERROR", error: safeError(error), retryable: false });
     }
@@ -130,67 +89,6 @@ export function createQueryExecutionKernel({
         error: verdict.reason || "SQL 未通过安全护栏",
         retryable: true,
         details: verdict.details,
-      }, verdict);
-    }
-
-    const hasIntentContract = typeof getQueryIntent === "function" || queryIntent != null;
-    const intent = resolveValue(getQueryIntent, queryIntent);
-    const retrieval = resolveValue(getRetrievalEvidence, retrievalEvidence);
-    const contractExecution = {
-      usedTables: verdict.tables,
-      retrieval,
-      verdict,
-      columnsByTable: catalog.columnsByTable || {},
-      semanticContract: semanticPlan?.semanticContract || null,
-    };
-    let intentError = null;
-    try {
-      intentError = hasIntentContract
-        ? queryIntentFilterError(question, verdict.sql, intent, contractExecution)
-        : null;
-    } catch (error) {
-      return failureWithVerdict({ stage: "intent", code: "INTENT_VALIDATION_ERROR", error: safeError(error), retryable: false }, verdict);
-    }
-    if (intentError) {
-      return failureWithVerdict({
-        stage: "intent",
-        code: intentError.code || "INTENT_FILTER_REJECTED",
-        error: intentError.message,
-        retryable: intentError.retryable,
-        details: intentError.details,
-      }, verdict);
-    }
-    let contractValidation;
-    try {
-      contractValidation = hasIntentContract
-        ? queryResultContractValidation(intent, verdict.sql, contractExecution)
-        : { ok: true, errors: [] };
-    } catch (error) {
-      return failureWithVerdict({ stage: "intent", code: "INTENT_CONTRACT_ERROR", error: safeError(error), retryable: false }, verdict);
-    }
-    if (!contractValidation.ok) {
-      const error = contractValidation.errors?.[0] || {};
-      return failureWithVerdict({
-        stage: "intent",
-        code: error.code || "INTENT_RESULT_CONTRACT_MISMATCH",
-        error: error.message || "SQL 未满足查询结果契约",
-        retryable: true,
-        details: error.details,
-      }, verdict);
-    }
-
-    // The coordinator selects schemaMode once. Per-SQL tool arguments cannot
-    // change it; ontology-mode callers retain their existing disclosure gate.
-    void requireDisclosure;
-    const disclosed = resolveDisclosure(getDisclosedTables, disclosedTables);
-    const undisclosed = verdict.tables.filter((table) => !disclosed.has(normalizeIdentifier(table)));
-    if (schemaMode === "ontology" && undisclosed.length) {
-      return failureWithVerdict({
-        stage: "guard",
-        code: "DISCLOSURE_REQUIRED",
-        error: `执行前必须先用 get_schema 查看表：${undisclosed.join(", ")}`,
-        retryable: true,
-        details: { undisclosedTables: undisclosed },
       }, verdict);
     }
 
@@ -210,12 +108,7 @@ export function createQueryExecutionKernel({
       const connectorOverflow = rawNormalizedRows.length > effectiveResultLimit;
       const boundedNormalizedRows = connectorOverflow ? rawNormalizedRows.slice(0, effectiveResultLimit) : rawNormalizedRows;
       const rawFieldsNormalized = normalizeFields(rawFields, boundedNormalizedRows);
-      const forbiddenOutputNames = new Set((activePolicy.forbiddenOutputColumns || [])
-        .map((value) => String(value).split(".").at(-1).toLowerCase()));
-      const fields = rawFieldsNormalized.filter((field) => !forbiddenOutputNames.has(String(field.name).toLowerCase()));
-      // A connector is expected to return only projected columns, but keep the
-      // execution boundary defensive: an over-eager/mock driver must not leak
-      // an extra sensitive column into the private run or final API response.
+      const fields = rawFieldsNormalized;
       const projectedNames = new Set(fields.map((field) => String(field.name)));
       const rows = boundedNormalizedRows.map((row) => Object.fromEntries(
         Object.entries(row).filter(([name]) => projectedNames.has(String(name))),
@@ -232,11 +125,9 @@ export function createQueryExecutionKernel({
         rows,
         fields,
         verdict,
-        contractValidation,
         scannedRows: explanation.scannedRows,
         durationMs: Date.now() - executionStarted,
         resultDelivery,
-        semanticPlan,
         mayBeTruncated,
       };
       runs.set(executionId, run);
@@ -331,7 +222,7 @@ export function createQueryExecutionKernel({
   }
 
   function driverFailure(stage, error) {
-    const schemaCode = schemaMode === "database" ? mysqlSchemaErrorCode(error) : null;
+    const schemaCode = mysqlSchemaErrorCode(error);
     return kernelFailure({ stage, code: schemaCode || (stage === "explain" ? "EXPLAIN_ERROR" : "EXECUTION_ERROR"), error: safeError(error), retryable: true });
   }
 
@@ -368,7 +259,7 @@ export function createQueryExecutionKernel({
     stats,
     clearRuns,
     clear,
-    policy: catalogPolicy,
+    policy: {maxRows},
   };
 }
 
@@ -377,302 +268,6 @@ function mysqlSchemaErrorCode(error) {
   if (error?.code === "ER_NO_SUCH_TABLE" || Number(error?.errno) === 1146) return "UNKNOWN_TABLE";
   if (error?.code === "ER_NON_UNIQ_ERROR" || Number(error?.errno) === 1052) return "AMBIGUOUS_COLUMN";
   return null;
-}
-
-function buildCatalogPolicy(catalog, maxRows, question, forbidSensitiveOutput) {
-  const sourcePolicy = catalog.policy || {};
-  const columnsByTable = catalog.columnsByTable || {};
-  const semantics = sourcePolicy.allowedColumns != null
-    ? {
-      allowedColumns: sourcePolicy.allowedColumns,
-      columnKinds: sourcePolicy.columnKinds || {},
-    }
-    : buildQueryColumnSemantics(columnsByTable);
-  const relations = sourcePolicy.allowedRelations ?? catalog.relations ?? [];
-  const enums = sourcePolicy.enums ?? catalog.enums ?? {};
-  const policy = {
-    ...sourcePolicy,
-    allowedTables: sourcePolicy.allowedTables ?? Object.keys(columnsByTable),
-    allowedColumns: sourcePolicy.allowedColumns ?? semantics.allowedColumns,
-    columnKinds: sourcePolicy.columnKinds ?? semantics.columnKinds,
-    allowedRelations: relations,
-    maxRows,
-    enums: normalizeEnums(enums),
-    valueKinds: sourcePolicy.valueKinds ?? detectQuestionValueKinds(question),
-  };
-  if (forbidSensitiveOutput) {
-    // 2026-09-04 应用户要求移除敏感列输出禁令：不再从 catalog 派生
-    // forbiddenOutputColumns。调用方显式传入的 forbiddenOutputColumns 仍然生效
-    // （那是调用方的明确策略，不是敏感列自动推断）。
-    void columnsByTable;
-  }
-  return policy;
-}
-
-function mergePolicy(base, override, { valueKinds, forbidSensitiveOutput } = {}) {
-  const parent = isRecord(base) ? base : {};
-  const child = isRecord(override) ? override : {};
-  const merged = { ...parent, ...child };
-
-  // A semantic plan is untrusted input at this boundary.  It may narrow the
-  // catalog policy, but replacing an allow-list would turn a planner bug (or
-  // a forged plan supplied by an adapter) into an authority escalation.  Each
-  // allow-list is therefore intersected explicitly instead of being spread.
-  if (hasPolicyValue(parent, "allowedTables") || hasPolicyValue(child, "allowedTables")) {
-    merged.allowedTables = intersectAllowedTables(parent.allowedTables, child.allowedTables);
-  }
-  if (hasPolicyValue(parent, "allowedColumns") || hasPolicyValue(child, "allowedColumns")) {
-    merged.allowedColumns = intersectAllowedColumns(parent.allowedColumns, child.allowedColumns, merged.allowedTables);
-  }
-  // When the base policy deliberately omits a table allow-list, an explicit
-  // child column map still denotes a closed scope.  Derive the corresponding
-  // table list instead of letting sql-guard's missing-table-key path become
-  // unrestricted.
-  if (!hasPolicyValue(parent, "allowedTables") && !hasPolicyValue(child, "allowedTables") && hasPolicyValue(child, "allowedColumns")) {
-    const childTables = Object.keys(policyMap(child.allowedColumns) || {});
-    merged.allowedTables = childTables.length ? childTables : [NO_ALLOWED_TABLE];
-  }
-  if (hasPolicyValue(parent, "allowedRelations") || hasPolicyValue(child, "allowedRelations")) {
-    // `allowedRelations: []` is a meaningful deny-all relation policy in the
-    // SQL guard, so an empty intersection must stay empty (never fall back to
-    // an override list).
-    merged.allowedRelations = intersectAllowedRelations(parent.allowedRelations, child.allowedRelations);
-  }
-
-  // Deny-lists and mandatory predicates compose monotonically: an override
-  // can add a restriction, but it can never erase one from the catalog.
-  merged.forbiddenColumns = unionPolicyValues(parent.forbiddenColumns, child.forbiddenColumns);
-  merged.forbiddenOutputColumns = unionPolicyValues(parent.forbiddenOutputColumns, child.forbiddenOutputColumns);
-  merged.mandatoryFilters = unionPolicyObjects(parent.mandatoryFilters, child.mandatoryFilters);
-
-  // Preserve the strongest dictionary/type constraints.  Adding a closed
-  // enum or a value/column kind is safe; replacing a parent constraint is not.
-  merged.enums = mergeEnumPolicies(parent.enums, child.enums);
-  merged.columnKinds = mergeColumnKinds(parent.columnKinds, child.columnKinds);
-  merged.valueKinds = unionValueKinds(parent.valueKinds, child.valueKinds);
-  if (Array.isArray(valueKinds) && valueKinds.length) merged.valueKinds = unionValueKinds(merged.valueKinds, valueKinds);
-
-  const parentMaxRows = finitePositive(parent.maxRows);
-  const childMaxRows = finitePositive(child.maxRows);
-  if (parentMaxRows != null || childMaxRows != null) {
-    const candidates = [parentMaxRows, childMaxRows].filter((item) => item != null);
-    merged.maxRows = Math.min(...candidates);
-  }
-
-  // `forbidSensitiveOutput` is retained for API compatibility/documentation;
-  // the deny-list union above is intentionally unconditional so an override
-  // cannot clear sensitive-output protection supplied by the base policy.
-  void forbidSensitiveOutput;
-  return merged;
-}
-
-const NO_ALLOWED_TABLE = "__query_execution_kernel_denied__";
-
-function isRecord(value) { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
-function hasPolicyValue(policy, key) { return Object.prototype.hasOwnProperty.call(policy || {}, key) && policy[key] != null; }
-
-function policyList(value) {
-  if (Array.isArray(value)) return value.map((item) => String(item ?? "").trim()).filter(Boolean);
-  if (value instanceof Set) return [...value].map((item) => String(item ?? "").trim()).filter(Boolean);
-  return null;
-}
-
-function intersectAllowedTables(parentValue, childValue) {
-  const parentList = policyList(parentValue);
-  const childList = policyList(childValue);
-  if (parentList == null) {
-    if (childList == null) return parentValue == null ? parentValue : [NO_ALLOWED_TABLE];
-    return childList.length ? [...new Set(childList)] : [NO_ALLOWED_TABLE];
-  }
-  if (childList == null) return parentList.length ? parentList : [NO_ALLOWED_TABLE];
-  const parentSet = new Set(parentList.map(normalizeIdentifier));
-  const result = childList.filter((item) => parentSet.has(normalizeIdentifier(item)));
-  return result.length ? [...new Set(result)] : [NO_ALLOWED_TABLE];
-}
-
-function intersectAllowedColumns(parentValue, childValue, allowedTables) {
-  const parentMap = policyMap(parentValue);
-  const childMap = policyMap(childValue);
-  if (parentMap == null) {
-    if (childMap == null) return parentValue == null ? parentValue : { [NO_ALLOWED_TABLE]: [] };
-    return completeColumnPolicyForTables(cloneColumnPolicy(childMap), allowedTables);
-  }
-  if (childMap == null) return cloneColumnPolicy(parentMap);
-  const parentByTable = mapPolicyEntries(parentMap);
-  const childByTable = mapPolicyEntries(childMap);
-  const tableSet = policyList(allowedTables);
-  const result = {};
-  for (const [parentTable, parentColumns] of parentByTable.entries()) {
-    const normalizedTable = normalizeIdentifier(parentTable);
-    if (tableSet && tableSet.length && !tableSet.some((item) => normalizeIdentifier(item) === normalizedTable)) continue;
-    const childEntry = childByTable.get(normalizedTable);
-    if (!childEntry) {
-      // An explicitly supplied child map is a complete scope declaration:
-      // omitted tables receive an empty list.  Keeping an empty entry is
-      // important because sql-guard treats a missing map key as unrestricted.
-      result[parentTable] = [];
-      continue;
-    }
-    const childColumns = new Set(normalizeColumnList(childEntry).map(normalizeIdentifier));
-    result[parentTable] = normalizeColumnList(parentColumns).filter((column) => childColumns.has(normalizeIdentifier(column)));
-  }
-  // If the parent had no table entries, a child map cannot widen it.  Emit
-  // empty entries for the intersected tables so an explicit empty child map
-  // remains a deny-all column policy rather than becoming guardSql's
-  // unrestricted `{}` form.
-  if (!Object.keys(result).length && tableSet?.length) {
-    for (const table of tableSet) if (normalizeIdentifier(table) !== normalizeIdentifier(NO_ALLOWED_TABLE)) result[table] = [];
-  }
-  return result;
-}
-
-function policyMap(value) { return isRecord(value) ? value : null; }
-
-function mapPolicyEntries(value) {
-  return new Map(Object.entries(value || {}).map(([key, columns]) => [normalizeIdentifier(key), columns]));
-}
-
-function normalizeColumnList(value) {
-  if (Array.isArray(value)) return value.map((item) => String(item ?? "").trim()).filter(Boolean);
-  if (value instanceof Set) return [...value].map((item) => String(item ?? "").trim()).filter(Boolean);
-  return [];
-}
-
-function cloneColumnPolicy(value) {
-  return Object.fromEntries(Object.entries(value || {}).map(([table, columns]) => [table, normalizeColumnList(columns)]));
-}
-
-function completeColumnPolicyForTables(value, allowedTables) {
-  const result = value || {};
-  for (const table of policyList(allowedTables) || []) {
-    if (normalizeIdentifier(table) === normalizeIdentifier(NO_ALLOWED_TABLE)) continue;
-    if (!Object.keys(result).some((key) => normalizeIdentifier(key) === normalizeIdentifier(table))) result[table] = [];
-  }
-  return result;
-}
-
-function intersectAllowedRelations(parentValue, childValue) {
-  const parentList = policyListObjects(parentValue);
-  const childList = policyListObjects(childValue);
-  if (parentList == null) return [];
-  if (childList == null) return parentList;
-  const childKeys = new Set(childList.flatMap(relationPolicyKeys));
-  return parentList.filter((relation) => relationPolicyKeys(relation).some((key) => childKeys.has(key)));
-}
-
-function policyListObjects(value) {
-  if (Array.isArray(value)) return value.filter((item) => isRecord(item));
-  if (value instanceof Set) return [...value].filter((item) => isRecord(item));
-  return null;
-}
-
-function relationPolicyKeys(relation) {
-  if (!isRecord(relation)) return [];
-  const keys = [];
-  const id = relation.id ?? relation.relationId;
-  if (id != null && String(id).trim()) keys.push(`id:${String(id).trim()}`);
-  const fromTable = relation.fromTable ?? relation.from_table;
-  const fromCol = relation.fromCol ?? relation.fromColumn ?? relation.from_col;
-  const toTable = relation.toTable ?? relation.to_table;
-  const toCol = relation.toCol ?? relation.toColumn ?? relation.to_col;
-  if ([fromTable, fromCol, toTable, toCol].every((item) => String(item ?? "").trim())) {
-    try{const normalized={fromTable:normalizeIdentifier(fromTable),toTable:normalizeIdentifier(toTable),columnPairs:relationPairs({...relation,fromCol,toCol}).map(pair=>({fromCol:normalizeIdentifier(pair.fromCol),toCol:normalizeIdentifier(pair.toCol)}))};keys.push(`edge:${relationKey(normalized)}`,`edge:${relationKey(reverseRelation(normalized))}`);}catch{return [];}
-  }
-  return keys;
-}
-
-function unionPolicyValues(parentValue, childValue) {
-  const values = [...(policyList(parentValue) || []), ...(policyList(childValue) || [])];
-  if (!values.length && parentValue == null && childValue == null) return parentValue ?? childValue;
-  const seen = new Set();
-  return values.filter((value) => {
-    const key = normalizeIdentifier(value);
-    if (seen.has(key)) return false;
-    seen.add(key); return true;
-  });
-}
-
-function unionPolicyObjects(parentValue, childValue) {
-  const values = [...(Array.isArray(parentValue) ? parentValue : []), ...(Array.isArray(childValue) ? childValue : [])];
-  if (!values.length && parentValue == null && childValue == null) return parentValue ?? childValue;
-  const seen = new Set();
-  return values.filter((value) => {
-    let key;
-    try { key = JSON.stringify(value); } catch { key = String(value); }
-    if (seen.has(key)) return false;
-    seen.add(key); return true;
-  });
-}
-
-function mergeEnumPolicies(parentValue, childValue) {
-  const parentMap = isRecord(parentValue) ? parentValue : {};
-  const childMap = isRecord(childValue) ? childValue : {};
-  const result = {};
-  const childByKey = new Map(Object.entries(childMap).map(([key, value]) => [normalizeIdentifier(key), [key, value]]));
-  for (const [parentKey, parentSpec] of Object.entries(parentMap)) {
-    const childEntry = childByKey.get(normalizeIdentifier(parentKey));
-    if (!childEntry) { result[parentKey] = cloneEnumSpec(parentSpec); continue; }
-    result[parentKey] = intersectEnumSpec(parentSpec, childEntry[1]);
-    childByKey.delete(normalizeIdentifier(parentKey));
-  }
-  // A dictionary absent from the parent starts from an unrestricted field;
-  // adding the child's dictionary is a safe narrowing operation.
-  for (const [key, value] of childByKey.values()) result[key] = cloneEnumSpec(value);
-  return Object.keys(result).length ? result : (parentValue ?? childValue);
-}
-
-function cloneEnumSpec(value) {
-  if (Array.isArray(value)) return [...value];
-  return isRecord(value) ? { ...value, ...(Array.isArray(value.values) ? { values: [...value.values] } : {}) } : value;
-}
-
-function intersectEnumSpec(parentValue, childValue) {
-  const parentSpec = normalizeEnumSpec(parentValue);
-  const childSpec = normalizeEnumSpec(childValue);
-  const parentClosed = parentSpec.mode === "closed" && Array.isArray(parentSpec.values);
-  const childClosed = childSpec.mode === "closed" && Array.isArray(childSpec.values);
-  if (!parentClosed && !childClosed) return cloneEnumSpec(parentValue);
-  if (parentClosed && !childClosed) return { ...parentSpec, values: [...parentSpec.values] };
-  if (!parentClosed && childClosed) return { ...childSpec, values: [...childSpec.values] };
-  const childValues = new Set(childSpec.values.map((item) => String(item)));
-  return { ...parentSpec, mode: "closed", values: parentSpec.values.filter((item) => childValues.has(String(item))) };
-}
-
-function normalizeEnumSpec(value) {
-  if (Array.isArray(value)) return { mode: "closed", values: [...value] };
-  if (isRecord(value)) return { mode: String(value.mode || "closed").toLowerCase(), values: Array.isArray(value.values) ? [...value.values] : [] };
-  return { mode: "unknown", values: [] };
-}
-
-function mergeColumnKinds(parentValue, childValue) {
-  const result = isRecord(parentValue) ? { ...parentValue } : {};
-  if (isRecord(childValue)) {
-    for (const [key, value] of Object.entries(childValue)) {
-      const existingKey = Object.keys(result).find((item) => normalizeIdentifier(item) === normalizeIdentifier(key));
-      // Never replace a catalog type hint.  A child may add a hint for a
-      // previously untyped column, which only makes value validation stricter.
-      if (!existingKey || result[existingKey] == null || result[existingKey] === "") result[key] = value;
-    }
-  }
-  return Object.keys(result).length ? result : (parentValue ?? childValue);
-}
-
-function unionValueKinds(parentValue, childValue) {
-  const values = [...(Array.isArray(parentValue) ? parentValue : []), ...(Array.isArray(childValue) ? childValue : [])];
-  if (!values.length && parentValue == null && childValue == null) return parentValue ?? childValue;
-  const seen = new Set();
-  return values.filter((item) => {
-    const value = String(item?.value ?? "");
-    const kind = String(item?.kind ?? "");
-    const key = `${value.toLowerCase()}\u0000${kind.toLowerCase()}`;
-    if (seen.has(key)) return false;
-    seen.add(key); return true;
-  });
-}
-
-function finitePositive(value) {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? Math.floor(number) : null;
 }
 
 function cloneRun(run) {
@@ -684,32 +279,12 @@ function registryFailure(code, error) {
   return { ok: false, stage: "registry", code, error: reason, reason, retryable: false, runs: [] };
 }
 
-function resolveValue(getter, fallback) {
-  try { return typeof getter === "function" ? getter() : fallback; } catch { return fallback; }
-}
-
 function resolveSignal(value) {
   try { return typeof value === "function" ? value() : value; } catch { return undefined; }
 }
 
-function resolveDisclosure(getter, fallback) {
-  const value = resolveValue(getter, fallback);
-  if (value instanceof Set) return new Set([...value].map(normalizeIdentifier));
-  if (Array.isArray(value)) return new Set(value.map(normalizeIdentifier));
-  return new Set();
-}
-
 function failureWithVerdict(failure, verdict) {
   return { ...kernelFailure(failure), verdict, ...(verdict?.details ? { details: verdict.details } : {}) };
-}
-
-function normalizeEnums(enums) {
-  if (!enums || typeof enums !== "object") return {};
-  return Object.fromEntries(Object.entries(enums).map(([key, value]) => {
-    if (Array.isArray(value)) return [key, value];
-    if (value && typeof value === "object") return [key, value];
-    return [key, { mode: "unknown", values: [] }];
-  }));
 }
 
 function normalizeFields(fields, rows) {
@@ -755,7 +330,6 @@ function boundedPositiveInt(value, fallback, min, max) {
   return Number.isFinite(number) ? Math.max(min, Math.min(max, Math.floor(number))) : fallback;
 }
 
-function normalizeIdentifier(value) { return String(value || "").replaceAll("`", "").toLowerCase(); }
 function sqlHash(sql) { return createHash("sha256").update(String(sql || "").trim().replace(/\s+/g, " ")).digest("hex"); }
 function safeError(error) {
   return String(error?.message || error)

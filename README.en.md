@@ -11,18 +11,18 @@ English | [简体中文](./README.md)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-Apache--2.0-D22128)
 
-OntoQuery is an ontology-driven conversational analytics platform for enterprise data. It discovers metadata and bounded value evidence from read-only MySQL sources, builds human-reviewed business objects, properties, and links, and produces traceable answers through semantic query plans, SQL safety guards, and result-equivalence evaluations.
+OntoQuery is an ontology-driven conversational analytics platform for enterprise data. It discovers metadata and bounded value evidence from read-only MySQL sources, builds human-reviewed business objects, properties, and links, and produces traceable answers by calling Claude Code for question understanding, SQL planning, and answers, with platform-owned execution guards and result-equivalence evaluations.
 
-The built-in “Customer → Order → Payment → Refund” demo domain lets you explore the complete workflow without a live database. Real data sources never fall back to hard-coded answers or fabricated metrics.
+New workspaces start empty. Connect read-only MySQL and build the ontology; production startup never loads demo data or canned answers.
 
 ## Why OntoQuery
 
-- **Business semantics first** — Object Types, Properties, and Link Types shield planners from raw physical mappings.
-- **Human-approved relationships** — structural candidates, model review, and bounded value checks only produce suggestions; a JOIN becomes executable only after confirmation.
-- **Governed SQL end to end** — every query passes single-`SELECT` AST validation, table/column/JOIN/enum allowlists, `EXPLAIN` cost checks, timeouts, and row limits.
+- **Business semantics first** — Object Types, Properties, and Link Types provide Claude with business definitions and physical mappings.
+- **Human-approved relationships** — structural candidates, model review, and bounded value checks only produce suggestions; confirmed relationships inform Claude without defining database permissions.
+- **Governed SQL end to end** — every query passes single-`SELECT` AST validation, `EXPLAIN` cost checks, timeouts, and row limits.
 - **Evidence-rich answers** — conclusions, tables, charts, and evidence remain traceable to SQL, rules, knowledge pages, and execution audits.
-- **Measurable rollout gates** — Gold SQL equivalence, failure rate, latency, token usage, and tool success metrics gate semantic planning and Agent Loop rollout.
-- **Least privilege by default** — physical read-only checks, AES-256-GCM credential encryption, scoped roles, rate limits, and early sensitive-field filtering.
+- **Quality gates** — compare Claude results with reviewed Gold SQL, repair ontology definitions, and rerun before publishing.
+- **Least privilege by default** — physical read-only checks, AES-256-GCM credential encryption, scoped roles, rate limits, and read-only execution guards.
 
 ## Capabilities
 
@@ -33,12 +33,13 @@ The built-in “Customer → Order → Payment → Refund” demo domain lets yo
 | Ontology knowledge | `tables / terms / metrics / joins / rules` Markdown pages, SQLite CRUD, term-first retrieval, and Wikilink expansion |
 | Business modeling | visual Object / Property / Link editing, physical mappings, immutable versions, diffs, revalidation, publish, and rollback |
 | Conversational analytics | semantic Query Plans, controlled SQL compilation, clarification, tables/charts/CSV, and supporting evidence |
-| Agent Loop | budgeted tool loop, stable session bucketing, safe fallback, and complete audit trails |
 | Evaluation governance | isolated Gold SQL, real result-set equivalence, repair suggestions, and semantic/Agent comparison gates |
 | Access control | `viewer / analyst / editor / admin`, bearer tokens, data-source scopes, and rate limits |
 | Operations | Docker Compose baseline, hardened containers, health checks, backup and recovery guidance |
 
 ## Architecture
+
+See [the current query architecture and migration notes](docs/QUERY_ARCHITECTURE.md).
 
 ```mermaid
 flowchart LR
@@ -52,7 +53,7 @@ flowchart LR
   MySQL --> Discovery[Schema Discovery & Bounded Probes]
   Discovery --> Meta
   Meta --> Schema[Business Object Schema]
-  Wiki --> Planner[Semantic Planner / Agent Loop]
+  Wiki --> Planner[Claude Code]
   Schema --> Planner
   Planner --> Guard[AST / Allowlists / JOIN / Enum / EXPLAIN]
   LLM --> Planner
@@ -88,7 +89,7 @@ Open:
 - API health: <http://localhost:8787/api/health>
 - API readiness: <http://localhost:8787/api/ready>
 
-`npm run dev` starts both the web app and the local API. On first launch, the API creates its SQLite database under `.data/` and loads the demo workspace.
+`npm run dev` starts both the web app and the local API. On first launch, the API creates its SQLite database under `.data/` and starts an empty workspace.
 
 Development can use the local admin token from `.env.local`. Do not set `NEXT_PUBLIC_API_WRITE_TOKEN` in production; the sign-in token is kept only in the current tab's `sessionStorage`.
 
@@ -99,7 +100,7 @@ Development can use the local admin token from `.env.local`. Do not set `NEXT_PU
 3. Start discovery. A background task reads metadata, runs bounded probes, creates relationship candidates, and performs batched model review.
 4. Confirm or reject candidates in the disambiguation queue. Model suggestions remain in `review` and never grant JOIN access by themselves.
 5. Model Objects, Properties, Links, and physical mappings in the ontology workspace; validate and publish the Schema.
-6. Build an evaluation set and pass rollout gates before enabling semantic planning or Agent Loop traffic.
+6. Build an evaluation set and validate Claude against Gold SQL before publishing ontology changes.
 
 Relationship review sends only table and column names, types, indexes, and comments to the model. Database passwords and raw sampled values never enter prompts. Column profiling is disabled by default; when enabled, it is restricted to A/B-grade tables and redacted.
 
@@ -113,25 +114,11 @@ LLM_API_KEY=replace-with-your-model-api-key
 LLM_MODEL=your-model-name
 ```
 
-Without a model, the demo workspace uses a deterministic planner. Real sources fail explicitly instead of returning fabricated results.
+Ontology construction uses the LLM configuration above. Queries require `CLAUDE_QUERY_BINARY`, an exact `CLAUDE_QUERY_MODEL`, and `ANTHROPIC_API_KEY`. Run `npm run claude:preflight` before querying.
 
-### Semantic Query Plan
+Claude Code is the sole query engine. The frontend retains `/api/query`, SSE progress, clarification, sessions, charts, tables, and exports. Request-local MCP tools provide ontology reads and guarded SQL execution; answers must reference execution IDs issued by the current request.
 
-Set `SEMANTIC_QUERY_PLAN_MODE` to:
-
-- `off` — use the compatibility pipeline; this is the default.
-- `prefer` — prefer a published, compatible Ontology Schema and fall back only when safe.
-- `required` — require semantic planning and disallow fallback.
-
-### Agent Loop
-
-Set `QUERY_AGENT_MODE` to:
-
-- `off` — keep the single-pass pipeline; this is the default.
-- `prefer` — upgrade to a tool loop when exploration is required or the first guard/execution attempt fails.
-- `required` — allow Agent Loop only.
-
-The agent can call only constrained tools and never receives direct database access. Iterations, SQL calls, cumulative scanned rows, clarification TTL, and traffic percentage are configurable. After evaluation gates pass, a recommended `prefer` rollout is `10% → 30% → 100%`.
+Configure `QUERY_MAX_SQL_CALLS`, `QUERY_MAX_SCANNED_ROWS`, and `QUERY_PENDING_TTL_MS`. Legacy planner modes and rollout flags are retired; migrate old Agent budget settings to these names. A zero Claude request budget disables queries. Historical engine-comparison gates must be rerun against Claude and Gold SQL.
 
 See [`.env.example`](./.env.example) for all environment variables and safety defaults.
 

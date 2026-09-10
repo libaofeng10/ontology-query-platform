@@ -11,6 +11,7 @@ import {createOntologyActivationService} from '../src/ontology-activation-servic
 import {createSourceOntologyBuildService} from '../src/source-ontology-build-service.mjs';
 import {createTaskService} from '../src/task-service.mjs';
 import {evalSetChecksum} from '../src/evaluation-evidence.mjs';
+import {createTestSource} from './fixtures/test-source.mjs';
 
 async function fixture(t,{owner=true,transform=schema=>schema}={}) {
   const root=await mkdtemp(join(tmpdir(),'ontoquery-activation-'));
@@ -18,10 +19,10 @@ async function fixture(t,{owner=true,transform=schema=>schema}={}) {
   const app=createApp({dbPath:join(root,'store.sqlite'),wikiDir:join(root,'wiki'),appSecret:'activation-test-secret',nodeEnv:'test',claudeBridge:null,
     llm:{baseUrl:'',apiKey:'',model:''},embedding:{enabled:false},profiling:{enabled:false},ontologyAi:{mode:'auto_draft',auditDir:join(root,'audit')},
     ontologyCandidateVerifier:false,ontologyCandidateGenerator:{generateObjects:async()=>{modelCalls++;throw Error('activation must reuse its draft');}},
-    apiIdentities:[{name:'viewer',role:'viewer',token:'viewer',sourceIds:[2]},{name:'outsider',role:'editor',token:'outsider',sourceIds:[1]},{name:'editor',role:'editor',token:'editor',sourceIds:'*'}],
+    apiIdentities:[{name:'viewer',role:'viewer',token:'viewer',sourceIds:[1]},{name:'outsider',role:'editor',token:'outsider',sourceIds:[2]},{name:'editor',role:'editor',token:'editor',sourceIds:'*'}],
     connector:{close:async()=>{},query:async()=>[[],[]],explain:async()=>[]},rateLimits:{queryPerMinute:100,readPerMinute:1000,writePerMinute:1000}});
   t.after(async()=>{await app.close();await rm(root,{recursive:true,force:true});});
-  const {store}=app,source=store.createSource({name:'activation',kind:'mysql',host:'db',port:3306,dbName:'activation',userName:'ro',credential:'encrypted',isDemo:true});
+  const {store}=app,source=createTestSource(store,{name:'activation'});
   for(const table of ['customers','orders'])store.upsertTable({sourceId:source.id,tableName:table,rowEstimate:10,grade:'A',active:1,comment:table});
   for(const [table,column,primary,dataType] of [['customers','id',1,'bigint'],['customers','nickname',0,'varchar'],['orders','id',1,'bigint'],['orders','customer_id',0,'bigint']])store.upsertColumn({sourceId:source.id,tableName:table,columnName:column,dataType,isPrimary:primary,isUnique:primary,nullable:!primary?1:0,comment:column});
   store.upsertRelation({sourceId:source.id,fromTable:'orders',fromCol:'customer_id',toTable:'customers',toCol:'id',cardinality:'N:1',confidence:1,status:'confirmed',inferenceSource:'foreign_key'});
@@ -59,7 +60,7 @@ async function finished(store,id) {
 }
 function addCase(f){return f.store.addEvalCase({sourceId:f.source.id,setName:'reviewed',question:'显示客户昵称',goldSql:'SELECT nickname FROM customers',category:'核心业务',heldOut:0});}
 function passGate(f,id=randomUUID()) {
-  return f.store.saveEvalGate({id,sourceId:f.source.id,setName:'reviewed',total:1,ontologySchemaVersion:f.draft.version,evaluationChecksum:evalSetChecksum(f.store.listEvalCasesForImpact(f.source.id)),baseline:{requestedMode:'off',passRate:1},candidate:{requestedMode:'prefer',passRate:1,semanticExecutionRate:1},passed:1,decision:'enable_prefer',reason:'test fixture passed'});
+  return f.store.saveEvalGate({id,sourceId:f.source.id,setName:'reviewed',total:1,ontologySchemaVersion:f.draft.version,evaluationChecksum:evalSetChecksum(f.store.listEvalCasesForImpact(f.source.id)),baseline:{requestedMode:'gold',passRate:1},candidate:{requestedMode:'claude',passRate:1,claudeExecutionRate:1},passed:1,decision:'enable_claude',reason:'test fixture passed'});
 }
 
 test('启用检查只读且明确列出移除字段；重复检查不会创建任务或改变发布版本',async t=>{
@@ -148,7 +149,7 @@ test('启用接口遵守编辑权限和数据源隔离，拒绝无效的处理�
   const f=await fixture(t),info=(await inspect(f)).body;
   assert.equal((await api(f.app,path(f.source,'activate'),input(f,info),'POST','viewer')).status,403);
   assert.equal((await api(f.app,path(f.source,`activation?versionId=${f.draft.id}`),null,'GET','outsider')).status,403);
-  const other=f.store.getPublishedOntologySchema(1);assert.equal((await api(f.app,path(f.source,`activation?versionId=${other.id}`),null,'GET')).status,404);
+  const otherSource=createTestSource(f.store);const other=f.schemas.saveDraft(otherSource.id,f.base.schema,"editor");assert.equal((await api(f.app,path(f.source,`activation?versionId=${other.id}`),null,'GET')).status,404);
   assert.equal((await api(f.app,path(f.source,'activate'),{...input(f,info),mode:'force_publish'})).status,400);
 });
 

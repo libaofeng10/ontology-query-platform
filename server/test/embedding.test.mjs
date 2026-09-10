@@ -6,7 +6,6 @@ import test from "node:test";
 import { createStore } from "../src/store.mjs";
 import { callLlmEmbedding } from "../src/embedding-client.mjs";
 import { createEmbeddingIndex, pageText, tableText } from "../src/embedding-index.mjs";
-import { retrieveKnowledge } from "../src/knowledge-retrieval.mjs";
 
 const EMBEDDING={baseUrl:"https://embed.test/v1",apiKey:"embed-key",model:"embed-v1",dimensions:null};
 
@@ -87,57 +86,4 @@ test("index text builders capture titles, aliases, comments and truncate content
   assert.ok(text.length<1000);
   const table=tableText({tableName:"crm_customer",comment:"客户主表"},[{columnName:"customer_id",comment:"客户编号"}]);
   assert.ok(table.includes("crm_customer")&&table.includes("客户编号"));
-});
-
-test("hybrid retrieval recalls high-similarity pages lexical scoring misses",()=>{
-  const pages=[
-    {pageType:"term",slug:"valid-customer",title:"有效客户",aliases:["有效户"],tables:["crm_customer"],content:"近90天下单",verified:true},
-    {pageType:"metric",slug:"repurchase-rate",title:"复购率",aliases:[],tables:["sales_order"],content:"再次下单比例",verified:true},
-  ];
-  const tables=[{tableName:"crm_customer",comment:"客户"},{tableName:"sales_order",comment:"订单"}];
-  const question="回头客占多少";
-  const lexical=retrieveKnowledge({question,pages,tables,columnsByTable:{},relations:[]});
-  assert.equal(lexical.coverage,"none");
-  assert.equal(lexical.retrievalMode,"lexical");
-  const vector={
-    queryVector:[1,0],
-    pageVectors:new Map([["metric:repurchase-rate",[0.95,Math.sqrt(1-0.95**2)]],["term:valid-customer",[0.1,Math.sqrt(1-0.1**2)]]]),
-    tableVectors:new Map(),
-    vectorWeight:0.4,minSimilarity:0.35,semanticThreshold:0.55,
-  };
-  const hybrid=retrieveKnowledge({question,pages,tables,columnsByTable:{},relations:[],vector});
-  assert.equal(hybrid.coverage,"semantic");
-  assert.equal(hybrid.retrievalMode,"hybrid");
-  assert.deepEqual(hybrid.pages.map((page)=>page.slug),["repurchase-rate"]);
-  assert.deepEqual(hybrid.tableNames,["sales_order"]);
-});
-
-test("term-anchor aliases expand business slang into bound semantic labels",()=>{
-  const pages=[{pageType:"term",slug:"customer",title:"客户",aliases:[],tables:["crm_customer"],content:"客户主体",verified:true}];
-  const result=retrieveKnowledge({question:"看一下客群数量",pages,tables:[{tableName:"crm_customer",comment:"客户"}],columnsByTable:{crm_customer:[]},relations:[],termAliases:[{aliases:["客群"],terms:["客户"]}]});
-  assert.equal(result.coverage,"semantic");
-  assert.deepEqual(result.pages.map((page)=>page.slug),["customer"]);
-});
-
-test("low-similarity pure vector hits are dropped so refusal boundaries stay strict",()=>{
-  const pages=[{pageType:"term",slug:"valid-customer",title:"有效客户",aliases:[],tables:["crm_customer"],content:"",verified:true}];
-  const vector={
-    queryVector:[1,0],
-    pageVectors:new Map([["term:valid-customer",[0.5,Math.sqrt(0.75)]]]),
-    tableVectors:new Map(),
-    vectorWeight:0.4,minSimilarity:0.35,semanticThreshold:0.55,
-  };
-  const result=retrieveKnowledge({question:"完全无关的问题",pages,tables:[],columnsByTable:{},relations:[],vector});
-  assert.equal(result.coverage,"none");
-  assert.deepEqual(result.pages,[]);
-});
-
-test("vector=null keeps hybrid retrieval byte-compatible with the lexical path",()=>{
-  const pages=[{pageType:"term",slug:"valid-customer",title:"有效客户",aliases:["有效户"],tables:["crm_customer"],content:"定义",verified:true}];
-  const tables=[{tableName:"crm_customer",comment:"客户"}];
-  const question="有效客户有多少";
-  const before=retrieveKnowledge({question,pages,tables,columnsByTable:{},relations:[]});
-  const after=retrieveKnowledge({question,pages,tables,columnsByTable:{},relations:[],vector:null});
-  assert.deepEqual({...before,retrievalMode:undefined},{...after,retrievalMode:undefined});
-  assert.equal(before.coverage,"semantic");
 });

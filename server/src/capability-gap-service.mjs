@@ -1,4 +1,4 @@
-import { knowledgeIntentConcepts, catalogFilterConcepts } from "./query-intent.mjs";
+import { knowledgeIntentConcepts, catalogFilterConcepts } from "./knowledge-concepts.mjs";
 import { validateKnowledgeSemantics } from "./knowledge-semantics.mjs";
 
 // Keep business definitions, catalog maintenance and runtime incidents distinct.

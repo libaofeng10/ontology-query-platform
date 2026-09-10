@@ -33,7 +33,7 @@ export function createSourceOntologyBuildService({store,discovery,modeling,tasks
   }
 
   async function start(source,input,actor) {
-    if(!source.isDemo&&source.lastTestOk!==1)throw httpError(400,"真实数据源必须先通过只读连接测试");
+    if(source.lastTestOk!==1)throw httpError(400,"真实数据源必须先通过只读连接测试");
     if(config.ontologyAi.mode==="off")throw httpError(409,"AI 本体生成尚未启用，请在设置中开启后再构建");
     let selections=normalizeSelections(input?.selections);
     const active=store.findActiveTask(source.id,"ontology_domain_modeling");

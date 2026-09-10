@@ -1,7 +1,6 @@
 import { relationPairs, relationKey } from "./physical-relation.mjs";
 import { createHash } from "node:crypto";
 import { redactTypedLiterals } from "./query-column-semantics.mjs";
-import { buildQueryResultContract } from "./query-result-contract.mjs";
 
 /**
  * Version of the public, request-scoped ontology view exposed to Claude.
@@ -88,9 +87,9 @@ export function createClaudeQuerySnapshot(input = {}) {
   const objects = buildPublicObjects(schema, columnsByTable, tableNames);
   const links = buildPublicLinks(schema, relations, tableNames);
   const enumValues = buildPublicEnums(catalog, columnsByTable);
-  const queryIntent = sanitizeQueryIntent(input.queryIntent ?? input.context?.queryIntent);
-  const retrieval = sanitizeRetrieval(input.retrievalEvidence ?? input.context?.retrieval);
-  const executionContract = publicExecutionContract(input.queryIntent ?? input.context?.queryIntent, input.retrievalEvidence ?? input.context?.retrieval);
+  const queryIntent = null;
+  const retrieval = null;
+  const executionContract = null;
   const schemaVersion = normalizeVersion(published?.version ?? input.ontologySchemaVersion);
   const schemaVersionId = normalizeVersion(published?.id ?? input.ontologySchemaVersionId);
   const publishedAt = safeText(published?.publishedAt ?? published?.published_at, 128);
@@ -451,62 +450,6 @@ function normalizeRules(items, tableNames) {
     .filter((rule) => rule.name || rule.content);
 }
 
-function sanitizeQueryIntent(intent) {
-  if (!intent || typeof intent !== "object") return null;
-  const copy = {
-    version: safeText(intent.version, 40),
-    subjects: normalizeTextArray(intent.subjects, 20, 100),
-    dimensions: normalizeTextArray(intent.dimensions, 30, 100),
-    measures: normalizeTextArray(intent.measures, 30, 100),
-    timeRole: safeText(intent.timeRole, 100) || null,
-    shape: sanitizeData(intent.shape, 2),
-    scope: sanitizeData(intent.scope, 2),
-    filters: Array.isArray(intent.filters) ? intent.filters.slice(0, 30).map((filter) => ({
-      field: safeText(filter?.field, 120),
-      operator: safeText(filter?.operator, 40),
-      value: sanitizeScalar(filter?.value),
-      valueType: safeText(filter?.valueType, 40),
-      physicalColumns: normalizeTextArray(filter?.physicalColumns, 10, 200),
-    })) : [],
-    entities: Array.isArray(intent.entities) ? intent.entities.slice(0, 20).map((entity) => ({
-      type: safeText(entity?.type, 80),
-      text: safeText(entity?.text, 500),
-      value: sanitizeScalar(entity?.value),
-    })) : [],
-  };
-  return removeEmpty(copy);
-}
-
-function sanitizeRetrieval(retrieval) {
-  if (!retrieval || typeof retrieval !== "object") return null;
-  return removeEmpty({
-    version: safeText(retrieval.version, 40),
-    coverage: safeText(retrieval.coverage, 80),
-    retrievalMode: safeText(retrieval.retrievalMode, 80),
-    tableNames: normalizeTextArray(retrieval.tableNames, 50, 128),
-    diagnostics: sanitizeData(retrieval.diagnostics, 3),
-  });
-}
-
-function publicExecutionContract(intent, retrieval) {
-  if (intent == null) return null;
-  // Derive from the same full evidence as the kernel. Generic prompt depth
-  // limits otherwise erase predicates nested under retrieval[].diagnostics.
-  const contract = buildQueryResultContract(intent, retrieval);
-  const fields = [
-    "id", "kind", "value", "values", "role", "required", "operator", "valueType", "attribution", "range",
-    "tables", "columns", "filterBindings", "labelColumns", "identityColumns",
-    "bindingTables", "bindingColumns", "bindingRelationIds", "bindingPaths",
-    "bindingValidityPredicates", "executionValidityPredicates",
-  ];
-  return {
-    version: contract.version,
-    shape: sanitizeData(contract.shape),
-    closedWorldRowDomain: contract.closedWorldRowDomain,
-    slots: contract.slots.map((slot) => sanitizeData(Object.fromEntries(fields.map((key) => [key, slot[key]])))),
-  };
-}
-
 function readSnapshot(snapshot, request = {}) {
   const operation = safeText(request.operation ?? request.op, 40).toLowerCase();
   if (!OPERATION_NAMES.has(operation)) {
@@ -708,22 +651,6 @@ function sanitizeConstraints(value) {
   for (const key of ["minimum", "maximum", "minLength", "maxLength", "pattern"]) if (value[key] != null) result[key] = sanitizeScalar(value[key]);
   if (Array.isArray(value.enumValues)) result.enumValues = normalizeTextArray(value.enumValues, 200, 500);
   return removeEmpty(result);
-}
-
-function sanitizeData(value, depth = 0) {
-  if (depth > 4) return undefined;
-  if (value == null || typeof value === "string" || typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return sanitizeScalar(value);
-  if (Array.isArray(value)) return value.slice(0, 100).map((item) => sanitizeData(item, depth + 1)).filter((item) => item !== undefined);
-  if (typeof value === "object") {
-    const result = {};
-    for (const key of Object.keys(value).slice(0, 100)) {
-      if (/prompt|instruction|futureSql|rawQuestion|normalizedQuestion|sourceText|secret|token|password|credential/i.test(key)) continue;
-      const item = sanitizeData(value[key], depth + 1);
-      if (item !== undefined) result[safeText(key, 100)] = item;
-    }
-    return result;
-  }
-  return undefined;
 }
 
 function sanitizeScalar(value) {

@@ -36,18 +36,6 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
       return schema;
     };
     emit(onProgress,2,"准备数据源探查");
-    if (source.isDemo) {
-      const schema=restrict(demoSchema(source.id));
-      const schemaDiff=saveSnapshot(source.id,schema);
-      const relationKeys=schema.foreignKeys.map(relationKey);
-      store.finishSchemaRefresh(source.id,schema,relationKeys);
-      emit(onProgress,75,"生成演示本体页面");
-      await writeOntology(source.id);
-      store.markSourceDiscovered(source.id);
-      emit(onProgress,100,"探查完成");
-      return {...summary(source.id),schemaDiff};
-    }
-
     emit(onProgress,5,"读取 INFORMATION_SCHEMA");
     const schema=restrict(await introspectSchema(connector,source));
     const analysisInput=()=>{
@@ -182,13 +170,11 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
 
   // Lists every base table in the source database with its current selection state, without
   // probing anything — this is what the user reviews BEFORE discovery runs. Demo sources have
-  // no live information_schema; their world is whatever the seed already registered.
+
   async function previewTables(source) {
     const selections=new Map(store.listTableSelections(source.id).map((item)=>[item.tableName,item]));
     const known=new Map(store.listTables(source.id).map((table)=>[table.tableName,table]));
-    const rows=source.isDemo
-      ? store.listTables(source.id).map((table)=>({tableName:table.tableName,rowEstimate:table.rowEstimate,comment:table.comment}))
-      : (await introspectSchema(connector,source)).tables;
+    const rows=(await introspectSchema(connector,source)).tables;
     return rows.map((row)=>({
       tableName:row.tableName,
       rowEstimate:Number(row.rowEstimate)||0,
@@ -218,7 +204,6 @@ export function createDiscoveryService({store,connector,wikiDir,config={},relati
     return {sourceId,tables,totalTables:tables.length,grades:Object.fromEntries(["A","B","C"].map((grade)=>[grade,tables.filter((table)=>table.grade===grade).length])),sensitiveFields:0,relations:relations.length,pendingQuestions:store.listQuestions(sourceId).length,relationDiscovery:store.relationStats(sourceId)};
   }
 
-  function demoSchema(sourceId) { const tables=store.listTables(sourceId); return normalizeSchema({tables,columns:tables.flatMap((table)=>store.listColumns(sourceId,table.tableName)),foreignKeys:store.listRelations(sourceId).map((item)=>({...item}))}); }
   function saveSnapshot(sourceId,schema,knownDiff=null) { const previous=store.getLatestSchemaSnapshot(sourceId); const checksum=checksumSchema(schema); const diff=knownDiff||compareSchema(previous?.schema,schema); if(!previous||previous.checksum!==checksum) { const saved=store.addSchemaSnapshot(sourceId,checksum,schema); return {...diff,previousVersion:previous?.version??null,currentVersion:saved.version}; } return {...diff,previousVersion:previous?.version??null,currentVersion:previous.version}; }
   return {discover,summary,writeOntology,previewTables};
 }

@@ -103,16 +103,10 @@ test("a fixed build scope never probes tables that appeared after selection",asy
   }finally{store.close();}
 });
 
-test("preview and selection API round-trip, purge runs on save, and demo sources preview from the store",async()=>{
+test("preview and selection API round-trip with a real source and purge on save",async()=>{
   const root=mkdtempSync(join(tmpdir(),"ontoquery-selection-api-"));
   const app=createApp({dbPath:join(root,"store.sqlite"),wikiDir:join(root,"wiki"),appSecret:"selection-secret",apiIdentities:[{name:"data-editor",role:"editor",token:"token-editor",sourceIds:"*"}],connector:fakeConnector(),rateLimits:{queryPerMinute:100,writePerMinute:100,readPerMinute:100},nodeEnv:"test"});
   try {
-    const demo=app.store.listSources().find((item)=>item.isDemo);
-    const demoPreview=await api(app,`/api/sources/${demo.id}/tables/preview`,null,"GET");
-    assert.equal(demoPreview.status,200);
-    assert.ok(demoPreview.body.tables.length>0,"演示源从已登记结构给出清单");
-    assert.ok(demoPreview.body.tables.every((row)=>row.included===1||row.included===true));
-
     const real=app.store.createSource({name:"real",kind:"mysql",host:"db",port:3306,dbName:"sales",userName:"ro",credential:"encrypted",isDemo:false});
     const blocked=await api(app,`/api/sources/${real.id}/tables/preview`,null,"GET");
     assert.equal(blocked.status,400,"未通过只读连接测试前不能预览");
